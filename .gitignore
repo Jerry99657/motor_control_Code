@@ -1,0 +1,50 @@
+# Build outputs
+build/*
+!build/Debug/
+build/Debug/*
+!build/Debug/*.elf
+!build/Debug/*.hex
+build_*/
+cmake-build-*/
+
+# Tool and IDE caches
+mx.scratch
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# User-specific IDE state that does not need to be shared
+.settings/
+
+# Media and example projects that should not be uploaded
+视频/
+例程/
+
+# Common generated binary / compiler artifacts
+*.o
+*.d
+*.obj
+*.axf
+*.bin
+*.map
+*.lst
+*.suo
+*.dep
+*.htm
+*.html
+*.log
+
+# Keil / MDK generated files inside example folders or elsewhere
+*.uvoptx
+*.uvguix.*
+*.uvprojx
+*.crf
+*.lnp
+*.bak
+
+# Allow useful editor configuration if you want to keep it under version control
+!.vscode/
+!.vscode/*.json
+
+# Keep CubeMX project metadata
+!.mxproject
