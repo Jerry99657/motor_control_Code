@@ -48,6 +48,10 @@ file(GLOB USER_DRIVER_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/Drivers/User/Src/*.c
 )
 
+file(GLOB_RECURSE LVGL_CORE_SOURCES CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/lvgl/src/*.c
+)
+
 set(USER_PERSISTENT_SOURCES
     ${USER_DRIVER_SOURCES}
 )
@@ -61,6 +65,7 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     ${USER_PERSISTENT_SOURCES}
+    ${LVGL_CORE_SOURCES}
 )
 
 # Add include paths
@@ -72,6 +77,7 @@ set(USER_PERSISTENT_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target
     ${CMAKE_CURRENT_SOURCE_DIR}/USB_DEVICE/App
     ${CMAKE_CURRENT_SOURCE_DIR}/USB_DEVICE/Target
+    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/lvgl
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
@@ -82,6 +88,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 # Add project symbols (macros)
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined symbols
+    LV_CONF_INCLUDE_SIMPLE
 )
 
 # Add linked libraries

@@ -33,6 +33,10 @@
 #include "qspi_start_anim.h"
 #include "qspi_anim_loader.h"
 #include "sd_start_anim.h"
+#include "lvgl.h"
+#include "lv_port_disp.h"
+#include "lv_port_indev.h"
+#include "lvgl_app.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -84,6 +88,7 @@ TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
+TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim15;
 
@@ -146,6 +151,7 @@ static void MX_SPI1_Init(void);
 static void MX_UART5_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
+static void MX_TIM6_Init(void);
 /* USER CODE BEGIN PFP */
 static void LCD_ShowStartupScreen(void);
 static void LCD_ShowDownloadScreen(void);
@@ -832,6 +838,7 @@ int main(void)
   MX_USB_DEVICE_Init();
   MX_FATFS_Init();
   MX_SDMMC1_SD_Init();
+  MX_TIM6_Init();
   /* USER CODE BEGIN 2 */
   SPI_LCD_Init();
   QSPI_BootInit();
@@ -878,6 +885,16 @@ int main(void)
   }
   LCD_ShowStartupScreen();
 
+  lv_init();
+  lv_port_disp_init();
+  lv_port_indev_init();
+  LVGL_App_Init();
+
+  if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -904,6 +921,8 @@ int main(void)
       }
     }
 #endif
+
+    LVGL_App_Process();
 
     if (g_cdc_welcome_sent == 0U)
     {
@@ -935,7 +954,7 @@ int main(void)
 #endif
 #endif
 
-    HAL_Delay(10);
+    HAL_Delay(5);
   }
   /* USER CODE END 3 */
 }
@@ -1696,6 +1715,44 @@ static void MX_TIM5_Init(void)
 }
 
 /**
+  * @brief TIM6 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM6_Init(void)
+{
+
+  /* USER CODE BEGIN TIM6_Init 0 */
+
+  /* USER CODE END TIM6_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM6_Init 1 */
+
+  /* USER CODE END TIM6_Init 1 */
+  htim6.Instance = TIM6;
+  htim6.Init.Prescaler = 239;
+  htim6.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim6.Init.Period = 999;
+  htim6.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim6, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM6_Init 2 */
+
+  /* USER CODE END TIM6_Init 2 */
+
+}
+
+/**
   * @brief TIM8 Initialization Function
   * @param None
   * @retval None
@@ -2022,7 +2079,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(CAMERAPWDN_GPIO_Port, CAMERAPWDN_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOG, M1_EN_Pin|M2_EN_Pin|M3_EN_Pin|M4_EN_Pin
+  HAL_GPIO_WritePin(GPIOG, M1_PH_Pin|M2_PH_Pin|M3_PH_Pin|M4_PH_Pin
                           |LCD_BL_Pin|LCD_DC_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
@@ -2063,8 +2120,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(CAMERAPWDN_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : M1_EN_Pin M2_EN_Pin M3_EN_Pin M4_EN_Pin */
-  GPIO_InitStruct.Pin = M1_EN_Pin|M2_EN_Pin|M3_EN_Pin|M4_EN_Pin;
+  /*Configure GPIO pins : M1_PH_Pin M2_PH_Pin M3_PH_Pin M4_PH_Pin */
+  GPIO_InitStruct.Pin = M1_PH_Pin|M2_PH_Pin|M3_PH_Pin|M4_PH_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
@@ -2096,6 +2153,14 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6)
+  {
+    lv_tick_inc(1);
+  }
+}
+
 /* USER CODE END 4 */
 
  /* MPU Configuration */
@@ -2118,15 +2183,6 @@ void MPU_Config(void)
   MPU_InitStruct.AccessPermission = MPU_REGION_NO_ACCESS;
   MPU_InitStruct.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
   MPU_InitStruct.IsShareable = MPU_ACCESS_SHAREABLE;
-  MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
-  MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
-
-  HAL_MPU_ConfigRegion(&MPU_InitStruct);
-
-  MPU_InitStruct.Number = MPU_REGION_NUMBER1;
-  MPU_InitStruct.BaseAddress = 0x30000000U;
-  MPU_InitStruct.Size = MPU_REGION_SIZE_512KB;
-  MPU_InitStruct.AccessPermission = MPU_REGION_FULL_ACCESS;
   MPU_InitStruct.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
