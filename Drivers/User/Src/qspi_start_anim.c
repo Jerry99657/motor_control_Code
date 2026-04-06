@@ -1,6 +1,7 @@
 #include "qspi_start_anim.h"
 
 #include "lcd_spi_154.h"
+#include "mjpeg_scheduler.h"
 #include "qspi_w25q64.h"
 
 #define QSPI_START_ANIM_MAX_FRAME_BYTES (LCD_Width * LCD_Height * 2U)
@@ -33,6 +34,33 @@ static uint32_t read_u32_le(const uint8_t *p)
          ((uint32_t)p[1] << 8) |
          ((uint32_t)p[2] << 16) |
          ((uint32_t)p[3] << 24);
+}
+
+static void qspi_wait_frame_pace(uint32_t wait_ms)
+{
+  uint32_t start_ms;
+
+  if (wait_ms == 0U)
+  {
+    return;
+  }
+
+  start_ms = HAL_GetTick();
+
+  for (;;)
+  {
+    if (MJPEG_Scheduler_ConsumeFrameTick() != 0U)
+    {
+      return;
+    }
+
+    if ((HAL_GetTick() - start_ms) >= wait_ms)
+    {
+      return;
+    }
+
+    HAL_Delay(1U);
+  }
 }
 
 int8_t QSPI_StartAnim_ReadInfo(QSPI_StartAnimInfo *info)
@@ -121,14 +149,6 @@ int8_t QSPI_StartAnim_Play(void)
   uint16_t x;
   uint16_t y;
   uint32_t frame_addr;
-  uint32_t anim_start_tick;
-  uint32_t frame_start_tick;
-  uint32_t elapsed_ms;
-  uint32_t expected_elapsed_ms;
-  uint32_t actual_elapsed_ms;
-  uint32_t lag_ms;
-  uint32_t drop_frames;
-  uint16_t frames_left;
   uint32_t target_delay_ms;
 
   QSPI_StartAnim_Log("QSA: enter\r\n");
@@ -153,15 +173,16 @@ int8_t QSPI_StartAnim_Play(void)
     target_delay_ms = 1U;
   }
 
+  if (MJPEG_Scheduler_SetFrameIntervalMs(target_delay_ms) != HAL_OK)
+  {
+    return QSPI_START_ANIM_ERR_QSPI;
+  }
+
   LCD_SetBackColor(LCD_BLACK);
   LCD_Clear();
 
-  anim_start_tick = HAL_GetTick();
-
   for (frame_index = 0; frame_index < info.frame_count; )
   {
-    frame_start_tick = HAL_GetTick();
-
     frame_addr = QSPI_START_ANIM_BASE_ADDR + info.data_offset_bytes + ((uint32_t)frame_index * info.frame_size_bytes);
     if (QSPI_W25Qxx_ReadBuffer(s_anim_frame_buffer, frame_addr, info.frame_size_bytes) != QSPI_W25QXX_OK)
     {
@@ -173,41 +194,10 @@ int8_t QSPI_StartAnim_Play(void)
 
     frame_index++;
 
-#if (QSPI_START_ANIM_DROP_LATE_FRAMES != 0U)
     if (frame_index < info.frame_count)
     {
-      actual_elapsed_ms = HAL_GetTick() - anim_start_tick;
-      expected_elapsed_ms = (uint32_t)frame_index * target_delay_ms;
-
-      if (actual_elapsed_ms > (expected_elapsed_ms + target_delay_ms))
-      {
-        lag_ms = actual_elapsed_ms - expected_elapsed_ms;
-        drop_frames = lag_ms / target_delay_ms;
-        if (drop_frames > (uint32_t)QSPI_START_ANIM_MAX_DROP_PER_LOOP)
-        {
-          drop_frames = (uint32_t)QSPI_START_ANIM_MAX_DROP_PER_LOOP;
-        }
-
-        frames_left = (uint16_t)(info.frame_count - frame_index);
-        if (drop_frames > (uint32_t)frames_left)
-        {
-          drop_frames = (uint32_t)frames_left;
-        }
-
-        frame_index = (uint16_t)(frame_index + (uint16_t)drop_frames);
-      }
+      qspi_wait_frame_pace(target_delay_ms + 10U);
     }
-#endif
-
-    actual_elapsed_ms = HAL_GetTick() - anim_start_tick;
-    expected_elapsed_ms = (uint32_t)frame_index * target_delay_ms;
-    if (actual_elapsed_ms < expected_elapsed_ms)
-    {
-      HAL_Delay(expected_elapsed_ms - actual_elapsed_ms);
-    }
-
-    elapsed_ms = HAL_GetTick() - frame_start_tick;
-    (void)elapsed_ms;
   }
 
   QSPI_StartAnim_Log("QSA: ok\r\n");

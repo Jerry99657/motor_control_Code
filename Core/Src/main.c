@@ -33,6 +33,7 @@
 #include "qspi_start_anim.h"
 #include "qspi_anim_loader.h"
 #include "sd_start_anim.h"
+#include "mjpeg_scheduler.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
@@ -71,9 +72,15 @@ ADC_HandleTypeDef hadc1;
 
 DAC_HandleTypeDef hdac1;
 
+DMA2D_HandleTypeDef hdma2d;
+
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 I2C_HandleTypeDef hi2c4;
+
+JPEG_HandleTypeDef hjpeg;
+MDMA_HandleTypeDef hmdma_jpeg_infifo_th;
+MDMA_HandleTypeDef hmdma_jpeg_outfifo_th;
 
 QSPI_HandleTypeDef hqspi;
 
@@ -89,6 +96,7 @@ TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
 TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim6;
+TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim15;
 
@@ -124,6 +132,11 @@ static char g_stage_log_buffer[STAGE_LOG_BUFFER_SIZE];
 static uint16_t g_stage_log_len = 0U;
 static uint16_t g_stage_log_flush_pos = 0U;
 static uint8_t g_stage_log_overflow = 0U;
+static uint8_t g_jpeg_init_ok = 0U;
+static uint8_t g_dma2d_init_ok = 0U;
+static uint8_t g_tim7_init_ok = 0U;
+static uint8_t g_tim7_start_ok = 0U;
+volatile uint32_t g_tim7_frame_tick = 0U;
 
 /* USER CODE END PV */
 
@@ -132,6 +145,7 @@ void SystemClock_Config(void);
 static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_BDMA_Init(void);
+static void MX_MDMA_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
@@ -151,7 +165,10 @@ static void MX_SPI1_Init(void);
 static void MX_UART5_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SDMMC1_SD_Init(void);
+static void MX_JPEG_Init(void);
 static void MX_TIM6_Init(void);
+static void MX_DMA2D_Init(void);
+static void MX_TIM7_Init(void);
 /* USER CODE BEGIN PFP */
 static void LCD_ShowStartupScreen(void);
 static void LCD_ShowDownloadScreen(void);
@@ -655,7 +672,7 @@ static void Boot_TryReportSdSelfTestViaCdc(void)
   char failMsg[224];
   int msgLen;
 
-  if ((g_sd_self_test_done == 0U) || (g_sd_self_test_reported != 0U) || (g_cdc_welcome_sent == 0U))
+  if ((g_sd_self_test_done == 0U) || (g_sd_self_test_reported != 0U))
   {
     return;
   }
@@ -755,7 +772,7 @@ static void Boot_TryReportSdBenchViaCdc(void)
   char msg[224];
   int msgLen;
 
-  if ((g_sd_bench_done == 0U) || (g_sd_bench_reported != 0U) || (g_cdc_welcome_sent == 0U))
+  if ((g_sd_bench_done == 0U) || (g_sd_bench_reported != 0U))
   {
     return;
   }
@@ -817,6 +834,7 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_BDMA_Init();
+  MX_MDMA_Init();
   MX_DAC1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
@@ -838,9 +856,15 @@ int main(void)
   MX_USB_DEVICE_Init();
   MX_FATFS_Init();
   MX_SDMMC1_SD_Init();
+  MX_JPEG_Init();
   MX_TIM6_Init();
+  MX_DMA2D_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
   SPI_LCD_Init();
+  Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
+  Boot_LogStatus("BOOT: DMA2D init=", g_dma2d_init_ok);
+  Boot_LogStatus("BOOT: TIM7 init=", g_tim7_init_ok);
   QSPI_BootInit();
   Boot_LogStatus("BOOT: QSPI init=", g_qspi_init_status);
   if (Boot_ShouldEnterAnimDownloadMode() == 1U)
@@ -895,6 +919,24 @@ int main(void)
     Error_Handler();
   }
 
+  g_tim7_start_ok = 0U;
+  if (g_tim7_init_ok != 0U)
+  {
+    if ((TIM7->CR1 & TIM_CR1_CEN) != 0U)
+    {
+      g_tim7_start_ok = 1U;
+    }
+    else if (HAL_TIM_Base_Start_IT(&htim7) == HAL_OK)
+    {
+      g_tim7_start_ok = 1U;
+    }
+    else if ((TIM7->CR1 & TIM_CR1_CEN) != 0U)
+    {
+      g_tim7_start_ok = 1U;
+    }
+  }
+  Boot_LogStatus("BOOT: TIM7 start=", g_tim7_start_ok);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -939,10 +981,7 @@ int main(void)
       }
     }
 
-    if (g_cdc_welcome_sent != 0U)
-    {
-      Boot_DebugFlushStageLogsViaCdc();
-    }
+    Boot_DebugFlushStageLogsViaCdc();
 
 #if SD_SELF_TEST_ENABLE
     Boot_TryReportSdSelfTestViaCdc();
@@ -1131,6 +1170,48 @@ static void MX_DAC1_Init(void)
 }
 
 /**
+  * @brief DMA2D Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_DMA2D_Init(void)
+{
+
+  /* USER CODE BEGIN DMA2D_Init 0 */
+
+  /* USER CODE END DMA2D_Init 0 */
+
+  /* USER CODE BEGIN DMA2D_Init 1 */
+
+  /* USER CODE END DMA2D_Init 1 */
+  g_dma2d_init_ok = 0U;
+  hdma2d.Instance = DMA2D;
+  hdma2d.Init.Mode = DMA2D_M2M_PFC;
+  hdma2d.Init.ColorMode = DMA2D_OUTPUT_RGB565;
+  hdma2d.Init.OutputOffset = 0;
+  hdma2d.LayerCfg[1].InputOffset = 0;
+  hdma2d.LayerCfg[1].InputColorMode = DMA2D_INPUT_YCBCR;
+  hdma2d.LayerCfg[1].AlphaMode = DMA2D_NO_MODIF_ALPHA;
+  hdma2d.LayerCfg[1].InputAlpha = 0;
+  hdma2d.LayerCfg[1].AlphaInverted = DMA2D_REGULAR_ALPHA;
+  hdma2d.LayerCfg[1].RedBlueSwap = DMA2D_RB_REGULAR;
+  hdma2d.LayerCfg[1].ChromaSubSampling = DMA2D_CSS_420;
+  if (HAL_DMA2D_Init(&hdma2d) != HAL_OK)
+  {
+    return;
+  }
+  if (HAL_DMA2D_ConfigLayer(&hdma2d, 1) != HAL_OK)
+  {
+    return;
+  }
+  g_dma2d_init_ok = 1U;
+  /* USER CODE BEGIN DMA2D_Init 2 */
+
+  /* USER CODE END DMA2D_Init 2 */
+
+}
+
+/**
   * @brief I2C1 Initialization Function
   * @param None
   * @retval None
@@ -1271,6 +1352,34 @@ static void MX_I2C4_Init(void)
   /* USER CODE BEGIN I2C4_Init 2 */
 
   /* USER CODE END I2C4_Init 2 */
+
+}
+
+/**
+  * @brief JPEG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_JPEG_Init(void)
+{
+
+  /* USER CODE BEGIN JPEG_Init 0 */
+
+  /* USER CODE END JPEG_Init 0 */
+
+  /* USER CODE BEGIN JPEG_Init 1 */
+
+  /* USER CODE END JPEG_Init 1 */
+  g_jpeg_init_ok = 0U;
+  hjpeg.Instance = JPEG;
+  if (HAL_JPEG_Init(&hjpeg) != HAL_OK)
+  {
+    return;
+  }
+  g_jpeg_init_ok = 1U;
+  /* USER CODE BEGIN JPEG_Init 2 */
+
+  /* USER CODE END JPEG_Init 2 */
 
 }
 
@@ -1753,6 +1862,46 @@ static void MX_TIM6_Init(void)
 }
 
 /**
+  * @brief TIM7 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM7_Init(void)
+{
+
+  /* USER CODE BEGIN TIM7_Init 0 */
+
+  /* USER CODE END TIM7_Init 0 */
+
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM7_Init 1 */
+
+  /* USER CODE END TIM7_Init 1 */
+  g_tim7_init_ok = 0U;
+  htim7.Instance = TIM7;
+  htim7.Init.Prescaler = 24000-1;
+  htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim7.Init.Period = 332;
+  htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
+  {
+    return;
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
+  {
+    return;
+  }
+  g_tim7_init_ok = 1U;
+  /* USER CODE BEGIN TIM7_Init 2 */
+
+  /* USER CODE END TIM7_Init 2 */
+
+}
+
+/**
   * @brief TIM8 Initialization Function
   * @param None
   * @retval None
@@ -2049,6 +2198,23 @@ static void MX_BDMA_Init(void)
 }
 
 /**
+  * Enable MDMA controller clock
+  */
+static void MX_MDMA_Init(void)
+{
+
+  /* MDMA controller clock enable */
+  __HAL_RCC_MDMA_CLK_ENABLE();
+  /* Local variables */
+
+  /* MDMA interrupt initialization */
+  /* MDMA_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(MDMA_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(MDMA_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -2158,6 +2324,11 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM6)
   {
     lv_tick_inc(1);
+  }
+  else if (htim->Instance == TIM7)
+  {
+    MJPEG_Scheduler_OnTim7Tick();
+    g_tim7_frame_tick++;
   }
 }
 

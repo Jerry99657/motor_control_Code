@@ -1,6 +1,7 @@
 ﻿#include "lvgl_app.h"
 
 #include "lv_port_indev.h"
+#include "mjpeg_player.h"
 #include "sd_start_anim.h"
 #include "main.h"
 #include "lvgl.h"
@@ -33,7 +34,8 @@ typedef enum
 {
     LVGL_APP_ENTRY_DIR = 0,
     LVGL_APP_ENTRY_BIN,
-    LVGL_APP_ENTRY_GIF
+    LVGL_APP_ENTRY_GIF,
+    LVGL_APP_ENTRY_MJPEG
 } lvgl_app_entry_type_t;
 
 typedef struct
@@ -150,6 +152,47 @@ static uint8_t lvgl_app_is_bin_file(const char *name)
 static uint8_t lvgl_app_is_gif_file(const char *name)
 {
     return lvgl_app_is_ext_file(name, "GIF");
+}
+
+static uint8_t lvgl_app_is_avi_file(const char *name)
+{
+    return lvgl_app_is_ext_file(name, "AVI");
+}
+
+static uint8_t lvgl_app_is_mjpeg_file(const char *name)
+{
+    size_t len;
+
+    if (name == NULL)
+    {
+        return 0U;
+    }
+
+    len = strlen(name);
+    if ((len >= 7U) && (name[len - 7U] == '.'))
+    {
+        if (((char)toupper((unsigned char)name[len - 6U]) == 'M') &&
+            ((char)toupper((unsigned char)name[len - 5U]) == 'J') &&
+            ((char)toupper((unsigned char)name[len - 4U]) == 'P') &&
+            ((char)toupper((unsigned char)name[len - 3U]) == 'E') &&
+            ((char)toupper((unsigned char)name[len - 2U]) == 'G'))
+        {
+            return 1U;
+        }
+    }
+
+    if ((len >= 6U) && (name[len - 6U] == '.'))
+    {
+        if (((char)toupper((unsigned char)name[len - 5U]) == 'M') &&
+            ((char)toupper((unsigned char)name[len - 4U]) == 'J') &&
+            ((char)toupper((unsigned char)name[len - 3U]) == 'P') &&
+            ((char)toupper((unsigned char)name[len - 2U]) == 'G'))
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
 }
 
 static void lvgl_app_browser_reset_path(void)
@@ -293,6 +336,10 @@ static uint16_t lvgl_app_scan_browser_entries(void)
             else if (lvgl_app_is_gif_file(fno.fname) != 0U)
             {
                 file_type = LVGL_APP_ENTRY_GIF;
+            }
+            else if ((lvgl_app_is_avi_file(fno.fname) != 0U) || (lvgl_app_is_mjpeg_file(fno.fname) != 0U))
+            {
+                file_type = LVGL_APP_ENTRY_MJPEG;
             }
             else
             {
@@ -958,6 +1005,38 @@ static void lvgl_app_sd_play_gif_by_index(uint16_t index)
     lvgl_app_show_gif_player(play_path, s_browser_entries[index].name);
 }
 
+static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
+{
+    int8_t play_status;
+    char play_path[LVGL_APP_BROWSER_PATH_LEN];
+
+    if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
+    {
+        lvgl_app_set_status("Path build failed");
+        lvgl_app_show_sd_browser();
+        return;
+    }
+
+    lvgl_app_set_status("Playing %s...", s_browser_entries[index].name);
+    lv_refr_now(NULL);
+
+    play_status = MJPEG_Player_PlayFile(play_path);
+    if (play_status == MJPEG_PLAYER_OK)
+    {
+        lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
+    }
+    else if (play_status == MJPEG_PLAYER_ERR_STOPPED)
+    {
+        lvgl_app_set_status("Stopped by KEY2");
+    }
+    else
+    {
+        lvgl_app_set_status("MJPEG fail(%d): %s", (int)play_status, s_browser_entries[index].name);
+    }
+
+    lvgl_app_show_sd_browser();
+}
+
 static void lvgl_app_sd_select_id(uintptr_t id)
 {
     uint16_t index;
@@ -995,6 +1074,10 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_GIF)
     {
         lvgl_app_sd_play_gif_by_index(index);
+    }
+    else if (s_browser_entries[index].type == LVGL_APP_ENTRY_MJPEG)
+    {
+        lvgl_app_sd_play_mjpeg_by_index(index);
     }
 }
 
@@ -1174,7 +1257,7 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "SD Browser (.BIN/.GIF)");
+    lv_label_set_text(title, "SD Browser (.BIN/.GIF/.AVI/.MJPEG)");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     (void)snprintf(path_line, sizeof(path_line), "Path: %s", s_browser_path);
@@ -1220,6 +1303,10 @@ static void lvgl_app_show_sd_browser(void)
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_GIF)
             {
                 btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, s_browser_entries[i].name);
+            }
+            else if (s_browser_entries[i].type == LVGL_APP_ENTRY_MJPEG)
+            {
+                btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, s_browser_entries[i].name);
             }
             else
             {

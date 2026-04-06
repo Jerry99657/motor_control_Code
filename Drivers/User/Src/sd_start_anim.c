@@ -3,6 +3,7 @@
 #include "fatfs.h"
 #include "lcd_spi_154.h"
 #include "main.h"
+#include "mjpeg_scheduler.h"
 #include "qspi_start_anim.h"
 #include <stdio.h>
 #include <string.h>
@@ -154,13 +155,16 @@ static int8_t sd_seek_to_frame(FIL *file, const QSPI_StartAnimInfo *info, uint16
 static int8_t sd_wait_for_playback_action(uint32_t wait_ms, sd_playback_action_t *action)
 {
   sd_playback_action_t current_action;
+  uint32_t start_ms;
 
   if (action == NULL)
   {
     return SD_START_ANIM_ERR_PARAM;
   }
 
-  while (wait_ms > 0U)
+  start_ms = HAL_GetTick();
+
+  for (;;)
   {
     current_action = sd_playback_get_action();
     if (current_action == SD_PLAYBACK_ACTION_STOP)
@@ -175,8 +179,18 @@ static int8_t sd_wait_for_playback_action(uint32_t wait_ms, sd_playback_action_t
       return SD_START_ANIM_OK;
     }
 
+    if (MJPEG_Scheduler_ConsumeFrameTick() != 0U)
+    {
+      *action = SD_PLAYBACK_ACTION_NONE;
+      return SD_START_ANIM_OK;
+    }
+
+    if ((HAL_GetTick() - start_ms) >= wait_ms)
+    {
+      break;
+    }
+
     HAL_Delay(1U);
-    wait_ms--;
   }
 
   *action = SD_PLAYBACK_ACTION_NONE;
@@ -407,6 +421,13 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
   if (playback_delay_ms == 0U)
   {
     playback_delay_ms = 1U;
+  }
+
+  if (MJPEG_Scheduler_SetFrameIntervalMs(playback_delay_ms) != HAL_OK)
+  {
+    (void)f_close(&file);
+    (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
+    return SD_START_ANIM_ERR_IO;
   }
 
   x = (uint16_t)((LCD_Width - info.width) / 2U);
