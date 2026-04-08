@@ -16,7 +16,7 @@
 
 static lv_obj_t *s_status_label = NULL;
 static lv_group_t *s_group = NULL;
-static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play";
+static char s_status_text[640] = "上下移动，右键进入，左键返回，OK播放";
 
 #define LVGL_APP_MAX_BROWSER_ENTRIES 48U
 #define LVGL_APP_ENTRY_NAME_LEN      256U
@@ -26,16 +26,29 @@ static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play"
 #define LVGL_APP_MENU_ID_MANUAL      1U
 #define LVGL_APP_MENU_ID_COMMAND     2U
 #define LVGL_APP_MENU_ID_SD_BROWSER  3U
+#define LVGL_APP_MOTOR_SUB_ID_BACK   0U
+#define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
+#define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
 #define LVGL_APP_SD_ID_BACK          0U
 #define LVGL_APP_SD_ID_UP            1U
 #define LVGL_APP_SD_ID_BASE          2U
+
+#define LVGL_APP_MOTOR_COUNT         4U
+#define LVGL_APP_SERVO_COUNT         4U
+#define LVGL_APP_SPEED_MIN           (-100)
+#define LVGL_APP_SPEED_MAX           100
+#define LVGL_APP_SPEED_STEP          10
+#define LVGL_APP_SERVO_MIN           0
+#define LVGL_APP_SERVO_MAX           270
+#define LVGL_APP_SERVO_STEP          10
 
 typedef enum
 {
     LVGL_APP_ENTRY_DIR = 0,
     LVGL_APP_ENTRY_BIN,
     LVGL_APP_ENTRY_GIF,
-    LVGL_APP_ENTRY_MJPEG
+    LVGL_APP_ENTRY_MJPEG,
+    LVGL_APP_ENTRY_FILE
 } lvgl_app_entry_type_t;
 
 typedef struct
@@ -48,6 +61,23 @@ typedef struct
 {
     FIL fil;
 } lvgl_app_lvfs_file_t;
+
+typedef enum
+{
+    LVGL_APP_CTRL_PAGE_NONE = 0,
+    LVGL_APP_CTRL_PAGE_MOTOR_SPEED,
+    LVGL_APP_CTRL_PAGE_SERVO_ANGLE
+} lvgl_app_ctrl_page_t;
+
+typedef enum
+{
+    LVGL_APP_SCREEN_REQ_NONE = 0,
+    LVGL_APP_SCREEN_REQ_MAIN,
+    LVGL_APP_SCREEN_REQ_MOTOR_MENU,
+    LVGL_APP_SCREEN_REQ_MOTOR_SPEED,
+    LVGL_APP_SCREEN_REQ_SERVO_ANGLE,
+    LVGL_APP_SCREEN_REQ_SD_BROWSER
+} lvgl_app_screen_req_t;
 
 static uint16_t s_browser_entry_count = 0U;
 static lvgl_app_browser_entry_t s_browser_entries[LVGL_APP_MAX_BROWSER_ENTRIES];
@@ -66,10 +96,39 @@ static char s_gif_lvfs_path[LVGL_APP_LVFS_PATH_LEN] = "S:/";
 static lv_fs_drv_t s_lvfs_drv;
 static uint8_t s_lvfs_registered = 0U;
 
+static lvgl_app_ctrl_page_t s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+static lvgl_app_screen_req_t s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
+static uint8_t s_ctrl_selected_row = 0U;
+static uint8_t s_ctrl_editing = 0U;
+static int16_t s_motor_speed_preset[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
+static int16_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
+static int16_t s_servo_angle_preset[LVGL_APP_SERVO_COUNT] = {0, 0, 0, 0};
+static lv_obj_t *s_ctrl_row_btns[LVGL_APP_MOTOR_COUNT] = {NULL, NULL, NULL, NULL};
+static lv_obj_t *s_ctrl_row_labels[LVGL_APP_MOTOR_COUNT] = {NULL, NULL, NULL, NULL};
+static uint32_t s_ctrl_last_confirm_tick = 0U;
+
+static void lvgl_app_control_clear_row_refs(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        s_ctrl_row_btns[i] = NULL;
+        s_ctrl_row_labels[i] = NULL;
+    }
+}
+
 static void lvgl_app_show_main_menu(void);
+static void lvgl_app_show_motor_control_menu(void);
+static void lvgl_app_show_motor_speed_control(void);
+static void lvgl_app_show_servo_angle_control(void);
 static void lvgl_app_show_sd_browser(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
+static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
+static void lvgl_app_control_event_cb(lv_event_t *e);
+static void lvgl_app_request_screen(lvgl_app_screen_req_t req);
+static void lvgl_app_process_pending_screen(void);
 
 static void lvgl_app_set_status(const char *fmt, ...)
 {
@@ -343,7 +402,7 @@ static uint16_t lvgl_app_scan_browser_entries(void)
             }
             else
             {
-                continue;
+                file_type = LVGL_APP_ENTRY_FILE;
             }
 
             (void)snprintf(
@@ -357,6 +416,7 @@ static uint16_t lvgl_app_scan_browser_entries(void)
 
             if (s_browser_entry_count >= LVGL_APP_MAX_BROWSER_ENTRIES)
             {
+                lvgl_app_set_status("文件过多");
                 break;
             }
         }
@@ -536,6 +596,646 @@ static void lvgl_app_fs_init(void)
     s_lvfs_registered = 1U;
 }
 
+static void lvgl_app_motor_speed_send_cmd(uint8_t motor_index, int16_t speed)
+{
+    /* Placeholder: real motor command channel will be connected later. */
+    (void)motor_index;
+    (void)speed;
+}
+
+static void lvgl_app_motor_speed_force_clear_all(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        s_motor_speed_preset[i] = 0;
+        s_motor_speed_actual[i] = 0;
+        lvgl_app_motor_speed_send_cmd((uint8_t)(i + 1U), 0);
+    }
+}
+
+static void lvgl_app_servo_angle_send_cmd(uint8_t servo_index, int16_t angle)
+{
+    /* Placeholder: real servo command channel will be connected later. */
+    (void)servo_index;
+    (void)angle;
+}
+
+static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
+{
+    s_pending_screen_req = req;
+}
+
+static void lvgl_app_process_pending_screen(void)
+{
+    lvgl_app_screen_req_t req;
+
+    req = s_pending_screen_req;
+    s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
+
+    if (req == LVGL_APP_SCREEN_REQ_MAIN)
+    {
+        lvgl_app_show_main_menu();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_MOTOR_MENU)
+    {
+        lvgl_app_show_motor_control_menu();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_MOTOR_SPEED)
+    {
+        lvgl_app_show_motor_speed_control();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_SERVO_ANGLE)
+    {
+        lvgl_app_show_servo_angle_control();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_SD_BROWSER)
+    {
+        lvgl_app_show_sd_browser();
+    }
+}
+
+static void lvgl_app_control_refresh_rows(void)
+{
+    uint8_t i;
+    char line[64];
+    char mark;
+    lv_obj_t *row_label;
+    lv_obj_t *row_btn;
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        row_label = s_ctrl_row_labels[i];
+        row_btn = s_ctrl_row_btns[i];
+
+        if ((row_label == NULL) || (lv_obj_is_valid(row_label) == false))
+        {
+            s_ctrl_row_labels[i] = NULL;
+            s_ctrl_row_btns[i] = NULL;
+            continue;
+        }
+
+        if ((row_btn != NULL) && (lv_obj_is_valid(row_btn) == false))
+        {
+            row_btn = NULL;
+            s_ctrl_row_btns[i] = NULL;
+        }
+
+        if ((row_btn != NULL) && (s_ctrl_editing != 0U) && (i == s_ctrl_selected_row))
+        {
+            lv_obj_set_style_bg_opa(row_btn, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_AMBER), 0);
+            lv_obj_set_style_text_color(row_label, lv_color_black(), 0);
+        }
+        else
+        {
+            if (row_btn != NULL)
+            {
+                lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, 0);
+            }
+            lv_obj_set_style_text_color(row_label, lv_color_black(), 0);
+        }
+
+        mark = ' ';
+        if ((s_ctrl_editing == 0U) && (i == s_ctrl_selected_row))
+        {
+            mark = '>';
+        }
+
+        if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+        {
+            (void)snprintf(
+                line,
+                sizeof(line),
+                "%c M%u   %+4d   %+4d",
+                mark,
+                (unsigned int)(i + 1U),
+                (int)s_motor_speed_preset[i],
+                (int)s_motor_speed_actual[i]
+            );
+        }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
+        {
+            (void)snprintf(
+                line,
+                sizeof(line),
+                "%c S%u   %3d",
+                mark,
+                (unsigned int)(i + 1U),
+                (int)s_servo_angle_preset[i]
+            );
+        }
+        else
+        {
+            line[0] = '\0';
+        }
+
+        lv_label_set_text(row_label, line);
+    }
+}
+
+static void lvgl_app_control_confirm_selected(void)
+{
+    if (s_ctrl_editing == 0U)
+    {
+        s_ctrl_editing = 1U;
+        if (s_group != NULL)
+        {
+            lv_group_set_editing(s_group, true);
+            lv_group_focus_freeze(s_group, true);
+        }
+
+        if ((s_ctrl_selected_row < LVGL_APP_MOTOR_COUNT) && (s_ctrl_row_btns[s_ctrl_selected_row] != NULL))
+        {
+            if (lv_obj_is_valid(s_ctrl_row_btns[s_ctrl_selected_row]) != false)
+            {
+                lv_group_focus_obj(s_ctrl_row_btns[s_ctrl_selected_row]);
+            }
+        }
+
+        if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+        {
+            lvgl_app_set_status("M%u: 左右调速, OK发送, KEY2退出编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+        }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
+        {
+            lvgl_app_set_status("S%u: 左右调角度, OK发送, KEY2退出编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+        }
+    }
+    else
+    {
+        if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+        {
+            lvgl_app_motor_speed_send_cmd((uint8_t)(s_ctrl_selected_row + 1U), s_motor_speed_preset[s_ctrl_selected_row]);
+            lvgl_app_set_status(
+                "M%u 已发送: %d (KEY2退出编辑)",
+                (unsigned int)(s_ctrl_selected_row + 1U),
+                (int)s_motor_speed_preset[s_ctrl_selected_row]
+            );
+        }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
+        {
+            lvgl_app_servo_angle_send_cmd((uint8_t)(s_ctrl_selected_row + 1U), s_servo_angle_preset[s_ctrl_selected_row]);
+            lvgl_app_set_status(
+                "S%u 已发送: %d (KEY2退出编辑)",
+                (unsigned int)(s_ctrl_selected_row + 1U),
+                (int)s_servo_angle_preset[s_ctrl_selected_row]
+            );
+        }
+    }
+
+    lvgl_app_control_refresh_rows();
+}
+
+static void lvgl_app_control_exit_edit_mode(void)
+{
+    if (s_ctrl_editing == 0U)
+    {
+        return;
+    }
+
+    s_ctrl_editing = 0U;
+    if (s_group != NULL)
+    {
+        lv_group_focus_freeze(s_group, false);
+        lv_group_set_editing(s_group, false);
+    }
+
+    if (s_ctrl_selected_row < LVGL_APP_MOTOR_COUNT)
+    {
+        if (s_ctrl_row_btns[s_ctrl_selected_row] != NULL)
+        {
+            if (lv_obj_is_valid(s_ctrl_row_btns[s_ctrl_selected_row]) != false)
+            {
+                lv_group_focus_obj(s_ctrl_row_btns[s_ctrl_selected_row]);
+            }
+        }
+    }
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+    {
+        lvgl_app_set_status("退出速度编辑, 可上下切换电机, OK进入编辑");
+    }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
+    {
+        lvgl_app_set_status("退出舵机编辑, 可上下切换舵机, OK进入编辑");
+    }
+
+    lvgl_app_control_refresh_rows();
+}
+
+static void lvgl_app_control_back_to_motor_menu(void)
+{
+    if (s_group != NULL)
+    {
+        lv_group_focus_freeze(s_group, false);
+        lv_group_set_editing(s_group, false);
+    }
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+    {
+        lvgl_app_motor_speed_force_clear_all();
+    }
+
+    lvgl_app_control_clear_row_refs();
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MOTOR_MENU);
+}
+
+static void lvgl_app_control_adjust_selected(int8_t direction)
+{
+    int16_t value;
+
+    if (s_ctrl_editing == 0U)
+    {
+        return;
+    }
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+    {
+        value = (int16_t)(s_motor_speed_preset[s_ctrl_selected_row] + (int16_t)(direction * LVGL_APP_SPEED_STEP));
+        if (value < LVGL_APP_SPEED_MIN)
+        {
+            value = LVGL_APP_SPEED_MIN;
+        }
+        else if (value > LVGL_APP_SPEED_MAX)
+        {
+            value = LVGL_APP_SPEED_MAX;
+        }
+
+        s_motor_speed_preset[s_ctrl_selected_row] = value;
+    }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
+    {
+        value = (int16_t)(s_servo_angle_preset[s_ctrl_selected_row] + (int16_t)(direction * LVGL_APP_SERVO_STEP));
+        if (value < LVGL_APP_SERVO_MIN)
+        {
+            value = LVGL_APP_SERVO_MIN;
+        }
+        else if (value > LVGL_APP_SERVO_MAX)
+        {
+            value = LVGL_APP_SERVO_MAX;
+        }
+
+        s_servo_angle_preset[s_ctrl_selected_row] = value;
+    }
+
+    lvgl_app_control_refresh_rows();
+}
+
+static void lvgl_app_control_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code;
+    uint32_t key;
+    uint8_t row;
+    uint32_t now;
+
+    code = lv_event_get_code(e);
+    row = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    if (row >= LVGL_APP_MOTOR_COUNT)
+    {
+        row = s_ctrl_selected_row;
+    }
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_NONE)
+    {
+        return;
+    }
+
+    if (code == LV_EVENT_FOCUSED)
+    {
+        if (s_ctrl_editing == 0U)
+        {
+            s_ctrl_selected_row = row;
+            lvgl_app_control_refresh_rows();
+
+            if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+            {
+                lvgl_app_set_status("当前电机 M%u, OK进入编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+            }
+            else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
+            {
+                lvgl_app_set_status("当前舵机 S%u, OK进入编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+            }
+        }
+        return;
+    }
+
+    if (code == LV_EVENT_SHORT_CLICKED)
+    {
+        now = HAL_GetTick();
+        if ((now - s_ctrl_last_confirm_tick) < 120U)
+        {
+            return;
+        }
+
+        s_ctrl_last_confirm_tick = now;
+        s_ctrl_selected_row = row;
+        lvgl_app_control_confirm_selected();
+        return;
+    }
+
+    if (code != LV_EVENT_KEY)
+    {
+        return;
+    }
+
+    key = lvgl_app_event_get_key(e);
+    if (s_ctrl_editing == 0U)
+    {
+        if (key == LV_KEY_LEFT)
+        {
+            lvgl_app_control_back_to_motor_menu();
+            return;
+        }
+
+        if (key == LV_KEY_ESC)
+        {
+            lvgl_app_control_back_to_motor_menu();
+            return;
+        }
+
+        if (key == LV_KEY_ENTER)
+        {
+            now = HAL_GetTick();
+            if ((now - s_ctrl_last_confirm_tick) >= 120U)
+            {
+                s_ctrl_last_confirm_tick = now;
+                s_ctrl_selected_row = row;
+                lvgl_app_control_confirm_selected();
+            }
+
+            return;
+        }
+
+        return;
+    }
+
+    if ((key == LV_KEY_UP) || (key == LV_KEY_PREV) || (key == LV_KEY_DOWN) || (key == LV_KEY_NEXT))
+    {
+        return;
+    }
+
+    if (key == LV_KEY_LEFT)
+    {
+        lvgl_app_control_adjust_selected(-1);
+        return;
+    }
+
+    if (key == LV_KEY_RIGHT)
+    {
+        lvgl_app_control_adjust_selected(1);
+        return;
+    }
+
+    if (key == LV_KEY_ENTER)
+    {
+        now = HAL_GetTick();
+        if ((now - s_ctrl_last_confirm_tick) >= 120U)
+        {
+            s_ctrl_last_confirm_tick = now;
+            lvgl_app_control_confirm_selected();
+        }
+        return;
+    }
+
+    if (key == LV_KEY_ESC)
+    {
+        lvgl_app_control_exit_edit_mode();
+    }
+}
+
+static void lvgl_app_show_motor_speed_control(void)
+{
+    lv_obj_t *title;
+    lv_obj_t *header;
+    lv_obj_t *row_btn;
+    uint8_t i;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_MOTOR_SPEED;
+    s_ctrl_selected_row = 0U;
+    s_ctrl_editing = 0U;
+    s_ctrl_last_confirm_tick = 0U;
+    lvgl_app_control_clear_row_refs();
+
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "电机速度");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    header = lv_label_create(lv_scr_act());
+    lv_label_set_text(header, "ID   PRESET   ACTUAL");
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 32);
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        row_btn = lv_btn_create(lv_scr_act());
+        s_ctrl_row_btns[i] = row_btn;
+        lv_obj_set_size(row_btn, 220, 22);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 54 + (lv_coord_t)i * 24);
+        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_SHORT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
+
+        s_ctrl_row_labels[i] = lv_label_create(row_btn);
+        lv_obj_set_style_pad_left(s_ctrl_row_labels[i], 6, 0);
+        lv_obj_set_style_pad_right(s_ctrl_row_labels[i], 6, 0);
+        lv_obj_set_style_pad_top(s_ctrl_row_labels[i], 2, 0);
+        lv_obj_set_style_pad_bottom(s_ctrl_row_labels[i], 2, 0);
+        lv_obj_set_style_radius(s_ctrl_row_labels[i], 4, 0);
+        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_group_add_obj(s_group, row_btn);
+    }
+
+    if (s_ctrl_row_btns[0] != NULL)
+    {
+        lv_group_focus_obj(s_ctrl_row_btns[0]);
+    }
+    lv_group_set_editing(s_group, false);
+
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, s_status_text);
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    lvgl_app_control_refresh_rows();
+    lvgl_app_set_status("上下选电机, OK进入编辑, 编辑中OK发送, KEY2退出编辑, 左键返回并清零");
+}
+
+static void lvgl_app_show_servo_angle_control(void)
+{
+    lv_obj_t *title;
+    lv_obj_t *header;
+    lv_obj_t *row_btn;
+    uint8_t i;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_SERVO_ANGLE;
+    s_ctrl_selected_row = 0U;
+    s_ctrl_editing = 0U;
+    s_ctrl_last_confirm_tick = 0U;
+    lvgl_app_control_clear_row_refs();
+
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "舵机角度");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    header = lv_label_create(lv_scr_act());
+    lv_label_set_text(header, "ID   ANGLE");
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 32);
+
+    for (i = 0U; i < LVGL_APP_SERVO_COUNT; ++i)
+    {
+        row_btn = lv_btn_create(lv_scr_act());
+        s_ctrl_row_btns[i] = row_btn;
+        lv_obj_set_size(row_btn, 220, 22);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 54 + (lv_coord_t)i * 24);
+        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_SHORT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
+
+        s_ctrl_row_labels[i] = lv_label_create(row_btn);
+        lv_obj_set_style_pad_left(s_ctrl_row_labels[i], 6, 0);
+        lv_obj_set_style_pad_right(s_ctrl_row_labels[i], 6, 0);
+        lv_obj_set_style_pad_top(s_ctrl_row_labels[i], 2, 0);
+        lv_obj_set_style_pad_bottom(s_ctrl_row_labels[i], 2, 0);
+        lv_obj_set_style_radius(s_ctrl_row_labels[i], 4, 0);
+        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_group_add_obj(s_group, row_btn);
+    }
+
+    if (s_ctrl_row_btns[0] != NULL)
+    {
+        lv_group_focus_obj(s_ctrl_row_btns[0]);
+    }
+    lv_group_set_editing(s_group, false);
+
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, s_status_text);
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    lvgl_app_control_refresh_rows();
+    lvgl_app_set_status("上下选舵机, OK进入编辑, 编辑中OK发送, KEY2退出编辑, 左键返回");
+}
+
+static void lvgl_app_motor_menu_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code;
+    uintptr_t id;
+    uint32_t key;
+
+    code = lv_event_get_code(e);
+    id = (uintptr_t)lv_event_get_user_data(e);
+
+    if (code == LV_EVENT_KEY)
+    {
+        key = lvgl_app_event_get_key(e);
+        if ((key == LV_KEY_ESC) || (key == LV_KEY_LEFT))
+        {
+            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+            return;
+        }
+
+        if (key != LV_KEY_RIGHT)
+        {
+            return;
+        }
+    }
+    else if (code != LV_EVENT_CLICKED)
+    {
+        return;
+    }
+
+    if (id == LVGL_APP_MOTOR_SUB_ID_SPEED)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MOTOR_SPEED);
+    }
+    else if (id == LVGL_APP_MOTOR_SUB_ID_SERVO)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SERVO_ANGLE);
+    }
+    else
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+    }
+}
+
+static void lvgl_app_show_motor_control_menu(void)
+{
+    lv_obj_t *title;
+    lv_obj_t *list;
+    lv_obj_t *btn;
+    lv_obj_t *first_btn;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
+
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "电机控制");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    list = lv_list_create(lv_scr_act());
+    lv_obj_set_size(list, 220, 160);
+    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "1 电机速度");
+    first_btn = btn;
+    lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
+    lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
+    lv_group_add_obj(s_group, btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 舵机角度");
+    lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
+    lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
+    lv_group_add_obj(s_group, btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "返回主菜单");
+    lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
+    lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
+    lv_group_add_obj(s_group, btn);
+    lv_group_focus_obj(first_btn);
+
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, s_status_text);
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    lvgl_app_set_status("先电机后舵机, 左键返回");
+}
+
 static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
 {
     uint8_t enter_ok;
@@ -550,7 +1250,7 @@ static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
     }
     else
     {
-        lvgl_app_set_status("Path: %s", s_browser_path);
+        lvgl_app_set_status("路径: %s", s_browser_path);
     }
 
     lvgl_app_show_sd_browser();
@@ -701,7 +1401,7 @@ static uint8_t lvgl_app_probe_gif_open(const char *full_path, char *reason, size
     if (fr != FR_OK)
     {
         (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
-        (void)snprintf(reason, reason_size, "GIF open failed (%d)", (int)fr);
+        (void)snprintf(reason, reason_size, "GIF打开失败(%d)", (int)fr);
         return 0U;
     }
 
@@ -788,26 +1488,26 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
-        lvgl_app_set_status("Path build failed");
+          lvgl_app_set_status("路径生成失败");
         lvgl_app_show_sd_browser();
         return;
     }
 
-    lvgl_app_set_status("Playing BIN %s...", s_browser_entries[index].name);
+    lvgl_app_set_status("正在播放BIN %s...", s_browser_entries[index].name);
     lv_refr_now(NULL);
 
     play_status = SD_StartAnim_PlayFile(play_path);
     if (play_status == SD_START_ANIM_OK)
     {
-        lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
+          lvgl_app_set_status("完成: %s", s_browser_entries[index].name);
     }
     else if (play_status == SD_START_ANIM_ERR_STOPPED)
     {
-        lvgl_app_set_status("Stopped by KEY2");
+          lvgl_app_set_status("被KEY2停止");
     }
     else
     {
-        lvgl_app_set_status("Fail(%d): %s", (int)play_status, s_browser_entries[index].name);
+          lvgl_app_set_status("失败(%d): %s", (int)play_status, s_browser_entries[index].name);
     }
 
     lvgl_app_show_sd_browser();
@@ -901,16 +1601,17 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     if (s_gif == NULL)
     {
         (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
-        lvgl_app_set_status("GIF open failed (decoder/memory)");
+        lvgl_app_set_status("GIF打开失败（解码/内存）");
         lvgl_app_show_sd_browser();
         return;
     }
 
-    lv_obj_clean(lv_scr_act());
     lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "GIF Player");
+    lv_label_set_text(title, "GIF播放");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     s_gif_obj = lv_img_create(lv_scr_act());
@@ -927,7 +1628,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     lv_obj_align(ctrl_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     ctrl_label = lv_label_create(ctrl_btn);
-    lv_label_set_text(ctrl_label, "Left/Right seek 10, KEY2 stop");
+    lv_label_set_text(ctrl_label, "左右快进10秒，KEY2停止");
     lv_obj_center(ctrl_label);
 
     lv_obj_add_event_cb(ctrl_btn, lvgl_app_gif_event_cb, LV_EVENT_CLICKED, NULL);
@@ -942,7 +1643,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     }
     else
     {
-        lvgl_app_set_status("GIF playing");
+        lvgl_app_set_status("GIF播放中");
     }
     lv_label_set_text(s_status_label, s_status_text);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 30);
@@ -997,7 +1698,7 @@ static void lvgl_app_sd_play_gif_by_index(uint16_t index)
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
-        lvgl_app_set_status("Path build failed");
+            lvgl_app_set_status("路径生成失败");
         lvgl_app_show_sd_browser();
         return;
     }
@@ -1012,26 +1713,26 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
-        lvgl_app_set_status("Path build failed");
+          lvgl_app_set_status("路径生成失败");
         lvgl_app_show_sd_browser();
         return;
     }
 
-    lvgl_app_set_status("Playing %s...", s_browser_entries[index].name);
+    lvgl_app_set_status("正在播放 %s...", s_browser_entries[index].name);
     lv_refr_now(NULL);
 
     play_status = MJPEG_Player_PlayFile(play_path);
     if (play_status == MJPEG_PLAYER_OK)
     {
-        lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
+          lvgl_app_set_status("完成: %s", s_browser_entries[index].name);
     }
     else if (play_status == MJPEG_PLAYER_ERR_STOPPED)
     {
-        lvgl_app_set_status("Stopped by KEY2");
+          lvgl_app_set_status("被KEY2停止");
     }
     else
     {
-        lvgl_app_set_status("MJPEG fail(%d): %s", (int)play_status, s_browser_entries[index].name);
+          lvgl_app_set_status("MJPEG失败(%d): %s", (int)play_status, s_browser_entries[index].name);
     }
 
     lvgl_app_show_sd_browser();
@@ -1051,7 +1752,7 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     {
         if (lvgl_app_browser_go_parent() == 0U)
         {
-            lvgl_app_set_status("Already at root");
+            lvgl_app_set_status("已经在根目录");
         }
         lvgl_app_show_sd_browser();
         return;
@@ -1079,6 +1780,10 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     {
         lvgl_app_sd_play_mjpeg_by_index(index);
     }
+    else if (s_browser_entries[index].type == LVGL_APP_ENTRY_FILE)
+    {
+        lvgl_app_set_status("文件: %s", s_browser_entries[index].name);
+    }
 }
 
 static void lvgl_app_sd_left_action(void)
@@ -1089,7 +1794,7 @@ static void lvgl_app_sd_left_action(void)
         return;
     }
 
-    lvgl_app_set_status("Back to main menu");
+    lvgl_app_set_status("返回主菜单");
     lvgl_app_show_main_menu();
 }
 
@@ -1114,7 +1819,7 @@ static void lvgl_app_sd_right_action(uintptr_t id)
     }
     else
     {
-        lvgl_app_set_status("RIGHT only enters folder");
+        lvgl_app_set_status("右键只进入文件夹");
     }
 }
 
@@ -1130,7 +1835,7 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
         key = lvgl_app_event_get_key(e);
         if (key == LV_KEY_ESC)
         {
-            lvgl_app_set_status("Main menu");
+            lvgl_app_set_status("主菜单");
             lvgl_app_show_main_menu();
             return;
         }
@@ -1145,16 +1850,16 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     id = (uintptr_t)lv_event_get_user_data(e);
     if (id == LVGL_APP_MENU_ID_MANUAL)
     {
-        lvgl_app_set_status("Menu1: Manual motor UI placeholder");
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MOTOR_MENU);
     }
     else if (id == LVGL_APP_MENU_ID_COMMAND)
     {
-        lvgl_app_set_status("Menu2: Command motor UI placeholder");
+        lvgl_app_set_status("菜单2：指令电机界面占位");
     }
     else if (id == LVGL_APP_MENU_ID_SD_BROWSER)
     {
         lvgl_app_browser_reset_path();
-        lvgl_app_show_sd_browser();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
     }
 }
 
@@ -1173,7 +1878,7 @@ static void lvgl_app_sd_file_event_cb(lv_event_t *e)
 
         if (key == LV_KEY_ESC)
         {
-            lvgl_app_set_status("Global exit");
+            lvgl_app_set_status("全局退出");
             lvgl_app_show_main_menu();
             return;
         }
@@ -1207,30 +1912,30 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_t *btn;
     lv_obj_t *first_btn;
 
+    lvgl_app_group_reset();
+    s_status_label = NULL;
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Main Menu");
+    lv_label_set_text(title, "主菜单");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     list = lv_list_create(lv_scr_act());
     lv_obj_set_size(list, 220, 160);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
 
-    lvgl_app_group_reset();
-
-    btn = lv_list_add_btn(list, LV_SYMBOL_PLAY, "1 Manual motor");
+    btn = lv_list_add_btn(list, LV_SYMBOL_PLAY, "1 电机控制");
     first_btn = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "2 Command motor");
+    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "2 指令控制");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, "3 SD media");
+    btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, "3 SD卡文件");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_group_add_obj(s_group, btn);
@@ -1254,13 +1959,15 @@ static void lvgl_app_show_sd_browser(void)
 
     (void)lvgl_app_scan_browser_entries();
 
+    lvgl_app_group_reset();
+    s_status_label = NULL;
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "SD Browser (.BIN/.GIF/.AVI/.MJPEG)");
+    lv_label_set_text(title, "SD卡文件");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    (void)snprintf(path_line, sizeof(path_line), "Path: %s", s_browser_path);
+    (void)snprintf(path_line, sizeof(path_line), "路径: %s", s_browser_path);
     btn = lv_label_create(lv_scr_act());
     lv_label_set_text(btn, path_line);
     lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 24);
@@ -1269,14 +1976,12 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_set_size(list, 220, 146);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 44);
 
-    lvgl_app_group_reset();
-
-    back_btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back");
+    back_btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "返回");
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lv_group_add_obj(s_group, back_btn);
 
-    up_btn = lv_list_add_btn(list, LV_SYMBOL_UP, "Up");
+    up_btn = lv_list_add_btn(list, LV_SYMBOL_UP, "上一级");
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lv_group_add_obj(s_group, up_btn);
@@ -1285,9 +1990,9 @@ static void lvgl_app_show_sd_browser(void)
 
     if (s_browser_entry_count == 0U)
     {
-        btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "No folder or media");
+        btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "没有文件夹或媒体");
         lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lvgl_app_set_status("Empty: %s", s_browser_path);
+        lvgl_app_set_status("为空: %s", s_browser_path);
         lv_group_focus_obj(up_btn);
     }
     else
@@ -1352,12 +2057,12 @@ static void lvgl_app_process_gif_stop_key(void)
     }
 
     s_key2_latched = 1U;
-    lvgl_app_exit_gif_player("Stopped by KEY2");
+    lvgl_app_exit_gif_player("被KEY2停止");
 }
 
 void LVGL_App_Init(void)
 {
-    lvgl_app_set_status("Up/Down move, Right enter, Left back, KEY3 exit");
+    lvgl_app_set_status("上下移动，右键进入，左键返回，KEY2退出");
     lvgl_app_show_main_menu();
 }
 
@@ -1365,4 +2070,5 @@ void LVGL_App_Process(void)
 {
     lvgl_app_process_gif_stop_key();
     lv_timer_handler();
+    lvgl_app_process_pending_screen();
 }

@@ -23,6 +23,11 @@ static uint32_t lv_port_key_get_code(void)
     uint32_t lr_key;
     uint32_t now;
 
+    if (lv_port_key_is_pressed(Key2_GPIO_Port, Key2_Pin) != 0U)
+    {
+        return LV_KEY_ESC;
+    }
+
     if (lv_port_key_is_pressed(Key3_GPIO_Port, Key3_Pin) != 0U)
     {
         return LV_KEY_ESC;

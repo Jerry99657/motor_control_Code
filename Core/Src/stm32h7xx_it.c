@@ -58,6 +58,7 @@ typedef struct
   uint32_t afsr;
   uint32_t bfar;
   uint32_t mmfar;
+  uint32_t fault_type;
 } HardFaultSnapshot_t;
 
 volatile HardFaultSnapshot_t g_hardfault_snapshot;
@@ -74,7 +75,11 @@ void HardFault_HandlerC(uint32_t *stacked_sp);
 /* USER CODE BEGIN 0 */
 void HardFault_HandlerC(uint32_t *stacked_sp)
 {
+  __DSB();
+  __ISB();
+
   g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
+  g_hardfault_snapshot.fault_type = 1U;
   g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
   g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
   g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
@@ -92,6 +97,87 @@ void HardFault_HandlerC(uint32_t *stacked_sp)
 
   __DSB();
   __ISB();
+
+  while (1)
+  {
+  }
+}
+
+void MemManage_HandlerC(uint32_t *stacked_sp)
+{
+  __DSB();
+  __ISB();
+
+  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
+  g_hardfault_snapshot.fault_type = 2U;
+  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
+  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
+  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
+  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
+  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
+  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
+  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
+  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
+  g_hardfault_snapshot.cfsr = SCB->CFSR;
+  g_hardfault_snapshot.hfsr = SCB->HFSR;
+  g_hardfault_snapshot.dfsr = SCB->DFSR;
+  g_hardfault_snapshot.afsr = SCB->AFSR;
+  g_hardfault_snapshot.bfar = SCB->BFAR;
+  g_hardfault_snapshot.mmfar = SCB->MMFAR;
+
+  while (1)
+  {
+  }
+}
+
+void BusFault_HandlerC(uint32_t *stacked_sp)
+{
+  __DSB();
+  __ISB();
+
+  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
+  g_hardfault_snapshot.fault_type = 3U;
+  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
+  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
+  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
+  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
+  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
+  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
+  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
+  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
+  g_hardfault_snapshot.cfsr = SCB->CFSR;
+  g_hardfault_snapshot.hfsr = SCB->HFSR;
+  g_hardfault_snapshot.dfsr = SCB->DFSR;
+  g_hardfault_snapshot.afsr = SCB->AFSR;
+  g_hardfault_snapshot.bfar = SCB->BFAR;
+  g_hardfault_snapshot.mmfar = SCB->MMFAR;
+
+  while (1)
+  {
+  }
+}
+
+void UsageFault_HandlerC(uint32_t *stacked_sp)
+{
+  __DSB();
+  __ISB();
+
+  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
+  g_hardfault_snapshot.fault_type = 4U;
+  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
+  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
+  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
+  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
+  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
+  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
+  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
+  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
+  g_hardfault_snapshot.cfsr = SCB->CFSR;
+  g_hardfault_snapshot.hfsr = SCB->HFSR;
+  g_hardfault_snapshot.dfsr = SCB->DFSR;
+  g_hardfault_snapshot.afsr = SCB->AFSR;
+  g_hardfault_snapshot.bfar = SCB->BFAR;
+  g_hardfault_snapshot.mmfar = SCB->MMFAR;
 
   while (1)
   {
@@ -163,6 +249,15 @@ void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
 
+  __asm volatile
+  (
+    "tst lr, #4       \n"
+    "ite eq           \n"
+    "mrseq r0, msp    \n"
+    "mrsne r0, psp    \n"
+    "b MemManage_HandlerC \n"
+  );
+
   /* USER CODE END MemoryManagement_IRQn 0 */
   while (1)
   {
@@ -178,6 +273,15 @@ void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
 
+  __asm volatile
+  (
+    "tst lr, #4       \n"
+    "ite eq           \n"
+    "mrseq r0, msp    \n"
+    "mrsne r0, psp    \n"
+    "b BusFault_HandlerC \n"
+  );
+
   /* USER CODE END BusFault_IRQn 0 */
   while (1)
   {
@@ -192,6 +296,15 @@ void BusFault_Handler(void)
 void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
+
+  __asm volatile
+  (
+    "tst lr, #4       \n"
+    "ite eq           \n"
+    "mrseq r0, msp    \n"
+    "mrsne r0, psp    \n"
+    "b UsageFault_HandlerC \n"
+  );
 
   /* USER CODE END UsageFault_IRQn 0 */
   while (1)
