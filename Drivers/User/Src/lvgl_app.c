@@ -16,7 +16,7 @@
 
 static lv_obj_t *s_status_label = NULL;
 static lv_group_t *s_group = NULL;
-static char s_status_text[640] = "上下移动，右键进入，左键返回，OK播放";
+static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play";
 
 #define LVGL_APP_MAX_BROWSER_ENTRIES 48U
 #define LVGL_APP_ENTRY_NAME_LEN      256U
@@ -135,7 +135,7 @@ static void lvgl_app_set_status(const char *fmt, ...)
     va_list args;
 
     va_start(args, fmt);
-    (void)vsnprintf(s_status_text, sizeof(s_status_text), fmt, args);
+           (void)vsnprintf(s_status_text, sizeof(s_status_text), fmt, args);
     va_end(args);
 
     if (s_status_label != NULL)
@@ -416,7 +416,7 @@ static uint16_t lvgl_app_scan_browser_entries(void)
 
             if (s_browser_entry_count >= LVGL_APP_MAX_BROWSER_ENTRIES)
             {
-                lvgl_app_set_status("文件过多");
+                lvgl_app_set_status("Too many files");
                 break;
             }
         }
@@ -756,11 +756,11 @@ static void lvgl_app_control_confirm_selected(void)
 
         if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
         {
-            lvgl_app_set_status("M%u: 左右调速, OK发送, KEY2退出编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+            lvgl_app_set_status("M%u: Left/Right adjust speed, OK send, KEY2 exit edit", (unsigned int)(s_ctrl_selected_row + 1U));
         }
         else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
         {
-            lvgl_app_set_status("S%u: 左右调角度, OK发送, KEY2退出编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+            lvgl_app_set_status("S%u: Left/Right adjust angle, OK send, KEY2 exit edit", (unsigned int)(s_ctrl_selected_row + 1U));
         }
     }
     else
@@ -769,7 +769,7 @@ static void lvgl_app_control_confirm_selected(void)
         {
             lvgl_app_motor_speed_send_cmd((uint8_t)(s_ctrl_selected_row + 1U), s_motor_speed_preset[s_ctrl_selected_row]);
             lvgl_app_set_status(
-                "M%u 已发送: %d (KEY2退出编辑)",
+                "M%u sent: %d (KEY2 exit edit)",
                 (unsigned int)(s_ctrl_selected_row + 1U),
                 (int)s_motor_speed_preset[s_ctrl_selected_row]
             );
@@ -778,7 +778,7 @@ static void lvgl_app_control_confirm_selected(void)
         {
             lvgl_app_servo_angle_send_cmd((uint8_t)(s_ctrl_selected_row + 1U), s_servo_angle_preset[s_ctrl_selected_row]);
             lvgl_app_set_status(
-                "S%u 已发送: %d (KEY2退出编辑)",
+                "S%u sent: %d (KEY2 exit edit)",
                 (unsigned int)(s_ctrl_selected_row + 1U),
                 (int)s_servo_angle_preset[s_ctrl_selected_row]
             );
@@ -815,11 +815,11 @@ static void lvgl_app_control_exit_edit_mode(void)
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
     {
-        lvgl_app_set_status("退出速度编辑, 可上下切换电机, OK进入编辑");
+        lvgl_app_set_status("Exit speed edit, use Up/Down to change motor, OK to edit");
     }
     else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
     {
-        lvgl_app_set_status("退出舵机编辑, 可上下切换舵机, OK进入编辑");
+        lvgl_app_set_status("Exit servo edit, use Up/Down to change servo, OK to edit");
     }
 
     lvgl_app_control_refresh_rows();
@@ -913,11 +913,11 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
 
             if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
             {
-                lvgl_app_set_status("当前电机 M%u, OK进入编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+                lvgl_app_set_status("Motor M%u selected, OK to edit", (unsigned int)(s_ctrl_selected_row + 1U));
             }
             else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
             {
-                lvgl_app_set_status("当前舵机 S%u, OK进入编辑", (unsigned int)(s_ctrl_selected_row + 1U));
+                lvgl_app_set_status("Servo S%u selected, OK to edit", (unsigned int)(s_ctrl_selected_row + 1U));
             }
         }
         return;
@@ -1025,11 +1025,11 @@ static void lvgl_app_show_motor_speed_control(void)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "电机速度");
+            lv_label_set_text(title, "Motor Speed");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     header = lv_label_create(lv_scr_act());
-    lv_label_set_text(header, "ID   PRESET   ACTUAL");
+            lv_label_set_text(header, "ID   PRESET   ACTUAL");
     lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 32);
 
     for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
@@ -1074,7 +1074,7 @@ static void lvgl_app_show_motor_speed_control(void)
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     lvgl_app_control_refresh_rows();
-    lvgl_app_set_status("上下选电机, OK进入编辑, 编辑中OK发送, KEY2退出编辑, 左键返回并清零");
+        lvgl_app_set_status("Up/Down select motor, OK to edit, OK sends while editing, KEY2 exits edit, Left returns and clears speeds");
 }
 
 static void lvgl_app_show_servo_angle_control(void)
@@ -1095,7 +1095,7 @@ static void lvgl_app_show_servo_angle_control(void)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "舵机角度");
+    lv_label_set_text(title, "Servo Angle");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     header = lv_label_create(lv_scr_act());
@@ -1144,7 +1144,7 @@ static void lvgl_app_show_servo_angle_control(void)
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     lvgl_app_control_refresh_rows();
-    lvgl_app_set_status("上下选舵机, OK进入编辑, 编辑中OK发送, KEY2退出编辑, 左键返回");
+    lvgl_app_set_status("Up/Down select servo, OK to edit, OK sends while editing, KEY2 exits edit, Left returns");
 }
 
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e)
@@ -1205,25 +1205,25 @@ static void lvgl_app_show_motor_control_menu(void)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "电机控制");
+    lv_label_set_text(title, "Motor Control");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     list = lv_list_create(lv_scr_act());
     lv_obj_set_size(list, 220, 160);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "1 电机速度");
+    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "1 Motor Speed");
     first_btn = btn;
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 舵机角度");
+    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 Servo Angle");
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "返回主菜单");
+    btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back to Main Menu");
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
     lv_group_add_obj(s_group, btn);
@@ -1233,7 +1233,7 @@ static void lvgl_app_show_motor_control_menu(void)
     lv_label_set_text(s_status_label, s_status_text);
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 
-    lvgl_app_set_status("先电机后舵机, 左键返回");
+    lvgl_app_set_status("Motor first, Left to go back");
 }
 
 static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
@@ -1250,7 +1250,7 @@ static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
     }
     else
     {
-        lvgl_app_set_status("路径: %s", s_browser_path);
+        lvgl_app_set_status("Path: %s", s_browser_path);
     }
 
     lvgl_app_show_sd_browser();
@@ -1401,7 +1401,7 @@ static uint8_t lvgl_app_probe_gif_open(const char *full_path, char *reason, size
     if (fr != FR_OK)
     {
         (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
-        (void)snprintf(reason, reason_size, "GIF打开失败(%d)", (int)fr);
+        (void)snprintf(reason, reason_size, "GIF open failed (%d)", (int)fr);
         return 0U;
     }
 
@@ -1488,26 +1488,26 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
-          lvgl_app_set_status("路径生成失败");
+          lvgl_app_set_status("Failed to build path");
         lvgl_app_show_sd_browser();
         return;
     }
 
-    lvgl_app_set_status("正在播放BIN %s...", s_browser_entries[index].name);
+    lvgl_app_set_status("Playing BIN %s...", s_browser_entries[index].name);
     lv_refr_now(NULL);
 
     play_status = SD_StartAnim_PlayFile(play_path);
     if (play_status == SD_START_ANIM_OK)
     {
-          lvgl_app_set_status("完成: %s", s_browser_entries[index].name);
+          lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
     }
     else if (play_status == SD_START_ANIM_ERR_STOPPED)
     {
-          lvgl_app_set_status("被KEY2停止");
+          lvgl_app_set_status("Stopped by KEY2");
     }
     else
     {
-          lvgl_app_set_status("失败(%d): %s", (int)play_status, s_browser_entries[index].name);
+          lvgl_app_set_status("Failed (%d): %s", (int)play_status, s_browser_entries[index].name);
     }
 
     lvgl_app_show_sd_browser();
@@ -1601,7 +1601,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     if (s_gif == NULL)
     {
         (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
-        lvgl_app_set_status("GIF打开失败（解码/内存）");
+        lvgl_app_set_status("GIF open failed (decode/memory)");
         lvgl_app_show_sd_browser();
         return;
     }
@@ -1611,7 +1611,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "GIF播放");
+    lv_label_set_text(title, "GIF Player");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     s_gif_obj = lv_img_create(lv_scr_act());
@@ -1628,7 +1628,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     lv_obj_align(ctrl_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     ctrl_label = lv_label_create(ctrl_btn);
-    lv_label_set_text(ctrl_label, "左右快进10秒，KEY2停止");
+    lv_label_set_text(ctrl_label, "Left/Right seek 10s, KEY2 stop");
     lv_obj_center(ctrl_label);
 
     lv_obj_add_event_cb(ctrl_btn, lvgl_app_gif_event_cb, LV_EVENT_CLICKED, NULL);
@@ -1643,7 +1643,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     }
     else
     {
-        lvgl_app_set_status("GIF播放中");
+        lvgl_app_set_status("Playing GIF");
     }
     lv_label_set_text(s_status_label, s_status_text);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 30);
@@ -1698,7 +1698,7 @@ static void lvgl_app_sd_play_gif_by_index(uint16_t index)
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
-            lvgl_app_set_status("路径生成失败");
+            lvgl_app_set_status("Failed to build path");
         lvgl_app_show_sd_browser();
         return;
     }
@@ -1713,26 +1713,26 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
-          lvgl_app_set_status("路径生成失败");
+          lvgl_app_set_status("Failed to build path");
         lvgl_app_show_sd_browser();
         return;
     }
 
-    lvgl_app_set_status("正在播放 %s...", s_browser_entries[index].name);
+    lvgl_app_set_status("Playing %s...", s_browser_entries[index].name);
     lv_refr_now(NULL);
 
     play_status = MJPEG_Player_PlayFile(play_path);
     if (play_status == MJPEG_PLAYER_OK)
     {
-          lvgl_app_set_status("完成: %s", s_browser_entries[index].name);
+          lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
     }
     else if (play_status == MJPEG_PLAYER_ERR_STOPPED)
     {
-          lvgl_app_set_status("被KEY2停止");
+          lvgl_app_set_status("Stopped by KEY2");
     }
     else
     {
-          lvgl_app_set_status("MJPEG失败(%d): %s", (int)play_status, s_browser_entries[index].name);
+          lvgl_app_set_status("MJPEG failed (%d): %s", (int)play_status, s_browser_entries[index].name);
     }
 
     lvgl_app_show_sd_browser();
@@ -1752,7 +1752,7 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     {
         if (lvgl_app_browser_go_parent() == 0U)
         {
-            lvgl_app_set_status("已经在根目录");
+            lvgl_app_set_status("Already at root directory");
         }
         lvgl_app_show_sd_browser();
         return;
@@ -1782,7 +1782,7 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     }
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_FILE)
     {
-        lvgl_app_set_status("文件: %s", s_browser_entries[index].name);
+        lvgl_app_set_status("File: %s", s_browser_entries[index].name);
     }
 }
 
@@ -1794,7 +1794,7 @@ static void lvgl_app_sd_left_action(void)
         return;
     }
 
-    lvgl_app_set_status("返回主菜单");
+    lvgl_app_set_status("Back to main menu");
     lvgl_app_show_main_menu();
 }
 
@@ -1819,7 +1819,7 @@ static void lvgl_app_sd_right_action(uintptr_t id)
     }
     else
     {
-        lvgl_app_set_status("右键只进入文件夹");
+        lvgl_app_set_status("Right key enters folders only");
     }
 }
 
@@ -1835,7 +1835,7 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
         key = lvgl_app_event_get_key(e);
         if (key == LV_KEY_ESC)
         {
-            lvgl_app_set_status("主菜单");
+            lvgl_app_set_status("Main menu");
             lvgl_app_show_main_menu();
             return;
         }
@@ -1854,7 +1854,7 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     }
     else if (id == LVGL_APP_MENU_ID_COMMAND)
     {
-        lvgl_app_set_status("菜单2：指令电机界面占位");
+            lvgl_app_set_status("Menu 2: command motor page placeholder");
     }
     else if (id == LVGL_APP_MENU_ID_SD_BROWSER)
     {
@@ -1878,7 +1878,7 @@ static void lvgl_app_sd_file_event_cb(lv_event_t *e)
 
         if (key == LV_KEY_ESC)
         {
-            lvgl_app_set_status("全局退出");
+            lvgl_app_set_status("Global exit");
             lvgl_app_show_main_menu();
             return;
         }
@@ -1917,25 +1917,25 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "主菜单");
+    lv_label_set_text(title, "Main Menu");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     list = lv_list_create(lv_scr_act());
     lv_obj_set_size(list, 220, 160);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_PLAY, "1 电机控制");
+    btn = lv_list_add_btn(list, LV_SYMBOL_PLAY, "1 Motor Control");
     first_btn = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "2 指令控制");
+    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "2 Command Control");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, "3 SD卡文件");
+    btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, "3 SD Card Files");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_group_add_obj(s_group, btn);
@@ -1964,10 +1964,10 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "SD卡文件");
+    lv_label_set_text(title, "SD Card Files");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    (void)snprintf(path_line, sizeof(path_line), "路径: %s", s_browser_path);
+    (void)snprintf(path_line, sizeof(path_line), "Path: %s", s_browser_path);
     btn = lv_label_create(lv_scr_act());
     lv_label_set_text(btn, path_line);
     lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 24);
@@ -1976,12 +1976,12 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_set_size(list, 220, 146);
     lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 44);
 
-    back_btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "返回");
+    back_btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back");
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lv_group_add_obj(s_group, back_btn);
 
-    up_btn = lv_list_add_btn(list, LV_SYMBOL_UP, "上一级");
+    up_btn = lv_list_add_btn(list, LV_SYMBOL_UP, "Parent");
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lv_group_add_obj(s_group, up_btn);
@@ -1990,9 +1990,9 @@ static void lvgl_app_show_sd_browser(void)
 
     if (s_browser_entry_count == 0U)
     {
-        btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "没有文件夹或媒体");
+        btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "No folders or media");
         lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lvgl_app_set_status("为空: %s", s_browser_path);
+        lvgl_app_set_status("Empty: %s", s_browser_path);
         lv_group_focus_obj(up_btn);
     }
     else
@@ -2057,12 +2057,12 @@ static void lvgl_app_process_gif_stop_key(void)
     }
 
     s_key2_latched = 1U;
-    lvgl_app_exit_gif_player("被KEY2停止");
+    lvgl_app_exit_gif_player("Stopped by KEY2");
 }
 
 void LVGL_App_Init(void)
 {
-    lvgl_app_set_status("上下移动，右键进入，左键返回，KEY2退出");
+    lvgl_app_set_status("Up/Down move, Right enters, Left goes back, KEY2 exits");
     lvgl_app_show_main_menu();
 }
 
