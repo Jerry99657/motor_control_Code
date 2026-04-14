@@ -1,6 +1,7 @@
 ﻿#include "lvgl_app.h"
 
 #include "lv_port_indev.h"
+#include "dc_motor_ol.h"
 #include "mjpeg_player.h"
 #include "sd_start_anim.h"
 #include "main.h"
@@ -34,7 +35,7 @@ static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play"
 #define LVGL_APP_SD_ID_BASE          2U
 
 #define LVGL_APP_MOTOR_COUNT         4U
-#define LVGL_APP_SERVO_COUNT         4U
+#define LVGL_APP_SERVO_COUNT         2U
 #define LVGL_APP_SPEED_MIN           (-100)
 #define LVGL_APP_SPEED_MAX           100
 #define LVGL_APP_SPEED_STEP          10
@@ -101,11 +102,12 @@ static lvgl_app_screen_req_t s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
 static uint8_t s_ctrl_selected_row = 0U;
 static uint8_t s_ctrl_editing = 0U;
 static int16_t s_motor_speed_preset[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
-static int16_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
-static int16_t s_servo_angle_preset[LVGL_APP_SERVO_COUNT] = {0, 0, 0, 0};
+static int32_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
+static int16_t s_servo_angle_preset[LVGL_APP_SERVO_COUNT] = {0, 0};
 static lv_obj_t *s_ctrl_row_btns[LVGL_APP_MOTOR_COUNT] = {NULL, NULL, NULL, NULL};
 static lv_obj_t *s_ctrl_row_labels[LVGL_APP_MOTOR_COUNT] = {NULL, NULL, NULL, NULL};
 static uint32_t s_ctrl_last_confirm_tick = 0U;
+static uint32_t s_ctrl_last_actual_refresh_tick = 0U;
 
 static void lvgl_app_control_clear_row_refs(void)
 {
@@ -598,9 +600,17 @@ static void lvgl_app_fs_init(void)
 
 static void lvgl_app_motor_speed_send_cmd(uint8_t motor_index, int16_t speed)
 {
-    /* Placeholder: real motor command channel will be connected later. */
-    (void)motor_index;
-    (void)speed;
+    DCMotor_OL_SetSpeed(motor_index, speed);
+}
+
+static void lvgl_app_motor_speed_sync_actual(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        s_motor_speed_actual[i] = DCMotor_OL_GetSpeedRpm((uint8_t)(i + 1U));
+    }
 }
 
 static void lvgl_app_motor_speed_force_clear_all(void)
@@ -610,16 +620,29 @@ static void lvgl_app_motor_speed_force_clear_all(void)
     for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
     {
         s_motor_speed_preset[i] = 0;
-        s_motor_speed_actual[i] = 0;
         lvgl_app_motor_speed_send_cmd((uint8_t)(i + 1U), 0);
     }
 }
 
+extern TIM_HandleTypeDef htim8;
+
 static void lvgl_app_servo_angle_send_cmd(uint8_t servo_index, int16_t angle)
 {
-    /* Placeholder: real servo command channel will be connected later. */
-    (void)servo_index;
-    (void)angle;
+    uint32_t ccr;
+    if (angle < LVGL_APP_SERVO_MIN) { angle = LVGL_APP_SERVO_MIN; }
+    if (angle > LVGL_APP_SERVO_MAX) { angle = LVGL_APP_SERVO_MAX; }
+
+    /* 0 degrees -> 500us, 270 degrees -> 2500us. Timer resolution: 1us */
+    ccr = 500U + ((uint32_t)angle * 2000U) / 270U;
+
+    if (servo_index == 1U)
+    {
+        __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_1, ccr);
+    }
+    else if (servo_index == 2U)
+    {
+        __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, ccr);
+    }
 }
 
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
@@ -682,17 +705,28 @@ static void lvgl_app_control_refresh_rows(void)
             s_ctrl_row_btns[i] = NULL;
         }
 
-        if ((row_btn != NULL) && (s_ctrl_editing != 0U) && (i == s_ctrl_selected_row))
+        if ((row_btn != NULL) && (i == s_ctrl_selected_row))
         {
             lv_obj_set_style_bg_opa(row_btn, LV_OPA_COVER, 0);
-            lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_AMBER), 0);
-            lv_obj_set_style_text_color(row_label, lv_color_black(), 0);
+            lv_obj_set_style_bg_opa(row_btn, LV_OPA_COVER, LV_STATE_FOCUSED);
+            if (s_ctrl_editing != 0U)
+            {
+                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_AMBER), 0);
+                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_AMBER), LV_STATE_FOCUSED);
+            }
+            else
+            {
+                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_BLUE), 0);
+                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_BLUE), LV_STATE_FOCUSED);
+            }
+            lv_obj_set_style_text_color(row_label, lv_color_white(), 0);
         }
         else
         {
             if (row_btn != NULL)
             {
                 lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_STATE_FOCUSED);
             }
             lv_obj_set_style_text_color(row_label, lv_color_black(), 0);
         }
@@ -708,11 +742,11 @@ static void lvgl_app_control_refresh_rows(void)
             (void)snprintf(
                 line,
                 sizeof(line),
-                "%c M%u   %+4d   %+4d",
+                "%c M%u   %+4d   %+8ld",
                 mark,
                 (unsigned int)(i + 1U),
                 (int)s_motor_speed_preset[i],
-                (int)s_motor_speed_actual[i]
+                (long)s_motor_speed_actual[i]
             );
         }
         else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
@@ -1029,7 +1063,7 @@ static void lvgl_app_show_motor_speed_control(void)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     header = lv_label_create(lv_scr_act());
-            lv_label_set_text(header, "ID   PRESET   ACTUAL");
+            lv_label_set_text(header, "ID   PRESET(%)   ACTUAL(r/min)");
     lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 32);
 
     for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
@@ -1073,8 +1107,10 @@ static void lvgl_app_show_motor_speed_control(void)
     lv_label_set_text(s_status_label, s_status_text);
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 
+    lvgl_app_motor_speed_sync_actual();
+    s_ctrl_last_actual_refresh_tick = HAL_GetTick();
     lvgl_app_control_refresh_rows();
-        lvgl_app_set_status("Up/Down select motor, OK to edit, OK sends while editing, KEY2 exits edit, Left returns and clears speeds");
+        lvgl_app_set_status("Up/Down select motor, OK to edit, OK sends while editing, KEY2 exits edit, Left returns and clears speed cmd");
 }
 
 static void lvgl_app_show_servo_angle_control(void)
@@ -2062,12 +2098,27 @@ static void lvgl_app_process_gif_stop_key(void)
 
 void LVGL_App_Init(void)
 {
+    /* Start TIM8 PWM for servos (1 and 2 only, 3 and 4 used by SDMMC1) */
+    HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+    
     lvgl_app_set_status("Up/Down move, Right enters, Left goes back, KEY2 exits");
     lvgl_app_show_main_menu();
 }
 
 void LVGL_App_Process(void)
 {
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+    {
+        uint32_t now = HAL_GetTick();
+        if ((now - s_ctrl_last_actual_refresh_tick) >= 10U)
+        {
+            s_ctrl_last_actual_refresh_tick = now;
+            lvgl_app_motor_speed_sync_actual();
+            lvgl_app_control_refresh_rows();
+        }
+    }
+
     lvgl_app_process_gif_stop_key();
     lv_timer_handler();
     lvgl_app_process_pending_screen();

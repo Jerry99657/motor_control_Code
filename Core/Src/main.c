@@ -34,6 +34,7 @@
 #include "qspi_anim_loader.h"
 #include "sd_start_anim.h"
 #include "mjpeg_scheduler.h"
+#include "dc_motor_ol.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
@@ -98,6 +99,7 @@ TIM_HandleTypeDef htim5;
 TIM_HandleTypeDef htim6;
 TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim8;
+TIM_HandleTypeDef htim13;
 TIM_HandleTypeDef htim15;
 
 UART_HandleTypeDef huart4;
@@ -169,6 +171,7 @@ static void MX_JPEG_Init(void);
 static void MX_TIM6_Init(void);
 static void MX_DMA2D_Init(void);
 static void MX_TIM7_Init(void);
+static void MX_TIM13_Init(void);
 /* USER CODE BEGIN PFP */
 static void LCD_ShowStartupScreen(void);
 static void LCD_ShowDownloadScreen(void);
@@ -860,6 +863,7 @@ int main(void)
   MX_TIM6_Init();
   MX_DMA2D_Init();
   MX_TIM7_Init();
+  MX_TIM13_Init();
   /* USER CODE BEGIN 2 */
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
@@ -914,7 +918,17 @@ int main(void)
   lv_port_indev_init();
   LVGL_App_Init();
 
+  if (DCMotor_OL_Init() != HAL_OK)
+  {
+    Error_Handler();
+  }
+
   if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_TIM_Base_Start_IT(&htim13) != HAL_OK)
   {
     Error_Handler();
   }
@@ -1184,7 +1198,6 @@ static void MX_DMA2D_Init(void)
   /* USER CODE BEGIN DMA2D_Init 1 */
 
   /* USER CODE END DMA2D_Init 1 */
-  g_dma2d_init_ok = 0U;
   hdma2d.Instance = DMA2D;
   hdma2d.Init.Mode = DMA2D_M2M_PFC;
   hdma2d.Init.ColorMode = DMA2D_OUTPUT_RGB565;
@@ -1198,13 +1211,12 @@ static void MX_DMA2D_Init(void)
   hdma2d.LayerCfg[1].ChromaSubSampling = DMA2D_CSS_420;
   if (HAL_DMA2D_Init(&hdma2d) != HAL_OK)
   {
-    return;
+    Error_Handler();
   }
   if (HAL_DMA2D_ConfigLayer(&hdma2d, 1) != HAL_OK)
   {
-    return;
+    Error_Handler();
   }
-  g_dma2d_init_ok = 1U;
   /* USER CODE BEGIN DMA2D_Init 2 */
 
   /* USER CODE END DMA2D_Init 2 */
@@ -1370,13 +1382,11 @@ static void MX_JPEG_Init(void)
   /* USER CODE BEGIN JPEG_Init 1 */
 
   /* USER CODE END JPEG_Init 1 */
-  g_jpeg_init_ok = 0U;
   hjpeg.Instance = JPEG;
   if (HAL_JPEG_Init(&hjpeg) != HAL_OK)
   {
-    return;
+    Error_Handler();
   }
-  g_jpeg_init_ok = 1U;
   /* USER CODE BEGIN JPEG_Init 2 */
 
   /* USER CODE END JPEG_Init 2 */
@@ -1441,7 +1451,7 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockDiv = 6;
   if (HAL_SD_Init(&hsd1) != HAL_OK)
   {
-    Error_Handler();
+    // Error_Handler(); /* 忽略无SD卡时的初始化报错 */
   }
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
@@ -1565,9 +1575,9 @@ static void MX_TIM1_Init(void)
 
   /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0;
+  htim1.Init.Prescaler = 239;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 65535;
+  htim1.Init.Period = 999;
   htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim1.Init.RepetitionCounter = 0;
   htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -1878,7 +1888,6 @@ static void MX_TIM7_Init(void)
   /* USER CODE BEGIN TIM7_Init 1 */
 
   /* USER CODE END TIM7_Init 1 */
-  g_tim7_init_ok = 0U;
   htim7.Instance = TIM7;
   htim7.Init.Prescaler = 24000-1;
   htim7.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -1886,15 +1895,14 @@ static void MX_TIM7_Init(void)
   htim7.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim7) != HAL_OK)
   {
-    return;
+    Error_Handler();
   }
   sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
   sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
   if (HAL_TIMEx_MasterConfigSynchronization(&htim7, &sMasterConfig) != HAL_OK)
   {
-    return;
+    Error_Handler();
   }
-  g_tim7_init_ok = 1U;
   /* USER CODE BEGIN TIM7_Init 2 */
 
   /* USER CODE END TIM7_Init 2 */
@@ -1921,9 +1929,9 @@ static void MX_TIM8_Init(void)
 
   /* USER CODE END TIM8_Init 1 */
   htim8.Instance = TIM8;
-  htim8.Init.Prescaler = 0;
+  htim8.Init.Prescaler = 239;
   htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim8.Init.Period = 65535;
+  htim8.Init.Period = 19999;
   htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim8.Init.RepetitionCounter = 0;
   htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -1949,6 +1957,10 @@ static void MX_TIM8_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim8, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
   sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
   sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
@@ -1968,6 +1980,37 @@ static void MX_TIM8_Init(void)
 
   /* USER CODE END TIM8_Init 2 */
   HAL_TIM_MspPostInit(&htim8);
+
+}
+
+/**
+  * @brief TIM13 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM13_Init(void)
+{
+
+  /* USER CODE BEGIN TIM13_Init 0 */
+
+  /* USER CODE END TIM13_Init 0 */
+
+  /* USER CODE BEGIN TIM13_Init 1 */
+
+  /* USER CODE END TIM13_Init 1 */
+  htim13.Instance = TIM13;
+  htim13.Init.Prescaler = 2399;
+  htim13.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim13.Init.Period = 999;
+  htim13.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim13.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim13) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM13_Init 2 */
+
+  /* USER CODE END TIM13_Init 2 */
 
 }
 
@@ -2329,6 +2372,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     MJPEG_Scheduler_OnTim7Tick();
     g_tim7_frame_tick++;
+  }
+  else if (htim->Instance == TIM13)
+  {
+    DCMotor_OL_Tick10ms();
   }
 }
 

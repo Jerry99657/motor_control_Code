@@ -9,7 +9,7 @@
  */
 
 #if defined(DEBUG)
-#define SD_SELF_TEST_ENABLE_DEFAULT 1U
+#define SD_SELF_TEST_ENABLE_DEFAULT 0U
 #else
 #define SD_SELF_TEST_ENABLE_DEFAULT 0U
 #endif

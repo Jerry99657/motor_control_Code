@@ -490,13 +490,12 @@ void HAL_JPEG_MspInit(JPEG_HandleTypeDef* hjpeg)
     hmdma_jpeg_infifo_th.Init.DestBlockAddressOffset = 0;
     if (HAL_MDMA_Init(&hmdma_jpeg_infifo_th) != HAL_OK)
     {
-      return;
+      Error_Handler();
     }
 
     if (HAL_MDMA_ConfigPostRequestMask(&hmdma_jpeg_infifo_th, 0, 0) != HAL_OK)
     {
-      (void)HAL_MDMA_DeInit(&hmdma_jpeg_infifo_th);
-      return;
+      Error_Handler();
     }
 
     __HAL_LINKDMA(hjpeg,hdmain,hmdma_jpeg_infifo_th);
@@ -519,15 +518,12 @@ void HAL_JPEG_MspInit(JPEG_HandleTypeDef* hjpeg)
     hmdma_jpeg_outfifo_th.Init.DestBlockAddressOffset = 0;
     if (HAL_MDMA_Init(&hmdma_jpeg_outfifo_th) != HAL_OK)
     {
-      (void)HAL_MDMA_DeInit(&hmdma_jpeg_infifo_th);
-      return;
+      Error_Handler();
     }
 
     if (HAL_MDMA_ConfigPostRequestMask(&hmdma_jpeg_outfifo_th, 0, 0) != HAL_OK)
     {
-      (void)HAL_MDMA_DeInit(&hmdma_jpeg_outfifo_th);
-      (void)HAL_MDMA_DeInit(&hmdma_jpeg_infifo_th);
-      return;
+      Error_Handler();
     }
 
     __HAL_LINKDMA(hjpeg,hdmaout,hmdma_jpeg_outfifo_th);
@@ -969,6 +965,9 @@ void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* htim_pwm)
     /* USER CODE END TIM8_MspInit 0 */
     /* Peripheral clock enable */
     __HAL_RCC_TIM8_CLK_ENABLE();
+    /* TIM8 interrupt Init */
+    HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
     /* USER CODE BEGIN TIM8_MspInit 1 */
 
     /* USER CODE END TIM8_MspInit 1 */
@@ -1139,6 +1138,20 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* htim_base)
 
     /* USER CODE END TIM7_MspInit 1 */
   }
+  else if(htim_base->Instance==TIM13)
+  {
+    /* USER CODE BEGIN TIM13_MspInit 0 */
+
+    /* USER CODE END TIM13_MspInit 0 */
+    /* Peripheral clock enable */
+    __HAL_RCC_TIM13_CLK_ENABLE();
+    /* TIM13 interrupt Init */
+    HAL_NVIC_SetPriority(TIM8_UP_TIM13_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM8_UP_TIM13_IRQn);
+    /* USER CODE BEGIN TIM13_MspInit 1 */
+
+    /* USER CODE END TIM13_MspInit 1 */
+  }
 
 }
 
@@ -1177,8 +1190,9 @@ void HAL_TIM_MspPostInit(TIM_HandleTypeDef* htim)
     __HAL_RCC_GPIOC_CLK_ENABLE();
     /**TIM8 GPIO Configuration
     PC6     ------> TIM8_CH1
+    PC7     ------> TIM8_CH2
     */
-    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
@@ -1238,6 +1252,16 @@ void HAL_TIM_PWM_MspDeInit(TIM_HandleTypeDef* htim_pwm)
     /* USER CODE END TIM8_MspDeInit 0 */
     /* Peripheral clock disable */
     __HAL_RCC_TIM8_CLK_DISABLE();
+
+    /* TIM8 interrupt DeInit */
+    /* USER CODE BEGIN TIM8:TIM8_UP_TIM13_IRQn disable */
+    /**
+    * Uncomment the line below to disable the "TIM8_UP_TIM13_IRQn" interrupt
+    * Be aware, disabling shared interrupt may affect other IPs
+    */
+    /* HAL_NVIC_DisableIRQ(TIM8_UP_TIM13_IRQn); */
+    /* USER CODE END TIM8:TIM8_UP_TIM13_IRQn disable */
+
     /* USER CODE BEGIN TIM8_MspDeInit 1 */
 
     /* USER CODE END TIM8_MspDeInit 1 */
@@ -1383,6 +1407,27 @@ void HAL_TIM_Base_MspDeInit(TIM_HandleTypeDef* htim_base)
     /* USER CODE BEGIN TIM7_MspDeInit 1 */
 
     /* USER CODE END TIM7_MspDeInit 1 */
+  }
+  else if(htim_base->Instance==TIM13)
+  {
+    /* USER CODE BEGIN TIM13_MspDeInit 0 */
+
+    /* USER CODE END TIM13_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_TIM13_CLK_DISABLE();
+
+    /* TIM13 interrupt DeInit */
+    /* USER CODE BEGIN TIM13:TIM8_UP_TIM13_IRQn disable */
+    /**
+    * Uncomment the line below to disable the "TIM8_UP_TIM13_IRQn" interrupt
+    * Be aware, disabling shared interrupt may affect other IPs
+    */
+    /* HAL_NVIC_DisableIRQ(TIM8_UP_TIM13_IRQn); */
+    /* USER CODE END TIM13:TIM8_UP_TIM13_IRQn disable */
+
+    /* USER CODE BEGIN TIM13_MspDeInit 1 */
+
+    /* USER CODE END TIM13_MspDeInit 1 */
   }
 
 }
