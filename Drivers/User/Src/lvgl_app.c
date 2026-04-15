@@ -9,6 +9,9 @@
 #include "src/extra/libs/gif/gifdec.h"
 #include "fatfs.h"
 #include "ff.h"
+#include "mpu6500.h"
+#include "imu.h"
+#include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -16,6 +19,9 @@
 #include <string.h>
 
 static lv_obj_t *s_status_label = NULL;
+static lv_obj_t *s_adc_label = NULL;
+volatile uint8_t g_adc_update_flag = 0;
+volatile float g_adc_voltage = 0.0f;
 static lv_group_t *s_group = NULL;
 static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play";
 
@@ -27,6 +33,7 @@ static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play"
 #define LVGL_APP_MENU_ID_MANUAL      1U
 #define LVGL_APP_MENU_ID_COMMAND     2U
 #define LVGL_APP_MENU_ID_SD_BROWSER  3U
+#define LVGL_APP_MENU_ID_MPU6500     4U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -67,7 +74,8 @@ typedef enum
 {
     LVGL_APP_CTRL_PAGE_NONE = 0,
     LVGL_APP_CTRL_PAGE_MOTOR_SPEED,
-    LVGL_APP_CTRL_PAGE_SERVO_ANGLE
+    LVGL_APP_CTRL_PAGE_SERVO_ANGLE,
+    LVGL_APP_CTRL_PAGE_MPU6500
 } lvgl_app_ctrl_page_t;
 
 typedef enum
@@ -77,7 +85,8 @@ typedef enum
     LVGL_APP_SCREEN_REQ_MOTOR_MENU,
     LVGL_APP_SCREEN_REQ_MOTOR_SPEED,
     LVGL_APP_SCREEN_REQ_SERVO_ANGLE,
-    LVGL_APP_SCREEN_REQ_SD_BROWSER
+    LVGL_APP_SCREEN_REQ_SD_BROWSER,
+    LVGL_APP_SCREEN_REQ_MPU6500
 } lvgl_app_screen_req_t;
 
 static uint16_t s_browser_entry_count = 0U;
@@ -125,6 +134,7 @@ static void lvgl_app_show_motor_control_menu(void);
 static void lvgl_app_show_motor_speed_control(void);
 static void lvgl_app_show_servo_angle_control(void);
 static void lvgl_app_show_sd_browser(void);
+static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
@@ -676,6 +686,10 @@ static void lvgl_app_process_pending_screen(void)
     else if (req == LVGL_APP_SCREEN_REQ_SD_BROWSER)
     {
         lvgl_app_show_sd_browser();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_MPU6500)
+    {
+        lvgl_app_show_mpu6500_data();
     }
 }
 
@@ -1897,6 +1911,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
         lvgl_app_browser_reset_path();
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
     }
+    else if (id == LVGL_APP_MENU_ID_MPU6500)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MPU6500);
+    }
 }
 
 static void lvgl_app_sd_file_event_cb(lv_event_t *e)
@@ -1975,6 +1993,12 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_group_add_obj(s_group, btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_DUMMY, "4 MPU6500 Data");
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
+    lv_group_add_obj(s_group, btn);
+
     lv_group_focus_obj(first_btn);
 
     s_status_label = lv_label_create(lv_scr_act());
@@ -2102,6 +2126,9 @@ void LVGL_App_Init(void)
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
     
+    MPU6500_Init();
+    imu_init();
+
     lvgl_app_set_status("Up/Down move, Right enters, Left goes back, KEY2 exits");
     lvgl_app_show_main_menu();
 }
@@ -2119,7 +2146,114 @@ void LVGL_App_Process(void)
         }
     }
 
+    if (g_adc_update_flag)
+    {
+        g_adc_update_flag = 0;
+        if (s_adc_label == NULL)
+        {
+            s_adc_label = lv_label_create(lv_layer_sys());
+            lv_obj_align(s_adc_label, LV_ALIGN_TOP_RIGHT, -10, 10);
+            lv_obj_set_style_text_color(s_adc_label, lv_color_make(255, 0, 0), 0);
+        }
+        char buf[16];
+        int v_int = (int)g_adc_voltage;
+        int v_frac = (int)((g_adc_voltage - v_int) * 10);
+        if (v_frac < 0) v_frac = -v_frac;
+        snprintf(buf, sizeof(buf), "%d.%dV", v_int, v_frac);
+        lv_label_set_text(s_adc_label, buf);
+    }
+
     lvgl_app_process_gif_stop_key();
     lv_timer_handler();
     lvgl_app_process_pending_screen();
 }
+
+#include "mpu6500.h"
+#include "imu.h"
+
+static uint8_t s_mpu_id = 0;
+static lv_obj_t *s_mpu_label = NULL;
+static lv_timer_t *s_mpu_timer = NULL;
+
+static void mpu6500_timer_cb(lv_timer_t *timer)
+{
+    if (s_ctrl_page != LVGL_APP_CTRL_PAGE_MPU6500) {
+        return;
+    }
+    int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+    MPU6500_GetData(&ax, &ay, &az, &gx, &gy, &gz);
+    
+    if (ax == 0 && ay == 0 && az == 0 && gx == 0 && gy == 0 && gz == 0) {
+        uint8_t id = MPU6500_ReadReg(0x75);
+        if (s_mpu_label) {
+            char errmsg[64];
+            snprintf(errmsg, sizeof(errmsg), "IIC Error! ID: 0x%02X Check wiring!", id);
+            lv_label_set_text(s_mpu_label, errmsg);
+        }
+        return;
+    }
+    
+    imu_data_calibration(&gx, &gy, &gz, &ax, &ay, &az);
+    eulerian_angles_t angles = imu_get_eulerian_angles((float)gx, (float)gy, (float)gz, (float)ax, (float)ay, (float)az);
+    
+    char buf[128];
+    snprintf(buf, sizeof(buf), "Pitch: %d.%02d\nRoll: %d.%02d\nYaw: %d.%02d\nAcc: %d, %d, %d\nGyro: %d, %d, %d", 
+             (int)angles.pitch, abs((int)(angles.pitch*100)%100), 
+             (int)angles.roll, abs((int)(angles.roll*100)%100), 
+             (int)angles.yaw, abs((int)(angles.yaw*100)%100), 
+             ax, ay, az, gx, gy, gz);
+    if (s_mpu_label) {
+        lv_label_set_text(s_mpu_label, buf);
+    }
+}
+
+static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_KEY)
+    {
+        uint32_t key = lv_event_get_key(e);
+        if (key == LV_KEY_ESC || key == LV_KEY_LEFT)
+        {
+            if (s_mpu_timer) {
+                lv_timer_del(s_mpu_timer);
+                s_mpu_timer = NULL;
+            }
+            lvgl_app_set_status("Global exit");
+            lvgl_app_show_main_menu();
+        }
+    }
+}
+
+static void lvgl_app_show_mpu6500_data(void)
+{
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_MPU6500;
+
+    lv_obj_t *title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "MPU6500 Data");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    s_mpu_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_mpu_label, "Loading...");
+    lv_obj_align(s_mpu_label, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *btn = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(btn, 0, 0); 
+    lv_obj_add_event_cb(btn, lvgl_app_mpu6500_event_cb, LV_EVENT_KEY, NULL);
+    lv_group_add_obj(s_group, btn);
+    lv_group_focus_obj(btn);
+
+    if (s_mpu_timer == NULL) {
+        s_mpu_timer = lv_timer_create(mpu6500_timer_cb, 50, NULL);
+    }
+
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, "KEY2 or Left to go back");
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+

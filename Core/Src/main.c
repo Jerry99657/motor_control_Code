@@ -101,6 +101,7 @@ TIM_HandleTypeDef htim7;
 TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim13;
 TIM_HandleTypeDef htim15;
+TIM_HandleTypeDef htim16;
 
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart5;
@@ -172,6 +173,7 @@ static void MX_TIM6_Init(void);
 static void MX_DMA2D_Init(void);
 static void MX_TIM7_Init(void);
 static void MX_TIM13_Init(void);
+static void MX_TIM16_Init(void);
 /* USER CODE BEGIN PFP */
 static void LCD_ShowStartupScreen(void);
 static void LCD_ShowDownloadScreen(void);
@@ -864,6 +866,7 @@ int main(void)
   MX_DMA2D_Init();
   MX_TIM7_Init();
   MX_TIM13_Init();
+  MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
@@ -950,6 +953,8 @@ int main(void)
     }
   }
   Boot_LogStatus("BOOT: TIM7 start=", g_tim7_start_ok);
+
+  HAL_TIM_Base_Start_IT(&htim16);
 
   /* USER CODE END 2 */
 
@@ -1451,7 +1456,7 @@ static void MX_SDMMC1_SD_Init(void)
   hsd1.Init.ClockDiv = 6;
   if (HAL_SD_Init(&hsd1) != HAL_OK)
   {
-    // Error_Handler(); /* 忽略无SD卡时的初始化报错 */
+    Error_Handler();
   }
   /* USER CODE BEGIN SDMMC1_Init 2 */
 
@@ -2081,6 +2086,38 @@ static void MX_TIM15_Init(void)
 }
 
 /**
+  * @brief TIM16 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM16_Init(void)
+{
+
+  /* USER CODE BEGIN TIM16_Init 0 */
+
+  /* USER CODE END TIM16_Init 0 */
+
+  /* USER CODE BEGIN TIM16_Init 1 */
+
+  /* USER CODE END TIM16_Init 1 */
+  htim16.Instance = TIM16;
+  htim16.Init.Prescaler = 24000-1;
+  htim16.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim16.Init.Period = 10000-1;
+  htim16.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim16.Init.RepetitionCounter = 0;
+  htim16.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim16) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM16_Init 2 */
+
+  /* USER CODE END TIM16_Init 2 */
+
+}
+
+/**
   * @brief UART4 Initialization Function
   * @param None
   * @retval None
@@ -2376,6 +2413,18 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   else if (htim->Instance == TIM13)
   {
     DCMotor_OL_Tick10ms();
+  }
+  else if (htim->Instance == TIM16)
+  {
+    extern volatile uint8_t g_adc_update_flag;
+    extern volatile float g_adc_voltage;
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
+    {
+      uint32_t val = HAL_ADC_GetValue(&hadc1);
+      g_adc_voltage = ((float)val / 65535.0f) * 3.3f * 6.0f;
+      g_adc_update_flag = 1;
+    }
   }
 }
 

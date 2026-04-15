@@ -73,6 +73,8 @@ void Boot_DebugFlushStageLogsViaCdc(void);
 #define Key_OK_GPIO_Port GPIOF
 #define Key1_Pin GPIO_PIN_5
 #define Key1_GPIO_Port GPIOF
+#define VOLTAGE_MONITOR_Pin GPIO_PIN_0
+#define VOLTAGE_MONITOR_GPIO_Port GPIOC
 #define LED1_Pin GPIO_PIN_2
 #define LED1_GPIO_Port GPIOC
 #define LED2_Pin GPIO_PIN_3
