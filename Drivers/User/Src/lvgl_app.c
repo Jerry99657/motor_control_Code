@@ -75,6 +75,7 @@ typedef enum
     LVGL_APP_CTRL_PAGE_NONE = 0,
     LVGL_APP_CTRL_PAGE_MOTOR_SPEED,
     LVGL_APP_CTRL_PAGE_SERVO_ANGLE,
+    LVGL_APP_CTRL_PAGE_COMMAND,
     LVGL_APP_CTRL_PAGE_MPU6500
 } lvgl_app_ctrl_page_t;
 
@@ -85,6 +86,7 @@ typedef enum
     LVGL_APP_SCREEN_REQ_MOTOR_MENU,
     LVGL_APP_SCREEN_REQ_MOTOR_SPEED,
     LVGL_APP_SCREEN_REQ_SERVO_ANGLE,
+    LVGL_APP_SCREEN_REQ_COMMAND,
     LVGL_APP_SCREEN_REQ_SD_BROWSER,
     LVGL_APP_SCREEN_REQ_MPU6500
 } lvgl_app_screen_req_t;
@@ -133,6 +135,7 @@ static void lvgl_app_show_main_menu(void);
 static void lvgl_app_show_motor_control_menu(void);
 static void lvgl_app_show_motor_speed_control(void);
 static void lvgl_app_show_servo_angle_control(void);
+static void lvgl_app_show_command_control(void);
 static void lvgl_app_show_sd_browser(void);
 static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
@@ -687,11 +690,17 @@ static void lvgl_app_process_pending_screen(void)
     {
         lvgl_app_show_sd_browser();
     }
+    else if (req == LVGL_APP_SCREEN_REQ_COMMAND)
+    {
+        lvgl_app_show_command_control();
+    }
     else if (req == LVGL_APP_SCREEN_REQ_MPU6500)
     {
         lvgl_app_show_mpu6500_data();
     }
 }
+
+static lv_obj_t *s_cmd_ctrl_label = NULL;
 
 static void lvgl_app_control_refresh_rows(void)
 {
@@ -700,6 +709,28 @@ static void lvgl_app_control_refresh_rows(void)
     char mark;
     lv_obj_t *row_label;
     lv_obj_t *row_btn;
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
+    {
+        if (s_cmd_ctrl_label != NULL)
+        {
+            char big_buf[256];
+            snprintf(big_buf, sizeof(big_buf),
+                     "M1 Set: %+4d,  Act: %+5ld\n"
+                     "M2 Set: %+4d,  Act: %+5ld\n"
+                     "M3 Set: %+4d,  Act: %+5ld\n"
+                     "M4 Set: %+4d,  Act: %+5ld\n"
+                     "S1 Angle Set: %3d\n"
+                     "S2 Angle Set: %3d",
+                     s_motor_speed_preset[0], s_motor_speed_actual[0],
+                     s_motor_speed_preset[1], s_motor_speed_actual[1],
+                     s_motor_speed_preset[2], s_motor_speed_actual[2],
+                     s_motor_speed_preset[3], s_motor_speed_actual[3],
+                     s_servo_angle_preset[0], s_servo_angle_preset[1]);
+            lv_label_set_text(s_cmd_ctrl_label, big_buf);
+        }
+        return;
+    }
 
     for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
     {
@@ -1904,7 +1935,7 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     }
     else if (id == LVGL_APP_MENU_ID_COMMAND)
     {
-            lvgl_app_set_status("Menu 2: command motor page placeholder");
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_COMMAND);
     }
     else if (id == LVGL_APP_MENU_ID_SD_BROWSER)
     {
@@ -2004,6 +2035,194 @@ static void lvgl_app_show_main_menu(void)
     s_status_label = lv_label_create(lv_scr_act());
     lv_label_set_text(s_status_label, s_status_text);
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+#include "usbd_cdc_if.h"
+
+static uint8_t s_cmd_rx_buf[64];
+static uint16_t s_cmd_rx_idx = 0;
+
+static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
+{
+    uint8_t dev_id = frame[3];
+    uint8_t cmd    = frame[4];
+    
+    if (cmd == 0x02) // Write
+    {
+        if (dev_id == 0x01 && len == 0x0A) // Multi-motor 
+        {
+            uint8_t i;
+            for (i = 0; i < 4; i++) {
+                s_motor_speed_preset[i] = (int8_t)frame[5 + i];
+                lvgl_app_motor_speed_send_cmd((uint8_t)(i + 1), s_motor_speed_preset[i]);
+            }
+        }
+        else if (dev_id == 0x02 && len >= 0x08) // Single-motor
+        {
+            uint8_t port = frame[5];
+            int8_t speed = (int8_t)frame[6];
+            if (port >= 1 && port <= 4) {
+                s_motor_speed_preset[port - 1] = speed;
+                lvgl_app_motor_speed_send_cmd(port, speed);
+            }
+        }
+        else if (dev_id == 0x05 && len >= 0x09) // PWM Servo
+        {
+            uint8_t port  = frame[5]; // 1~7
+            uint8_t angle = frame[7]; // 0~180
+            
+            if (port >= 1 && port <= 2) {
+                int16_t target_angle = (int16_t)angle * 3 / 2; // 0~180 to 0~270
+                s_servo_angle_preset[port - 1] = target_angle;
+                lvgl_app_servo_angle_send_cmd(port, target_angle);
+            }
+        }
+    }
+    else if (cmd == 0x01) // Read Encoder
+    {
+        uint8_t tx_buf[16];
+        uint8_t tx_len = 0;
+        
+        lvgl_app_motor_speed_sync_actual();
+        
+        if (dev_id == 0x03) // Multi-encoder
+        {
+            tx_buf[0] = 0x77;
+            tx_buf[1] = 0x68;
+            tx_buf[2] = 0x0A;
+            tx_buf[3] = 0x03;
+            tx_buf[4] = 0x01; 
+            tx_buf[5] = (uint8_t)(s_motor_speed_actual[0]);
+            tx_buf[6] = (uint8_t)(s_motor_speed_actual[1]);
+            tx_buf[7] = (uint8_t)(s_motor_speed_actual[2]);
+            tx_buf[8] = (uint8_t)(s_motor_speed_actual[3]);
+            tx_buf[9] = 0x0A;
+            tx_len = 0x0A;
+        }
+        else if (dev_id == 0x04) // Single-encoder 
+        {
+            uint8_t port = frame[5];
+            tx_buf[0] = 0x77;
+            tx_buf[1] = 0x68;
+            tx_buf[2] = 0x08;
+            tx_buf[3] = 0x04;
+            tx_buf[4] = 0x01;
+            tx_buf[5] = port;
+            if (port >= 1 && port <= 4) {
+                tx_buf[6] = (uint8_t)(s_motor_speed_actual[port - 1]);
+            } else {
+                tx_buf[6] = 0;
+            }
+            tx_buf[7] = 0x0A;
+            tx_len = 0x08;
+        }
+        
+        if (tx_len > 0) {
+            CDC_Transmit_FS(tx_buf, tx_len);
+        }
+    }
+    
+    // Force UI refresh on next main loop
+    s_ctrl_last_actual_refresh_tick = 0;
+}
+
+void lvgl_app_usb_rx_cb(uint8_t *buf, uint32_t len)
+{
+    uint32_t i;
+    if (s_ctrl_page != LVGL_APP_CTRL_PAGE_COMMAND) return;
+
+    for (i = 0; i < len; i++) {
+        if (s_cmd_rx_idx < sizeof(s_cmd_rx_buf)) {
+            s_cmd_rx_buf[s_cmd_rx_idx++] = buf[i];
+        }
+        
+        while (s_cmd_rx_idx >= 3) { 
+            if (s_cmd_rx_buf[0] != 0x77 || s_cmd_rx_buf[1] != 0x68) {
+                uint16_t j;
+                for (j = 0; j < s_cmd_rx_idx - 1; j++) s_cmd_rx_buf[j] = s_cmd_rx_buf[j+1];
+                s_cmd_rx_idx--;
+                continue;
+            }
+            
+            uint8_t frame_len = s_cmd_rx_buf[2];
+            if (frame_len < 0x04 || frame_len > 0x10) { 
+                uint16_t j;
+                for (j = 0; j < s_cmd_rx_idx - 2; j++) s_cmd_rx_buf[j] = s_cmd_rx_buf[j+2];
+                s_cmd_rx_idx -= 2;
+                continue;
+            }
+            
+            if (s_cmd_rx_idx >= frame_len) {
+                if (s_cmd_rx_buf[frame_len - 1] == 0x0A) {
+                    lvgl_app_cmd_parse(s_cmd_rx_buf, frame_len);
+                }
+                uint16_t j;
+                for (j = 0; j < s_cmd_rx_idx - frame_len; j++) {
+                    s_cmd_rx_buf[j] = s_cmd_rx_buf[j + frame_len];
+                }
+                s_cmd_rx_idx -= frame_len;
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+static void lvgl_app_command_exit_event_cb(lv_event_t *e)
+{
+    uint32_t key;
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_CLICKED || code == LV_EVENT_KEY) {
+        if (code == LV_EVENT_KEY) {
+            key = lvgl_app_event_get_key(e);
+            if (key != LV_KEY_ESC && key != LV_KEY_LEFT && key != LV_KEY_ENTER) {
+                return;
+            }
+        }
+        s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+        s_cmd_rx_idx = 0;
+        lvgl_app_motor_speed_force_clear_all();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+    }
+}
+
+static void lvgl_app_show_command_control(void)
+{
+    lv_obj_t *title;
+    lv_obj_t *btn;
+    lv_obj_t *lbl;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_COMMAND;
+    lvgl_app_control_clear_row_refs();
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "Command Control RX");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    s_cmd_ctrl_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_cmd_ctrl_label, "Listening...");
+    lv_obj_align(s_cmd_ctrl_label, LV_ALIGN_CENTER, 0, -20);
+    
+    btn = lv_btn_create(lv_scr_act());
+    lv_obj_set_size(btn, 120, 30);
+    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -40);
+    lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, "Exit Mode");
+    lv_obj_center(lbl);
+    
+    lv_group_add_obj(s_group, btn);
+    lv_obj_add_event_cb(btn, lvgl_app_command_exit_event_cb, LV_EVENT_ALL, NULL);
+    
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, "Wait CDC... Press ENTER/LEFT to exit");
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    lvgl_app_motor_speed_sync_actual();
+    s_ctrl_last_actual_refresh_tick = 0;
+    lvgl_app_control_refresh_rows();
 }
 
 static void lvgl_app_show_sd_browser(void)
@@ -2135,7 +2354,7 @@ void LVGL_App_Init(void)
 
 void LVGL_App_Process(void)
 {
-    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED || s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
     {
         uint32_t now = HAL_GetTick();
         if ((now - s_ctrl_last_actual_refresh_tick) >= 10U)
