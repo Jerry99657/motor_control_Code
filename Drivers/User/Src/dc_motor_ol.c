@@ -46,6 +46,7 @@ static uint32_t s_encoder_prev_cnt[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static int16_t s_target_speed_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_target_rpm[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static volatile int32_t s_measured_rpm[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static volatile int16_t s_applied_duty_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static float s_pid_integral[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static float s_pid_prev_error[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static uint8_t s_motor_init_done = 0U;
@@ -153,6 +154,7 @@ static void dc_motor_apply_output(uint8_t index, int16_t speed)
     uint32_t compare;
 
     speed = dc_motor_clamp_speed(speed);
+    s_applied_duty_percent[index] = speed;
 
     if (speed >= 0)
     {
@@ -319,4 +321,14 @@ int32_t DCMotor_OL_GetSpeedRpm(uint8_t motor_index)
     }
 
     return s_measured_rpm[motor_index - 1U];
+}
+
+int16_t DCMotor_OL_GetDutyPercent(uint8_t motor_index)
+{
+    if ((motor_index == 0U) || (motor_index > DC_MOTOR_COUNT))
+    {
+        return 0;
+    }
+
+    return s_applied_duty_percent[motor_index - 1U];
 }

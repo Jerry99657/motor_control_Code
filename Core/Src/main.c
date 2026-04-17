@@ -195,11 +195,89 @@ static void Boot_TryReportSdBenchViaCdc(void);
 #endif
 static void Boot_LogText(const char *text);
 static void Boot_LogStatus(const char *prefix, int32_t value);
-
+void vofa_usb_rx_cb(uint8_t *buf, uint32_t len);
+static void VOFA_Task_Process(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void vofa_usb_rx_cb(uint8_t *buf, uint32_t len)
+{
+  static char rx_buf[64];
+  static uint8_t rx_idx = 0;
+  uint32_t i;
+
+  for (i = 0; i < len; i++)
+  {
+    if (buf[i] == '\n' || buf[i] == '\r')
+    {
+      if (rx_idx > 0)
+      {
+        rx_buf[rx_idx] = '\0';
+        int motor_idx;
+        int speed_pct;
+        
+        // Command format: e.g. "M1:50" -> Motor 1, 50% speed
+        if (sscanf(rx_buf, "M%d:%d", &motor_idx, &speed_pct) == 2)
+        {
+          if (motor_idx >= 1 && motor_idx <= 4)
+          {
+            if (speed_pct > 100) speed_pct = 100;
+            if (speed_pct < -100) speed_pct = -100;
+            DCMotor_OL_SetSpeed((uint8_t)motor_idx, (int16_t)speed_pct);
+          }
+        }
+        else if (strcmp(rx_buf, "STOP") == 0)
+        {
+          DCMotor_OL_StopAll();
+        }
+        rx_idx = 0;
+      }
+    }
+    else if (rx_idx < sizeof(rx_buf) - 1)
+    {
+      rx_buf[rx_idx++] = buf[i];
+    }
+  }
+}
+
+static void VOFA_Task_Process(void)
+{
+  static uint32_t last_vofa_tick = 0;
+  uint32_t now = HAL_GetTick();
+
+  if (now - last_vofa_tick >= 20) // 50Hz
+  {
+    last_vofa_tick = now;
+    if (g_cdc_welcome_sent != 0U)
+    {
+      // Using VOFA+ JustFloat protocol
+      struct {
+        float speed[4];   // 4 motors speed
+        float duty[4];    // 4 motors pwm duty cycle
+        uint8_t tail[4];  // 0x00, 0x00, 0x80, 0x7f
+      } frame;
+
+      frame.speed[0] = (float)DCMotor_OL_GetSpeedRpm(1);
+      frame.speed[1] = (float)DCMotor_OL_GetSpeedRpm(2);
+      frame.speed[2] = (float)DCMotor_OL_GetSpeedRpm(3);
+      frame.speed[3] = (float)DCMotor_OL_GetSpeedRpm(4);
+
+      frame.duty[0] = (float)DCMotor_OL_GetDutyPercent(1);
+      frame.duty[1] = (float)DCMotor_OL_GetDutyPercent(2);
+      frame.duty[2] = (float)DCMotor_OL_GetDutyPercent(3);
+      frame.duty[3] = (float)DCMotor_OL_GetDutyPercent(4);
+
+      frame.tail[0] = 0x00;
+      frame.tail[1] = 0x00;
+      frame.tail[2] = 0x80;
+      frame.tail[3] = 0x7f;
+
+      (void)CDC_Transmit_FS((uint8_t *)&frame, sizeof(frame));
+    }
+  }
+}
 
 void Boot_DebugStageLog(const char *text)
 {
@@ -984,6 +1062,7 @@ int main(void)
 #endif
 
     LVGL_App_Process();
+    VOFA_Task_Process();
 
     if (g_cdc_welcome_sent == 0U)
     {

@@ -14,5 +14,6 @@ void DCMotor_OL_SetSpeed(uint8_t motor_index, int16_t speed_percent);
 void DCMotor_OL_StopAll(void);
 void DCMotor_OL_Tick10ms(void);
 int32_t DCMotor_OL_GetSpeedRpm(uint8_t motor_index);
+int16_t DCMotor_OL_GetDutyPercent(uint8_t motor_index);
 
 #endif /* DC_MOTOR_OL_H */
