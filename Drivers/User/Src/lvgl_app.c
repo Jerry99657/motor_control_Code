@@ -2376,9 +2376,10 @@ void LVGL_App_Process(void)
         }
         char buf[16];
         int v_int = (int)g_adc_voltage;
-        int v_frac = (int)((g_adc_voltage - v_int) * 10);
+        // Calculate with 2 decimal precision and rounding to avoid truncation errors
+        int v_frac = (int)((g_adc_voltage - v_int) * 100.0f + 0.5f);
         if (v_frac < 0) v_frac = -v_frac;
-        snprintf(buf, sizeof(buf), "%d.%dV", v_int, v_frac);
+        snprintf(buf, sizeof(buf), "%d.%02dV", v_int, v_frac);
         lv_label_set_text(s_adc_label, buf);
     }
 
@@ -2388,6 +2389,7 @@ void LVGL_App_Process(void)
 }
 
 #include "mpu6500.h"
+#include "mpu6500_reg.h"
 #include "imu.h"
 
 static uint8_t s_mpu_id = 0;
@@ -2403,7 +2405,7 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
     MPU6500_GetData(&ax, &ay, &az, &gx, &gy, &gz);
     
     if (ax == 0 && ay == 0 && az == 0 && gx == 0 && gy == 0 && gz == 0) {
-        uint8_t id = MPU6500_ReadReg(0x75);
+        uint8_t id = MPU6500_ReadReg(MPU6500_WHO_AM_I);
         if (s_mpu_label) {
             char errmsg[64];
             snprintf(errmsg, sizeof(errmsg), "IIC Error! ID: 0x%02X Check wiring!", id);

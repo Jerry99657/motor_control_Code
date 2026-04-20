@@ -24,5 +24,6 @@
 #define	MPU6500_PWR_MGMT_1		0x6B
 #define	MPU6500_PWR_MGMT_2		0x6C
 #define	MPU6500_WHO_AM_I		0x75
+#define	MPU6500_CHIP_ID			0x24
 
 #endif

@@ -2501,7 +2501,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
     {
       uint32_t val = HAL_ADC_GetValue(&hadc1);
-      g_adc_voltage = ((float)val / 65535.0f) * 3.3f * 6.0f;
+      g_adc_voltage = ((float)val / 65535.0f) * 3.3f * 7.0f;
       g_adc_update_flag = 1;
     }
   }
