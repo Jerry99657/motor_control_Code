@@ -14,6 +14,11 @@ extern TIM_HandleTypeDef htim5;
 #define DC_MOTOR_PID_INT_LIMIT              8000.0f
 #define DC_MOTOR_OUTPUT_LIMIT               100.0f
 
+#define DC_MOTOR_POS_KP                     0.5f
+#define DC_MOTOR_POS_KI                     0.0f
+#define DC_MOTOR_POS_KD                     0.0f
+#define DC_MOTOR_POS_INT_LIMIT              100.0f
+
 static TIM_HandleTypeDef *s_encoder_tim[DC_MOTOR_COUNT] = {
     &htim2,
     &htim3,
@@ -50,6 +55,16 @@ static volatile int16_t s_applied_duty_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static float s_pid_integral[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static float s_pid_prev_error[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static uint8_t s_motor_init_done = 0U;
+
+static DCMotorControlMode s_control_mode[DC_MOTOR_COUNT] = {
+    DCMOTOR_CONTROL_MODE_SPEED, DCMOTOR_CONTROL_MODE_SPEED, 
+    DCMOTOR_CONTROL_MODE_SPEED, DCMOTOR_CONTROL_MODE_SPEED
+};
+static volatile int64_t s_measured_pulses[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static int64_t s_target_pulses[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static int16_t s_speed_limit_percent[DC_MOTOR_COUNT] = {100, 100, 100, 100};
+static float s_pos_pid_integral[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+static float s_pos_pid_prev_error[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 
 static int16_t dc_motor_clamp_speed(int16_t speed)
 {
@@ -100,6 +115,39 @@ static int32_t dc_motor_counts_to_rpm(int32_t counts_10ms)
 {
     return (int32_t)(((int64_t)counts_10ms * 60000LL) /
         ((int64_t)DCMOTOR_OL_ENCODER_COUNTS_PER_REV * (int64_t)DCMOTOR_OL_SAMPLE_PERIOD_MS));
+}
+
+static int32_t dc_motor_pos_pid_update(uint8_t index, int64_t target_pulses, int64_t measured_pulses)
+{
+    float error;
+    float p_term;
+    float i_term;
+    float d_term;
+    float output;
+    int16_t speed_limit;
+    float max_rpm_limit;
+
+    error = (float)(target_pulses - measured_pulses);
+
+    p_term = DC_MOTOR_POS_KP * error;
+    i_term = DC_MOTOR_POS_KI * s_pos_pid_integral[index];
+    d_term = DC_MOTOR_POS_KD * (error - s_pos_pid_prev_error[index]);
+
+    s_pos_pid_integral[index] += error;
+    s_pos_pid_integral[index] = dc_motor_clampf(s_pos_pid_integral[index], -DC_MOTOR_POS_INT_LIMIT, DC_MOTOR_POS_INT_LIMIT);
+    
+    s_pos_pid_prev_error[index] = error;
+
+    output = p_term + i_term + d_term;
+    
+    speed_limit = s_speed_limit_percent[index];
+    if (speed_limit < 0) speed_limit = -speed_limit;
+    if (speed_limit > 100) speed_limit = 100;
+    max_rpm_limit = (float)((int32_t)speed_limit * DCMOTOR_OL_MAX_TARGET_RPM / 100);
+
+    output = dc_motor_clampf(output, -max_rpm_limit, max_rpm_limit);
+
+    return (int32_t)output;
 }
 
 static int16_t dc_motor_pid_update(uint8_t index, int32_t target_rpm, int32_t measured_rpm)
@@ -215,6 +263,11 @@ HAL_StatusTypeDef DCMotor_OL_Init(void)
         s_measured_rpm[i] = 0;
         s_pid_integral[i] = 0.0f;
         s_pid_prev_error[i] = 0.0f;
+        s_measured_pulses[i] = 0;
+        s_target_pulses[i] = 0;
+        s_pos_pid_integral[i] = 0.0f;
+        s_pos_pid_prev_error[i] = 0.0f;
+        s_control_mode[i] = DCMOTOR_CONTROL_MODE_SPEED;
     }
 
     DCMotor_OL_StopAll();
@@ -241,7 +294,13 @@ void DCMotor_OL_SetSpeed(uint8_t motor_index, int16_t speed_percent)
     speed_percent = dc_motor_clamp_speed(speed_percent);
     prev_speed_percent = s_target_speed_percent[idx];
 
-    if (speed_percent != prev_speed_percent)
+    if (s_control_mode[idx] != DCMOTOR_CONTROL_MODE_SPEED)
+    {
+        s_control_mode[idx] = DCMOTOR_CONTROL_MODE_SPEED;
+        s_pid_integral[idx] = 0.0f;
+        s_pid_prev_error[idx] = 0.0f;
+    }
+    else if (speed_percent != prev_speed_percent)
     {
         /* Clear control memory on setpoint step to avoid carrying old integral bias. */
         s_pid_integral[idx] = 0.0f;
@@ -265,11 +324,15 @@ void DCMotor_OL_StopAll(void)
 
     for (i = 0U; i < DC_MOTOR_COUNT; ++i)
     {
+        s_control_mode[i] = DCMOTOR_CONTROL_MODE_SPEED;
         s_target_speed_percent[i] = 0;
         s_target_rpm[i] = 0;
         s_measured_rpm[i] = 0;
         s_pid_integral[i] = 0.0f;
         s_pid_prev_error[i] = 0.0f;
+        s_pos_pid_integral[i] = 0.0f;
+        s_pos_pid_prev_error[i] = 0.0f;
+        s_target_pulses[i] = s_measured_pulses[i];
         dc_motor_apply_output(i, 0);
     }
 }
@@ -298,18 +361,35 @@ void DCMotor_OL_Tick10ms(void)
 
         delta = dc_motor_calc_delta(curr, prev, arr);
         s_encoder_prev_cnt[i] = curr;
+        s_measured_pulses[i] += delta;
 
         measured_rpm = dc_motor_counts_to_rpm(delta);
         s_measured_rpm[i] = measured_rpm;
 
-        if (s_target_speed_percent[i] == 0)
+        if (s_control_mode[i] == DCMOTOR_CONTROL_MODE_POSITION)
         {
-            dc_motor_apply_output(i, 0);
-            continue;
-        }
+            s_target_rpm[i] = dc_motor_pos_pid_update(i, s_target_pulses[i], s_measured_pulses[i]);
+            
+            if ((s_target_rpm[i] == 0) && (s_target_pulses[i] == s_measured_pulses[i]))
+            {
+                dc_motor_apply_output(i, 0);
+                continue;
+            }
 
-        output_percent = dc_motor_pid_update(i, s_target_rpm[i], measured_rpm);
-        dc_motor_apply_output(i, output_percent);
+            output_percent = dc_motor_pid_update(i, s_target_rpm[i], measured_rpm);
+            dc_motor_apply_output(i, output_percent);
+        }
+        else
+        {
+            if (s_target_speed_percent[i] == 0)
+            {
+                dc_motor_apply_output(i, 0);
+                continue;
+            }
+
+            output_percent = dc_motor_pid_update(i, s_target_rpm[i], measured_rpm);
+            dc_motor_apply_output(i, output_percent);
+        }
     }
 }
 
@@ -321,6 +401,48 @@ int32_t DCMotor_OL_GetSpeedRpm(uint8_t motor_index)
     }
 
     return s_measured_rpm[motor_index - 1U];
+}
+
+void DCMotor_OL_SetTargetPosition(uint8_t motor_index, int64_t target_pulses, int16_t speed_limit_percent)
+{
+    uint8_t idx;
+
+    if (s_motor_init_done == 0U)
+    {
+        return;
+    }
+
+    if ((motor_index == 0U) || (motor_index > DC_MOTOR_COUNT))
+    {
+        return;
+    }
+
+    idx = (uint8_t)(motor_index - 1U);
+
+    if (s_control_mode[idx] != DCMOTOR_CONTROL_MODE_POSITION)
+    {
+        s_control_mode[idx] = DCMOTOR_CONTROL_MODE_POSITION;
+        s_pos_pid_integral[idx] = 0.0f;
+        s_pos_pid_prev_error[idx] = 0.0f;
+        s_pid_integral[idx] = 0.0f;
+        s_pid_prev_error[idx] = 0.0f;
+    }
+
+    s_target_pulses[idx] = target_pulses;
+    
+    if (speed_limit_percent < 0) speed_limit_percent = -speed_limit_percent;
+    if (speed_limit_percent > 100) speed_limit_percent = 100;
+    s_speed_limit_percent[idx] = speed_limit_percent;
+}
+
+int64_t DCMotor_OL_GetPositionPulses(uint8_t motor_index)
+{
+    if ((motor_index == 0U) || (motor_index > DC_MOTOR_COUNT))
+    {
+        return 0;
+    }
+
+    return s_measured_pulses[motor_index - 1U];
 }
 
 int16_t DCMotor_OL_GetDutyPercent(uint8_t motor_index)

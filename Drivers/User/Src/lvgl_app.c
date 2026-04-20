@@ -4,6 +4,7 @@
 #include "dc_motor_ol.h"
 #include "mjpeg_player.h"
 #include "sd_start_anim.h"
+#include "mecanum.h"
 #include "main.h"
 #include "lvgl.h"
 #include "src/extra/libs/gif/gifdec.h"
@@ -2064,6 +2065,22 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
             if (port >= 1 && port <= 4) {
                 s_motor_speed_preset[port - 1] = speed;
                 lvgl_app_motor_speed_send_cmd(port, speed);
+            }
+        }
+        else if (dev_id == 0x03 && len >= 0x0D) // Mecanum Mixed Control
+        {
+            // format: 0x77 0x68 [len=13] 0x03 0x02 [mode] [VxL] [VxH] [VyL] [VyH] [WzL] [WzH] [ck/tail]
+            uint8_t m_mode = frame[5];
+            int16_t vx_in  = (int16_t)((frame[7] << 8)  | frame[6]);
+            int16_t vy_in  = (int16_t)((frame[9] << 8)  | frame[8]);
+            int16_t wz_in  = (int16_t)((frame[11] << 8) | frame[10]);
+            
+            if (m_mode == 1) {
+                // DISTANCE mode: use fixed default speed (e.g. 100.0)
+                Mecanum_MixedControl(100.0f, 100.0f, 100.0f, (float)vx_in, (float)vy_in, (float)wz_in);
+            } else {
+                // SPEED mode
+                Mecanum_MixedControl((float)vx_in, (float)vy_in, (float)wz_in, 0.0f, 0.0f, 0.0f);
             }
         }
         else if (dev_id == 0x05 && len >= 0x09) // PWM Servo
