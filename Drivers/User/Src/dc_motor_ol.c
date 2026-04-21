@@ -129,6 +129,13 @@ static int32_t dc_motor_pos_pid_update(uint8_t index, int64_t target_pulses, int
 
     error = (float)(target_pulses - measured_pulses);
 
+    if (error > -15.0f && error < 15.0f)
+    {
+        s_pos_pid_integral[index] = 0.0f;
+        s_pos_pid_prev_error[index] = 0.0f;
+        return 0;
+    }
+
     p_term = DC_MOTOR_POS_KP * error;
     i_term = DC_MOTOR_POS_KI * s_pos_pid_integral[index];
     d_term = DC_MOTOR_POS_KD * (error - s_pos_pid_prev_error[index]);
@@ -370,8 +377,10 @@ void DCMotor_OL_Tick10ms(void)
         {
             s_target_rpm[i] = dc_motor_pos_pid_update(i, s_target_pulses[i], s_measured_pulses[i]);
             
-            if ((s_target_rpm[i] == 0) && (s_target_pulses[i] == s_measured_pulses[i]))
+            if (s_target_rpm[i] == 0)
             {
+                s_pid_integral[i] = 0.0f;
+                s_pid_prev_error[i] = 0.0f;
                 dc_motor_apply_output(i, 0);
                 continue;
             }

@@ -1,4 +1,4 @@
-﻿#include "lvgl_app.h"
+#include "lvgl_app.h"
 
 #include "lv_port_indev.h"
 #include "dc_motor_ol.h"
@@ -34,7 +34,8 @@ static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play"
 #define LVGL_APP_MENU_ID_MANUAL      1U
 #define LVGL_APP_MENU_ID_COMMAND     2U
 #define LVGL_APP_MENU_ID_SD_BROWSER  3U
-#define LVGL_APP_MENU_ID_MPU6500     4U
+#define LVGL_APP_MENU_ID_MECANUM     4U
+#define LVGL_APP_MENU_ID_MPU6500     5U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -77,6 +78,7 @@ typedef enum
     LVGL_APP_CTRL_PAGE_MOTOR_SPEED,
     LVGL_APP_CTRL_PAGE_SERVO_ANGLE,
     LVGL_APP_CTRL_PAGE_COMMAND,
+    LVGL_APP_CTRL_PAGE_MECANUM,
     LVGL_APP_CTRL_PAGE_MPU6500
 } lvgl_app_ctrl_page_t;
 
@@ -89,6 +91,7 @@ typedef enum
     LVGL_APP_SCREEN_REQ_SERVO_ANGLE,
     LVGL_APP_SCREEN_REQ_COMMAND,
     LVGL_APP_SCREEN_REQ_SD_BROWSER,
+    LVGL_APP_SCREEN_REQ_MECANUM,
     LVGL_APP_SCREEN_REQ_MPU6500
 } lvgl_app_screen_req_t;
 
@@ -116,8 +119,17 @@ static uint8_t s_ctrl_editing = 0U;
 static int16_t s_motor_speed_preset[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int16_t s_servo_angle_preset[LVGL_APP_SERVO_COUNT] = {0, 0};
-static lv_obj_t *s_ctrl_row_btns[LVGL_APP_MOTOR_COUNT] = {NULL, NULL, NULL, NULL};
-static lv_obj_t *s_ctrl_row_labels[LVGL_APP_MOTOR_COUNT] = {NULL, NULL, NULL, NULL};
+static int16_t s_mec_trans_x = 0;
+static int16_t s_mec_trans_y = 0;
+static int16_t s_mec_rot_z = 0;
+static int16_t s_mec_speed_x = 0;
+static int16_t s_mec_speed_y = 0;
+static int16_t s_mec_speed_z = 0;
+static uint8_t s_mecanum_executing = 0;
+static lv_timer_t *s_mecanum_timer = NULL;
+
+static lv_obj_t *s_ctrl_row_btns[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+static lv_obj_t *s_ctrl_row_labels[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 static uint32_t s_ctrl_last_confirm_tick = 0U;
 static uint32_t s_ctrl_last_actual_refresh_tick = 0U;
 
@@ -125,7 +137,7 @@ static void lvgl_app_control_clear_row_refs(void)
 {
     uint8_t i;
 
-    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    for (i = 0U; i < 7U; ++i)
     {
         s_ctrl_row_btns[i] = NULL;
         s_ctrl_row_labels[i] = NULL;
@@ -137,6 +149,7 @@ static void lvgl_app_show_motor_control_menu(void);
 static void lvgl_app_show_motor_speed_control(void);
 static void lvgl_app_show_servo_angle_control(void);
 static void lvgl_app_show_command_control(void);
+static void lvgl_app_show_mecanum_control(void);
 static void lvgl_app_show_sd_browser(void);
 static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
@@ -695,6 +708,10 @@ static void lvgl_app_process_pending_screen(void)
     {
         lvgl_app_show_command_control();
     }
+    else if (req == LVGL_APP_SCREEN_REQ_MECANUM)
+    {
+        lvgl_app_show_mecanum_control();
+    }
     else if (req == LVGL_APP_SCREEN_REQ_MPU6500)
     {
         lvgl_app_show_mpu6500_data();
@@ -702,6 +719,11 @@ static void lvgl_app_process_pending_screen(void)
 }
 
 static lv_obj_t *s_cmd_ctrl_label = NULL;
+
+static int8_t s_joy_lx = 0;
+static int8_t s_joy_ly = 0;
+static int8_t s_joy_rx = 0;
+static int8_t s_joy_ry = 0;
 
 static void lvgl_app_control_refresh_rows(void)
 {
@@ -717,23 +739,31 @@ static void lvgl_app_control_refresh_rows(void)
         {
             char big_buf[256];
             snprintf(big_buf, sizeof(big_buf),
-                     "M1 Set: %+4d,  Act: %+5ld\n"
-                     "M2 Set: %+4d,  Act: %+5ld\n"
-                     "M3 Set: %+4d,  Act: %+5ld\n"
-                     "M4 Set: %+4d,  Act: %+5ld\n"
-                     "S1 Angle Set: %3d\n"
-                     "S2 Angle Set: %3d",
+                     "M1 Set: %+4d, Act: %+5ld\n"
+                     "M2 Set: %+4d, Act: %+5ld\n"
+                     "M3 Set: %+4d, Act: %+5ld\n"
+                     "M4 Set: %+4d, Act: %+5ld\n"
+                     "Sv Set: %3d, %3d\n"
+                     "Joy: L(%+3d,%+3d) R(%+3d,%+3d)",
                      s_motor_speed_preset[0], s_motor_speed_actual[0],
                      s_motor_speed_preset[1], s_motor_speed_actual[1],
                      s_motor_speed_preset[2], s_motor_speed_actual[2],
                      s_motor_speed_preset[3], s_motor_speed_actual[3],
-                     s_servo_angle_preset[0], s_servo_angle_preset[1]);
+                     s_servo_angle_preset[0], s_servo_angle_preset[1],
+                     s_joy_lx, s_joy_ly, s_joy_rx, s_joy_ry);
             lv_label_set_text(s_cmd_ctrl_label, big_buf);
         }
         return;
     }
 
-    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    uint8_t loop_count = LVGL_APP_MOTOR_COUNT;
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) {
+        loop_count = 7U;
+    } else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE) {
+        loop_count = LVGL_APP_SERVO_COUNT;
+    }
+    
+    for (i = 0U; i < loop_count; ++i)
     {
         row_label = s_ctrl_row_labels[i];
         row_btn = s_ctrl_row_btns[i];
@@ -806,6 +836,23 @@ static void lvgl_app_control_refresh_rows(void)
                 (int)s_servo_angle_preset[i]
             );
         }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
+        {
+            if (i == 0)
+                (void)snprintf(line, sizeof(line), "%c X Dist(cm): %4d", mark, (int)s_mec_trans_x);
+            else if (i == 1)
+                (void)snprintf(line, sizeof(line), "%c Y Dist(cm): %4d", mark, (int)s_mec_trans_y);
+            else if (i == 2)
+                (void)snprintf(line, sizeof(line), "%c Z Rot(deg): %4d", mark, (int)s_mec_rot_z);
+            else if (i == 3)
+                (void)snprintf(line, sizeof(line), "%c X Speed   : %4d", mark, (int)s_mec_speed_x);
+            else if (i == 4)
+                (void)snprintf(line, sizeof(line), "%c Y Speed   : %4d", mark, (int)s_mec_speed_y);
+            else if (i == 5)
+                (void)snprintf(line, sizeof(line), "%c Z Speed   : %4d", mark, (int)s_mec_speed_z);
+            else if (i == 6)
+                (void)snprintf(line, sizeof(line), "%c [ %s ]", mark, s_mecanum_executing ? "STOP" : "EXECUTE");
+        }
         else
         {
             line[0] = '\0';
@@ -815,10 +862,66 @@ static void lvgl_app_control_refresh_rows(void)
     }
 }
 
+static void mecanum_start_timer_cb(lv_timer_t *timer)
+{
+    s_mecanum_timer = NULL;
+    if (s_mecanum_executing)
+    {
+        lvgl_app_set_status("Mecanum EXECUTING");
+        
+        float vx = (float)s_mec_speed_x * 10.0f; // Input was cm/s, convert to mm/s
+        float vy = (float)s_mec_speed_y * 10.0f; // Input was cm/s, convert to mm/s
+        float wz = (float)s_mec_speed_z;         // Rotational speed was presumably deg/s
+
+        if (s_mec_trans_x == 0 && s_mec_trans_y == 0 && s_mec_rot_z == 0)
+        {
+            Mecanum_MixedControl(vx, vy, wz, 0.0f, 0.0f, 0.0f);
+        }
+        else
+        {
+            float dx = (float)s_mec_trans_x * 10.0f; // Input was cm, convert to mm
+            float dy = (float)s_mec_trans_y * 10.0f; // Input was cm, convert to mm
+            float dw = (float)s_mec_rot_z;           // Input was degrees
+            
+            Mecanum_MixedControl(vx, vy, wz, dx, dy, dw);
+            s_mecanum_executing = 0;
+            lvgl_app_control_refresh_rows();
+        }
+    }
+}
+
 static void lvgl_app_control_confirm_selected(void)
 {
     if (s_ctrl_editing == 0U)
     {
+        if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM && s_ctrl_selected_row == 6)
+        {
+            if (s_mecanum_executing)
+            {
+                s_mecanum_executing = 0;
+                Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
+                lvgl_app_set_status("Mecanum STOPPED");
+                if (s_mecanum_timer)
+                {
+                    lv_timer_del(s_mecanum_timer);
+                    s_mecanum_timer = NULL;
+                }
+            }
+            else
+            {
+                s_mecanum_executing = 1;
+                lvgl_app_set_status("Mecanum Wait 3s...");
+                if (s_mecanum_timer == NULL)
+                {
+                    extern void mecanum_start_timer_cb(lv_timer_t *timer); // will define below
+                    s_mecanum_timer = lv_timer_create(mecanum_start_timer_cb, 3000, NULL);
+                    lv_timer_set_repeat_count(s_mecanum_timer, 1);
+                }
+            }
+            lvgl_app_control_refresh_rows();
+            return;
+        }
+
         s_ctrl_editing = 1U;
         if (s_group != NULL)
         {
@@ -826,7 +929,7 @@ static void lvgl_app_control_confirm_selected(void)
             lv_group_focus_freeze(s_group, true);
         }
 
-        if ((s_ctrl_selected_row < LVGL_APP_MOTOR_COUNT) && (s_ctrl_row_btns[s_ctrl_selected_row] != NULL))
+        if (s_ctrl_row_btns[s_ctrl_selected_row] != NULL)
         {
             if (lv_obj_is_valid(s_ctrl_row_btns[s_ctrl_selected_row]) != false)
             {
@@ -882,14 +985,11 @@ static void lvgl_app_control_exit_edit_mode(void)
         lv_group_set_editing(s_group, false);
     }
 
-    if (s_ctrl_selected_row < LVGL_APP_MOTOR_COUNT)
+    if (s_ctrl_row_btns[s_ctrl_selected_row] != NULL)
     {
-        if (s_ctrl_row_btns[s_ctrl_selected_row] != NULL)
+        if (lv_obj_is_valid(s_ctrl_row_btns[s_ctrl_selected_row]) != false)
         {
-            if (lv_obj_is_valid(s_ctrl_row_btns[s_ctrl_selected_row]) != false)
-            {
-                lv_group_focus_obj(s_ctrl_row_btns[s_ctrl_selected_row]);
-            }
+            lv_group_focus_obj(s_ctrl_row_btns[s_ctrl_selected_row]);
         }
     }
 
@@ -917,11 +1017,21 @@ static void lvgl_app_control_back_to_motor_menu(void)
     {
         lvgl_app_motor_speed_force_clear_all();
     }
+    
+    uint8_t previous_page = s_ctrl_page;
 
     lvgl_app_control_clear_row_refs();
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     s_ctrl_editing = 0U;
-    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MOTOR_MENU);
+
+    if (previous_page == LVGL_APP_CTRL_PAGE_MECANUM)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+    }
+    else
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MOTOR_MENU);
+    }
 }
 
 static void lvgl_app_control_adjust_selected(int8_t direction)
@@ -961,6 +1071,42 @@ static void lvgl_app_control_adjust_selected(int8_t direction)
 
         s_servo_angle_preset[s_ctrl_selected_row] = value;
     }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
+    {
+        if (s_ctrl_selected_row == 0)
+        {
+            value = s_mec_trans_x + direction * 10;
+            s_mec_trans_x = value;
+        }
+        else if (s_ctrl_selected_row == 1)
+        {
+            value = s_mec_trans_y + direction * 10;
+            s_mec_trans_y = value;
+        }
+        else if (s_ctrl_selected_row == 2)
+        {
+            value = s_mec_rot_z + direction * 10;
+            s_mec_rot_z = value;
+        }
+        else if (s_ctrl_selected_row == 3)
+        {
+            value = s_mec_speed_x + direction * 10;
+            if (value < 0) value = 0;
+            s_mec_speed_x = value;
+        }
+        else if (s_ctrl_selected_row == 4)
+        {
+            value = s_mec_speed_y + direction * 10;
+            if (value < 0) value = 0;
+            s_mec_speed_y = value;
+        }
+        else if (s_ctrl_selected_row == 5)
+        {
+            value = s_mec_speed_z + direction * 10;
+            if (value < 0) value = 0;
+            s_mec_speed_z = value;
+        }
+    }
 
     lvgl_app_control_refresh_rows();
 }
@@ -974,7 +1120,8 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
 
     code = lv_event_get_code(e);
     row = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
-    if (row >= LVGL_APP_MOTOR_COUNT)
+    uint8_t max_rows = (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) ? 7U : (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE ? LVGL_APP_SERVO_COUNT : LVGL_APP_MOTOR_COUNT);
+    if (row >= max_rows)
     {
         row = s_ctrl_selected_row;
     }
@@ -1003,7 +1150,7 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
         return;
     }
 
-    if (code == LV_EVENT_SHORT_CLICKED)
+    if (code == LV_EVENT_CLICKED)
     {
         now = HAL_GetTick();
         if ((now - s_ctrl_last_confirm_tick) < 120U)
@@ -1037,18 +1184,7 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
             return;
         }
 
-        if (key == LV_KEY_ENTER)
-        {
-            now = HAL_GetTick();
-            if ((now - s_ctrl_last_confirm_tick) >= 120U)
-            {
-                s_ctrl_last_confirm_tick = now;
-                s_ctrl_selected_row = row;
-                lvgl_app_control_confirm_selected();
-            }
-
-            return;
-        }
+        /* Remainder handled by LV_EVENT_CLICKED */
 
         return;
     }
@@ -1129,7 +1265,7 @@ static void lvgl_app_show_motor_speed_control(void)
         lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
-        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_SHORT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
 
         s_ctrl_row_labels[i] = lv_label_create(row_btn);
@@ -1201,7 +1337,7 @@ static void lvgl_app_show_servo_angle_control(void)
         lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
-        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_SHORT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
 
         s_ctrl_row_labels[i] = lv_label_create(row_btn);
@@ -1943,6 +2079,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
         lvgl_app_browser_reset_path();
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
     }
+    else if (id == LVGL_APP_MENU_ID_MECANUM)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MECANUM);
+    }
     else if (id == LVGL_APP_MENU_ID_MPU6500)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MPU6500);
@@ -2026,7 +2166,12 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_group_add_obj(s_group, btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_DUMMY, "4 MPU6500 Data");
+    btn = lv_list_add_btn(list, LV_SYMBOL_SHUFFLE, "4 Mecanum Control");
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MECANUM);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MECANUM);
+    lv_group_add_obj(s_group, btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_LOOP, "5 MPU6500 Data");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
     lv_group_add_obj(s_group, btn);
@@ -2047,6 +2192,23 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
 {
     uint8_t dev_id = frame[3];
     uint8_t cmd    = frame[4];
+    
+    if (dev_id == 0x0C && len == 0x0A) // Virtual Joystick Mecanum Control
+    {
+        s_joy_lx = (int8_t)frame[4];
+        s_joy_ly = (int8_t)frame[5];
+        s_joy_rx = (int8_t)frame[6];
+        s_joy_ry = (int8_t)frame[7];
+        
+        float wz = (float)s_joy_lx * 2.0f;
+        float vy = (float)s_joy_rx * 10.0f;
+        float vx = (float)s_joy_ry * 10.0f;
+        
+        Mecanum_MixedControl(vx, vy, wz, 0.0f, 0.0f, 0.0f);
+        
+        s_ctrl_last_actual_refresh_tick = 0; // Force UI refresh
+        return;
+    }
     
     if (cmd == 0x02) // Write
     {
@@ -2331,16 +2493,9 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 }
 
-static void lvgl_app_process_gif_stop_key(void)
+static void lvgl_app_process_global_stop_key(void)
 {
-    uint8_t key2_pressed;
-
-    if (s_gif_playing == 0U)
-    {
-        return;
-    }
-
-    key2_pressed = (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+    uint8_t key2_pressed = (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
     if (key2_pressed == 0U)
     {
         s_key2_latched = 0U;
@@ -2353,7 +2508,26 @@ static void lvgl_app_process_gif_stop_key(void)
     }
 
     s_key2_latched = 1U;
-    lvgl_app_exit_gif_player("Stopped by KEY2");
+    
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
+    {
+        // Emergency stop logic for Mecanum specifically
+        lvgl_app_motor_speed_force_clear_all();
+        Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
+        s_mecanum_executing = 0U;
+        if (s_mecanum_timer)
+        {
+            lv_timer_del(s_mecanum_timer);
+            s_mecanum_timer = NULL;
+        }
+        lvgl_app_set_status("EMERGENCY STOP!");
+        lvgl_app_control_refresh_rows();
+    }
+
+    if (s_gif_playing != 0U)
+    {
+        lvgl_app_exit_gif_player("Stopped by KEY2");
+    }
 }
 
 void LVGL_App_Init(void)
@@ -2400,7 +2574,7 @@ void LVGL_App_Process(void)
         lv_label_set_text(s_adc_label, buf);
     }
 
-    lvgl_app_process_gif_stop_key();
+    lvgl_app_process_global_stop_key();
     lv_timer_handler();
     lvgl_app_process_pending_screen();
 }
@@ -2461,6 +2635,77 @@ static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
             lvgl_app_show_main_menu();
         }
     }
+}
+
+static void lvgl_app_show_mecanum_control(void)
+{
+    lv_obj_t *title;
+    lv_obj_t *row_btn;
+    uint8_t i;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_MECANUM;
+    s_ctrl_selected_row = 0U;
+    s_ctrl_editing = 0U;
+    s_mecanum_executing = 0U;
+    if (s_mecanum_timer)
+    {
+        lv_timer_del(s_mecanum_timer);
+        s_mecanum_timer = NULL;
+    }
+    Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
+
+    lvgl_app_control_clear_row_refs();
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "Mecanum Control");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    for (i = 0U; i < 7U; ++i)
+    {
+        row_btn = lv_btn_create(lv_scr_act());
+        s_ctrl_row_btns[i] = row_btn;
+        lv_obj_set_size(row_btn, 220, 22);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 36 + (lv_coord_t)i * 22);
+        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
+        lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
+
+        s_ctrl_row_labels[i] = lv_label_create(row_btn);
+        lv_obj_set_style_pad_left(s_ctrl_row_labels[i], 6, 0);
+        lv_obj_set_style_pad_right(s_ctrl_row_labels[i], 6, 0);
+        lv_obj_set_style_pad_top(s_ctrl_row_labels[i], 2, 0);
+        lv_obj_set_style_pad_bottom(s_ctrl_row_labels[i], 2, 0);
+        lv_obj_set_style_radius(s_ctrl_row_labels[i], 4, 0);
+        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
+
+        lv_group_add_obj(s_group, row_btn);
+    }
+
+    if (s_ctrl_row_btns[0] != NULL)
+    {
+        lv_group_focus_obj(s_ctrl_row_btns[0]);
+    }
+    lv_group_set_editing(s_group, false);
+
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, s_status_text);
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    lvgl_app_control_refresh_rows();
+    lvgl_app_set_status("OK to edit/exec, Left returns");
 }
 
 static void lvgl_app_show_mpu6500_data(void)

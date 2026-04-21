@@ -28,8 +28,8 @@
 #define MECANUM_WHEEL_DIAMETER_MM       (60.0f)   /* 麦轮直径 */
 #define MECANUM_WHEEL_CIRCUMFERENCE_MM  (MECANUM_WHEEL_DIAMETER_MM * 3.14159265f) /* 麦轮周长 */
 
-#define MECANUM_WHEEL_BASE_MM           (200.0f)  /* 轴距：前后轮中心在X轴方向（车身纵向）的距离 L */
-#define MECANUM_TRACK_WIDTH_MM          (150.0f)  /* 轮距：左右轮中心在Y轴方向（车身横向）的距离 W */
+#define MECANUM_WHEEL_BASE_MM           (160.0f)  /* 轴距：前后轮中心在X轴方向（车身纵向）的距离 L */
+#define MECANUM_TRACK_WIDTH_MM          (205.0f)  /* 轮距：左右轮中心在Y轴方向（车身横向）的距离 W */
 
 /* 减速比与编码器参数 (预留，用于速度(mm/s)与电机PWM/转速的转换) */
 #define MECANUM_REDUCTION_RATIO         (1.0f)    /* 面向车轮的减速比 */
