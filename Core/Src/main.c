@@ -35,6 +35,7 @@
 #include "sd_start_anim.h"
 #include "mjpeg_scheduler.h"
 #include "dc_motor_ol.h"
+#include "mecanum.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
@@ -2492,6 +2493,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   else if (htim->Instance == TIM13)
   {
     DCMotor_OL_Tick10ms();
+    Mecanum_Tick10ms();
   }
   else if (htim->Instance == TIM16)
   {

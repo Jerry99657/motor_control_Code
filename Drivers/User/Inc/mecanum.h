@@ -65,6 +65,8 @@ typedef enum {
  */
 void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd, float dx_dist, float dy_dist, float dw_deg);
 
+void Mecanum_Tick10ms(void);
+
 /* --- 单独分离的控制指令 (基于 MixedControl 封装) --- */
 void Mecanum_Translate_Forward(float speed, float dist);
 void Mecanum_Translate_Backward(float speed, float dist);
