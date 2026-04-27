@@ -126,18 +126,18 @@ static void imu_ahrsupdate_nomagnetic(float gx, float gy, float gz, float ax, fl
 
     ex = ay * vz - az * vy;
     ey = az * vx - ax * vz;
-    ez = ax * vy - ay * vx;
+    ez = 0.0f; /* No yaw reference to correct ez! Force to 0 to prevent drift */
 
     /* �ò���������PI������������ƫ��
      * ͨ������ g_param_kp��g_param_ki ����������
      * ���Կ��Ƽ��ٶȼ����������ǻ�����̬���ٶȡ�*/
     i_ex += dt * ex;   /* integral error scaled by Ki */
     i_ey += dt * ey;
-    i_ez += dt * ez;
+    i_ez = 0.0f; // Force reset integrated error on Yaw (Z-axis)
 
     gx = gx + g_param_kp * ex + g_param_ki * i_ex;
     gy = gy + g_param_kp * ey + g_param_ki * i_ey;
-    gz = gz + g_param_kp * ez + g_param_ki * i_ez;
+    gz = gz; // Do not apply Z-axis gravity error compensation to Yaw
 
 
     /*����������ɣ���������Ԫ��΢�ַ���*/
@@ -187,7 +187,7 @@ eulerian_angles_t imu_get_eulerian_angles(float gx, float gy, float gz, float ax
     float q2 = g_q_info.q2;
     float q3 = g_q_info.q3;
 
-    eulerangle.pitch = -asin(- 2 * q1 * q3 + 2 * q0 * q2) * 190 / IMU_M_PI;
+    eulerangle.pitch = -asin(- 2 * q1 * q3 + 2 * q0 * q2) * 180 / IMU_M_PI;
     eulerangle.roll = atan2(2 * q2 * q3 + 2 * q0 * q1, - 2 * q1 * q1 - 2 * q2 * q2 + 1) * 180 / IMU_M_PI;
     eulerangle.yaw = -atan2(2 * q1 * q2 + 2 * q0 * q3, -2 * q2 * q2 - 2 * q3 * q3 + 1) * 180 / IMU_M_PI;
 
