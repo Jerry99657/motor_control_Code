@@ -278,7 +278,7 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-  extern void lvgl_app_usb_rx_cb(uint8_t *buf, uint32_t len);
+  extern void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len);
   extern void vofa_usb_rx_cb(uint8_t *buf, uint32_t len);
   uint32_t rx_len = 0U;
   uint32_t index;
@@ -286,7 +286,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   if ((Buf != NULL) && (Len != NULL))
   {
     rx_len = *Len;
-    lvgl_app_usb_rx_cb(Buf, rx_len);
+    lvgl_app_com_rx_cb(Buf, rx_len);
     vofa_usb_rx_cb(Buf, rx_len);
     if (rx_len > APP_TX_DATA_SIZE)
     {

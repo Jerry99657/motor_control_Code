@@ -12,6 +12,19 @@ static uint8_t s_angle_closed_loop_en = 1;
 static float s_target_yaw = 0.0f;
 static float s_yaw_integral = 0.0f;
 
+/* Hybrid Trajectory Mode State */
+static uint8_t s_hybrid_active = 0;
+static uint8_t s_hybrid_bound_x = 0;
+static uint8_t s_hybrid_bound_y = 0;
+static uint8_t s_hybrid_bound_w = 0;
+static float s_hybrid_rem_dx = 0.0f;
+static float s_hybrid_rem_dy = 0.0f;
+static float s_hybrid_rem_dw = 0.0f;
+static float s_hybrid_tgt_vx = 0.0f;
+static float s_hybrid_tgt_vy = 0.0f;
+static float s_hybrid_tgt_wz = 0.0f;
+static float s_hybrid_wheel_pulses[4] = {0,0,0,0};
+
 /* 
  * 纭欢鍥炶皟瀹炵幇
  * 灏嗚繍鍔ㄥ绠楁硶璁＄畻鍑虹殑杞绾块€熷害/璺濈鎸囦护锛屼笅鍙戠粰瀹為檯鐨勫簳灞傜數鏈烘帶鍒跺櫒 (DC Motor)
@@ -76,36 +89,42 @@ void Mecanum_HW_SetDistance(uint8_t motor_id, float dist_val, float speed_val) {
  * 姝ゅ叕寮忎篃鍚屾椂鏀寔缁撳悎浣跨敤銆傛瘮濡傚墠杩涗笖瑕佸彸杞?寮х嚎): 杈撳叆Vx 鍜?Wz銆?
  *=================================================================================*/
 void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd, float dx_dist, float dy_dist, float dw_deg) {
-    /* 1. 灏嗚搴﹀弬鏁拌浆鎹负寮у害绯绘暟鍙備笌鍒嗛厤 */
-    float wz_rad_spd = wz_spd * MECANUM_RAD_PER_DEG;
-    float wz_comp_spd = wz_rad_spd * MECANUM_K_ROTATION_COEFF_MM;
-    float dw_rad_dist = dw_deg * MECANUM_RAD_PER_DEG;
-    float dw_comp_dist = dw_rad_dist * MECANUM_K_ROTATION_COEFF_MM;
-
-    /* 2. 杩涜楹﹀厠绾冲杞┍鍔ㄧ畻娉曢€嗚В璁＄畻 */
-    float ms1 = vx_spd + vy_spd + wz_comp_spd;
-    float ms2 = -vx_spd + vy_spd + wz_comp_spd;
-    float ms3 = -vx_spd - vy_spd + wz_comp_spd;
-    float ms4 = vx_spd - vy_spd + wz_comp_spd;
-
-    float md1 = dx_dist + dy_dist + dw_comp_dist;
-    float md2 = -dx_dist + dy_dist + dw_comp_dist;
-    float md3 = -dx_dist - dy_dist + dw_comp_dist;
-    float md4 = dx_dist - dy_dist + dw_comp_dist;
-
-    /* 3. Execute Control */
-    if (dx_dist == 0.0f && dy_dist == 0.0f && dw_deg == 0.0f) {
+    /* 1. Determine Control Mode (Speed vs Hybrid/Distance) */
+    int has_dist = (dx_dist != 0.0f || dy_dist != 0.0f || dw_deg != 0.0f);
+    
+    if (!has_dist) {
+        // Pure speed control mode
         s_user_vx = vx_spd;
         s_user_vy = vy_spd;
         s_user_wz_raw = wz_spd;
         s_is_speed_mode = 1;
-        // The actual motor update is handled in Mecanum_Tick10ms for PID stability
+        s_hybrid_active = 0;
     } else {
+        // Hybrid trajectory generation mode
         s_is_speed_mode = 0;
-        Mecanum_HW_SetDistance(MECANUM_MOTOR_FL, md1, ms1);
-        Mecanum_HW_SetDistance(MECANUM_MOTOR_FR, md2, ms2);
-        Mecanum_HW_SetDistance(MECANUM_MOTOR_RR, md3, ms3);
-        Mecanum_HW_SetDistance(MECANUM_MOTOR_RL, md4, ms4);
+        s_hybrid_active = 1;
+        
+        // Save bounds for axes with non-zero distance commands
+        s_hybrid_bound_x = (dx_dist != 0.0f);
+        s_hybrid_bound_y = (dy_dist != 0.0f);
+        s_hybrid_bound_w = (dw_deg != 0.0f);
+        
+        s_hybrid_rem_dx = fabs(dx_dist);
+        s_hybrid_rem_dy = fabs(dy_dist);
+        s_hybrid_rem_dw = fabs(dw_deg);
+        
+        // Decide trajectory direction and raw velocity per axis.
+        // Axes with distance bounds use the signed speed as the travel rate.
+        // Axes without distance bounds keep their speed offset for this command.
+        s_hybrid_tgt_vx = s_hybrid_bound_x ? ((dx_dist > 0.0f) ? fabs(vx_spd) : -fabs(vx_spd)) : vx_spd;
+        s_hybrid_tgt_vy = s_hybrid_bound_y ? ((dy_dist > 0.0f) ? fabs(vy_spd) : -fabs(vy_spd)) : vy_spd;
+        s_hybrid_tgt_wz = s_hybrid_bound_w ? ((dw_deg > 0.0f) ? fabs(wz_spd) : -fabs(wz_spd)) : wz_spd;
+
+        // Initialize target pulses to physical wheels' current absolute positions to avoid discontinuity
+        s_hybrid_wheel_pulses[0] = (float)DCMotor_OL_GetPositionPulses(1);
+        s_hybrid_wheel_pulses[1] = (float)DCMotor_OL_GetPositionPulses(2);
+        s_hybrid_wheel_pulses[2] = (float)DCMotor_OL_GetPositionPulses(3);
+        s_hybrid_wheel_pulses[3] = (float)DCMotor_OL_GetPositionPulses(4);
     }
 }
 
@@ -144,8 +163,102 @@ void Mecanum_Tick10ms(void) {
     eulerian_angles_t angles = imu_get_eulerian_angles((float)gx, (float)gy, (float)gz, (float)ax, (float)ay, (float)az);
     
     if (!s_is_speed_mode) {
-        s_target_yaw = angles.yaw;
-        s_yaw_integral = 0.0f;
+        if (s_hybrid_active) {
+            float dt = 0.010f; // 10ms
+            
+            float step_vx = s_hybrid_tgt_vx;
+            if (s_hybrid_bound_x && s_hybrid_rem_dx > 0.0f) {
+                float dist_step = fabs(step_vx) * dt;
+                if (dist_step > s_hybrid_rem_dx) {
+                    dist_step = s_hybrid_rem_dx;
+                    step_vx = (step_vx > 0) ? (dist_step / dt) : -(dist_step / dt);
+                }
+                s_hybrid_rem_dx -= fabs(step_vx) * dt;
+                if (s_hybrid_rem_dx <= 0.0f) {
+                    s_hybrid_rem_dx = 0.0f;
+                    s_hybrid_tgt_vx = 0.0f; // End bounded X travel
+                }
+            }
+            
+            float step_vy = s_hybrid_tgt_vy;
+            if (s_hybrid_bound_y && s_hybrid_rem_dy > 0.0f) {
+                float dist_step = fabs(step_vy) * dt;
+                if (dist_step > s_hybrid_rem_dy) {
+                    dist_step = s_hybrid_rem_dy;
+                    step_vy = (step_vy > 0) ? (dist_step / dt) : -(dist_step / dt);
+                }
+                s_hybrid_rem_dy -= fabs(step_vy) * dt;
+                if (s_hybrid_rem_dy <= 0.0f) {
+                    s_hybrid_rem_dy = 0.0f;
+                    s_hybrid_tgt_vy = 0.0f; // End bounded Y travel
+                }
+            }
+            
+            float step_wz = s_hybrid_tgt_wz;
+            if (s_hybrid_bound_w && s_hybrid_rem_dw > 0.0f) {
+                float dist_step = fabs(step_wz) * dt;
+                if (dist_step > s_hybrid_rem_dw) {
+                    dist_step = s_hybrid_rem_dw;
+                    step_wz = (step_wz > 0) ? (dist_step / dt) : -(dist_step / dt);
+                }
+                s_hybrid_rem_dw -= fabs(step_wz) * dt;
+                if (s_hybrid_rem_dw <= 0.0f) {
+                    s_hybrid_rem_dw = 0.0f;
+                    s_hybrid_tgt_wz = 0.0f; // End bounded W travel
+                }
+            }
+
+            // Sync yaw so it doesn't jump back when hybrid mode finishes or pauses
+            s_target_yaw = angles.yaw;
+            s_yaw_integral = 0.0f;
+
+            // Convert to 10ms wheel pulse increments
+            float wz_comp_spd = step_wz * MECANUM_RAD_PER_DEG * MECANUM_K_ROTATION_COEFF_MM;
+            
+            float v1 = step_vx + step_vy + wz_comp_spd;
+            float v2 = -step_vx + step_vy + wz_comp_spd;
+            float v3 = -step_vx - step_vy + wz_comp_spd;
+            float v4 = step_vx - step_vy + wz_comp_spd;
+
+            float k_pulses = (dt / MECANUM_WHEEL_CIRCUMFERENCE_MM) * DCMOTOR_OL_ENCODER_COUNTS_PER_REV;
+
+            s_hybrid_wheel_pulses[0] += v1 * k_pulses;
+            s_hybrid_wheel_pulses[1] += v2 * k_pulses;
+            s_hybrid_wheel_pulses[2] += v3 * k_pulses;
+            s_hybrid_wheel_pulses[3] += v4 * k_pulses;
+
+            // Submit target pulses with 100% position limit (DC motor runs tracking smoothly)
+            DCMotor_OL_SetTargetPosition(MECANUM_MOTOR_FL, (int64_t)s_hybrid_wheel_pulses[0], 100);
+            DCMotor_OL_SetTargetPosition(MECANUM_MOTOR_FR, (int64_t)s_hybrid_wheel_pulses[1], 100);
+            DCMotor_OL_SetTargetPosition(MECANUM_MOTOR_RR, (int64_t)s_hybrid_wheel_pulses[2], 100);
+            DCMotor_OL_SetTargetPosition(MECANUM_MOTOR_RL, (int64_t)s_hybrid_wheel_pulses[3], 100);
+
+            if (((!s_hybrid_bound_x) || (s_hybrid_rem_dx <= 0.0f)) &&
+                ((!s_hybrid_bound_y) || (s_hybrid_rem_dy <= 0.0f)) &&
+                ((!s_hybrid_bound_w) || (s_hybrid_rem_dw <= 0.0f)))
+            {
+                s_hybrid_active = 0;
+                s_hybrid_bound_x = 0;
+                s_hybrid_bound_y = 0;
+                s_hybrid_bound_w = 0;
+                s_hybrid_rem_dx = 0.0f;
+                s_hybrid_rem_dy = 0.0f;
+                s_hybrid_rem_dw = 0.0f;
+                s_hybrid_tgt_vx = 0.0f;
+                s_hybrid_tgt_vy = 0.0f;
+                s_hybrid_tgt_wz = 0.0f;
+                s_is_speed_mode = 1;
+                s_user_vx = 0.0f;
+                s_user_vy = 0.0f;
+                s_user_wz_raw = 0.0f;
+                s_target_yaw = angles.yaw;
+                s_yaw_integral = 0.0f;
+            }
+        } else {
+            // Idle un-driven state
+            s_target_yaw = angles.yaw;
+            s_yaw_integral = 0.0f;
+        }
         return;
     }
     

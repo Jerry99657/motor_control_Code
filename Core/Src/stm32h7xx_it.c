@@ -196,11 +196,13 @@ extern JPEG_HandleTypeDef hjpeg;
 extern SD_HandleTypeDef hsd1;
 extern DMA_HandleTypeDef hdma_spi6_tx;
 extern SPI_HandleTypeDef hspi6;
+extern DMA_HandleTypeDef hdma_tim15_up;
 extern TIM_HandleTypeDef htim6;
 extern TIM_HandleTypeDef htim7;
 extern TIM_HandleTypeDef htim8;
 extern TIM_HandleTypeDef htim13;
 extern TIM_HandleTypeDef htim16;
+extern UART_HandleTypeDef huart5;
 /* USER CODE BEGIN EV */
 
 /* USER CODE END EV */
@@ -378,6 +380,20 @@ void SysTick_Handler(void)
 /******************************************************************************/
 
 /**
+  * @brief This function handles DMA1 stream0 global interrupt.
+  */
+void DMA1_Stream0_IRQHandler(void)
+{
+  /* USER CODE BEGIN DMA1_Stream0_IRQn 0 */
+
+  /* USER CODE END DMA1_Stream0_IRQn 0 */
+  HAL_DMA_IRQHandler(&hdma_tim15_up);
+  /* USER CODE BEGIN DMA1_Stream0_IRQn 1 */
+
+  /* USER CODE END DMA1_Stream0_IRQn 1 */
+}
+
+/**
   * @brief This function handles TIM8 update interrupt and TIM13 global interrupt.
   */
 void TIM8_UP_TIM13_IRQHandler(void)
@@ -404,6 +420,20 @@ void SDMMC1_IRQHandler(void)
   /* USER CODE BEGIN SDMMC1_IRQn 1 */
 
   /* USER CODE END SDMMC1_IRQn 1 */
+}
+
+/**
+  * @brief This function handles UART5 global interrupt.
+  */
+void UART5_IRQHandler(void)
+{
+  /* USER CODE BEGIN UART5_IRQn 0 */
+
+  /* USER CODE END UART5_IRQn 0 */
+  HAL_UART_IRQHandler(&huart5);
+  /* USER CODE BEGIN UART5_IRQn 1 */
+
+  /* USER CODE END UART5_IRQn 1 */
 }
 
 /**

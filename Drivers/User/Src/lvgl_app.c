@@ -1,4 +1,5 @@
 #include "lvgl_app.h"
+#include "ws2812.h"
 
 #include "lv_port_indev.h"
 #include "dc_motor_ol.h"
@@ -36,6 +37,7 @@ static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play"
 #define LVGL_APP_MENU_ID_SD_BROWSER  3U
 #define LVGL_APP_MENU_ID_MECANUM     4U
 #define LVGL_APP_MENU_ID_MPU6500     5U
+#define LVGL_APP_MENU_ID_WS2812      6U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -79,7 +81,8 @@ typedef enum
     LVGL_APP_CTRL_PAGE_SERVO_ANGLE,
     LVGL_APP_CTRL_PAGE_COMMAND,
     LVGL_APP_CTRL_PAGE_MECANUM,
-    LVGL_APP_CTRL_PAGE_MPU6500
+    LVGL_APP_CTRL_PAGE_MPU6500,
+    LVGL_APP_CTRL_PAGE_WS2812
 } lvgl_app_ctrl_page_t;
 
 typedef enum
@@ -92,7 +95,8 @@ typedef enum
     LVGL_APP_SCREEN_REQ_COMMAND,
     LVGL_APP_SCREEN_REQ_SD_BROWSER,
     LVGL_APP_SCREEN_REQ_MECANUM,
-    LVGL_APP_SCREEN_REQ_MPU6500
+    LVGL_APP_SCREEN_REQ_MPU6500,
+    LVGL_APP_SCREEN_REQ_WS2812
 } lvgl_app_screen_req_t;
 
 static uint16_t s_browser_entry_count = 0U;
@@ -152,6 +156,7 @@ static void lvgl_app_show_command_control(void);
 static void lvgl_app_show_mecanum_control(void);
 static void lvgl_app_show_sd_browser(void);
 static void lvgl_app_show_mpu6500_data(void);
+static void lvgl_app_show_ws2812_control(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
@@ -716,6 +721,10 @@ static void lvgl_app_process_pending_screen(void)
     {
         lvgl_app_show_mpu6500_data();
     }
+    else if (req == LVGL_APP_SCREEN_REQ_WS2812)
+    {
+        lvgl_app_show_ws2812_control();
+    }
 }
 
 static lv_obj_t *s_cmd_ctrl_label = NULL;
@@ -1229,6 +1238,10 @@ static void lvgl_app_show_motor_speed_control(void)
     lv_obj_t *header;
     lv_obj_t *row_btn;
     uint8_t i;
+
+    // Set WS2812 to 20% Red
+    ws2812_set_all(rgb_to_color(51, 0, 0));
+    ws2812_update();
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_MOTOR_SPEED;
     s_ctrl_selected_row = 0U;
@@ -2087,6 +2100,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MPU6500);
     }
+    else if (id == LVGL_APP_MENU_ID_WS2812)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_WS2812);
+    }
 }
 
 static void lvgl_app_sd_file_event_cb(lv_event_t *e)
@@ -2138,6 +2155,10 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_t *btn;
     lv_obj_t *first_btn;
 
+    // Reset WS2812 color on main menu
+    ws2812_set_all(0);
+    ws2812_update();
+
     lvgl_app_group_reset();
     s_status_label = NULL;
     lv_obj_clean(lv_scr_act());
@@ -2174,6 +2195,11 @@ static void lvgl_app_show_main_menu(void)
     btn = lv_list_add_btn(list, LV_SYMBOL_LOOP, "5 MPU6500 Data");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
+    lv_group_add_obj(s_group, btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_EDIT, "6 WS2812 Control");
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
     lv_group_add_obj(s_group, btn);
 
     lv_group_focus_obj(first_btn);
@@ -2297,7 +2323,8 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
         }
         
         if (tx_len > 0) {
-            CDC_Transmit_FS(tx_buf, tx_len);
+            extern UART_HandleTypeDef huart5;
+            HAL_UART_Transmit(&huart5, tx_buf, tx_len, 100);
         }
     }
     
@@ -2305,7 +2332,7 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
     s_ctrl_last_actual_refresh_tick = 0;
 }
 
-void lvgl_app_usb_rx_cb(uint8_t *buf, uint32_t len)
+void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len)
 {
     uint32_t i;
     if (s_ctrl_page != LVGL_APP_CTRL_PAGE_COMMAND) return;
@@ -2370,6 +2397,10 @@ static void lvgl_app_show_command_control(void)
     lv_obj_t *title;
     lv_obj_t *btn;
     lv_obj_t *lbl;
+
+    // Set WS2812 to 20% Red
+    ws2812_set_all(rgb_to_color(51, 0, 0));
+    ws2812_update();
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_COMMAND;
     lvgl_app_control_clear_row_refs();
@@ -2643,6 +2674,10 @@ static void lvgl_app_show_mecanum_control(void)
     lv_obj_t *row_btn;
     uint8_t i;
 
+    // Set WS2812 to 20% Red
+    ws2812_set_all(rgb_to_color(51, 0, 0));
+    ws2812_update();
+
     s_ctrl_page = LVGL_APP_CTRL_PAGE_MECANUM;
     s_ctrl_selected_row = 0U;
     s_ctrl_editing = 0U;
@@ -2736,6 +2771,136 @@ static void lvgl_app_show_mpu6500_data(void)
 
     s_status_label = lv_label_create(lv_scr_act());
     lv_label_set_text(s_status_label, "KEY2 or Left to go back");
+    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+static lv_obj_t *s_ws2812_slider_r = NULL;
+static lv_obj_t *s_ws2812_slider_g = NULL;
+static lv_obj_t *s_ws2812_slider_b = NULL;
+
+#define WS2812_RGB_STEP 10U
+
+static uint8_t lvgl_app_ws2812_snap_value(uint8_t value)
+{
+    uint32_t snapped = ((uint32_t)value + (WS2812_RGB_STEP / 2U)) / WS2812_RGB_STEP;
+    snapped *= WS2812_RGB_STEP;
+
+    if (snapped > 255U)
+    {
+        snapped = 255U;
+    }
+
+    return (uint8_t)snapped;
+}
+
+static void lvgl_app_ws2812_slider_cb(lv_event_t *e)
+{
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+
+    (void)e;
+
+    if (s_ctrl_page != LVGL_APP_CTRL_PAGE_WS2812)
+    {
+        return;
+    }
+
+    r = (uint8_t)lv_slider_get_value(s_ws2812_slider_r);
+    g = (uint8_t)lv_slider_get_value(s_ws2812_slider_g);
+    b = (uint8_t)lv_slider_get_value(s_ws2812_slider_b);
+
+    if ((r != lvgl_app_ws2812_snap_value(r)) ||
+        (g != lvgl_app_ws2812_snap_value(g)) ||
+        (b != lvgl_app_ws2812_snap_value(b)))
+    {
+        lv_slider_set_value(s_ws2812_slider_r, lvgl_app_ws2812_snap_value(r), LV_ANIM_OFF);
+        lv_slider_set_value(s_ws2812_slider_g, lvgl_app_ws2812_snap_value(g), LV_ANIM_OFF);
+        lv_slider_set_value(s_ws2812_slider_b, lvgl_app_ws2812_snap_value(b), LV_ANIM_OFF);
+        return;
+    }
+
+    ws2812_set_all(rgb_to_color(r, g, b));
+    ws2812_update();
+}
+
+static void lvgl_app_ws2812_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+
+    if (code == LV_EVENT_KEY)
+    {
+        uint32_t key = lv_event_get_key(e);
+
+        if (key == LV_KEY_ESC)
+        {
+            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+        }
+    }
+}
+
+static void lvgl_app_show_ws2812_control(void)
+{
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lv_obj_clean(lv_scr_act());
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_WS2812;
+
+    lv_obj_t *title = lv_label_create(lv_scr_act());
+    lv_label_set_text(title, "WS2812 RGB Control");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+
+    // R Slider
+    s_ws2812_slider_r = lv_slider_create(lv_scr_act());
+    lv_slider_set_range(s_ws2812_slider_r, 0, 255);
+    lv_obj_set_size(s_ws2812_slider_r, 200, 15);
+    lv_obj_align(s_ws2812_slider_r, LV_ALIGN_CENTER, 0, -40);
+    lv_obj_t *lr = lv_label_create(lv_scr_act());
+    lv_label_set_text(lr, "R");
+    lv_obj_align_to(lr, s_ws2812_slider_r, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    // G Slider
+    s_ws2812_slider_g = lv_slider_create(lv_scr_act());
+    lv_slider_set_range(s_ws2812_slider_g, 0, 255);
+    lv_obj_set_size(s_ws2812_slider_g, 200, 15);
+    lv_obj_align(s_ws2812_slider_g, LV_ALIGN_CENTER, 0, 10);
+    lv_obj_t *lg = lv_label_create(lv_scr_act());
+    lv_label_set_text(lg, "G");
+    lv_obj_align_to(lg, s_ws2812_slider_g, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    // B Slider
+    s_ws2812_slider_b = lv_slider_create(lv_scr_act());
+    lv_slider_set_range(s_ws2812_slider_b, 0, 255);
+    lv_obj_set_size(s_ws2812_slider_b, 200, 15);
+    lv_obj_align(s_ws2812_slider_b, LV_ALIGN_CENTER, 0, 60);
+    lv_obj_t *lb = lv_label_create(lv_scr_act());
+    lv_label_set_text(lb, "B");
+    lv_obj_align_to(lb, s_ws2812_slider_b, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+
+    // Initial state: Off
+    lv_slider_set_value(s_ws2812_slider_r, 0, LV_ANIM_OFF);
+    lv_slider_set_value(s_ws2812_slider_g, 0, LV_ANIM_OFF);
+    lv_slider_set_value(s_ws2812_slider_b, 0, LV_ANIM_OFF);
+
+    // Bind slider events
+    lv_obj_add_event_cb(s_ws2812_slider_r, lvgl_app_ws2812_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_ws2812_slider_g, lvgl_app_ws2812_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(s_ws2812_slider_b, lvgl_app_ws2812_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    // Handle Left key navigation via group
+    lv_obj_add_event_cb(s_ws2812_slider_r, lvgl_app_ws2812_event_cb, LV_EVENT_KEY, NULL);
+    lv_obj_add_event_cb(s_ws2812_slider_g, lvgl_app_ws2812_event_cb, LV_EVENT_KEY, NULL);
+    lv_obj_add_event_cb(s_ws2812_slider_b, lvgl_app_ws2812_event_cb, LV_EVENT_KEY, NULL);
+
+    lv_group_add_obj(s_group, s_ws2812_slider_r);
+    lv_group_add_obj(s_group, s_ws2812_slider_g);
+    lv_group_add_obj(s_group, s_ws2812_slider_b);
+
+    lv_group_focus_obj(s_ws2812_slider_r);
+
+    s_status_label = lv_label_create(lv_scr_act());
+    lv_label_set_text(s_status_label, "Select to edit, KEY2 to return");
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 }
 

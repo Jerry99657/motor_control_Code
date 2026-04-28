@@ -103,6 +103,7 @@ TIM_HandleTypeDef htim8;
 TIM_HandleTypeDef htim13;
 TIM_HandleTypeDef htim15;
 TIM_HandleTypeDef htim16;
+DMA_HandleTypeDef hdma_tim15_up;
 
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart5;
@@ -150,6 +151,7 @@ static void MPU_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_BDMA_Init(void);
 static void MX_MDMA_Init(void);
+static void MX_DMA_Init(void);
 static void MX_DAC1_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_TIM2_Init(void);
@@ -202,6 +204,18 @@ static void VOFA_Task_Process(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+uint8_t g_uart5_rx_byte;
+extern void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len);
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == UART5)
+  {
+    lvgl_app_com_rx_cb(&g_uart5_rx_byte, 1);
+    HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
+  }
+}
 
 void vofa_usb_rx_cb(uint8_t *buf, uint32_t len)
 {
@@ -919,6 +933,7 @@ int main(void)
   MX_GPIO_Init();
   MX_BDMA_Init();
   MX_MDMA_Init();
+  MX_DMA_Init();
   MX_DAC1_Init();
   MX_TIM1_Init();
   MX_TIM2_Init();
@@ -947,6 +962,7 @@ int main(void)
   MX_TIM13_Init();
   MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
+  HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
   Boot_LogStatus("BOOT: DMA2D init=", g_dma2d_init_ok);
@@ -2121,7 +2137,7 @@ static void MX_TIM15_Init(void)
   htim15.Instance = TIM15;
   htim15.Init.Prescaler = 0;
   htim15.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim15.Init.Period = 65535;
+  htim15.Init.Period = 299;
   htim15.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim15.Init.RepetitionCounter = 0;
   htim15.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
@@ -2354,6 +2370,22 @@ static void MX_BDMA_Init(void)
   /* BDMA_Channel0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(BDMA_Channel0_IRQn, 0, 0);
   HAL_NVIC_EnableIRQ(BDMA_Channel0_IRQn);
+
+}
+
+/**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
 

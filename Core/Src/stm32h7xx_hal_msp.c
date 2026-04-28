@@ -28,6 +28,8 @@ extern MDMA_HandleTypeDef hmdma_jpeg_outfifo_th;
 
 extern DMA_HandleTypeDef hdma_spi6_tx;
 
+extern DMA_HandleTypeDef hdma_tim15_up;
+
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
 
@@ -979,6 +981,26 @@ void HAL_TIM_PWM_MspInit(TIM_HandleTypeDef* htim_pwm)
     /* USER CODE END TIM15_MspInit 0 */
     /* Peripheral clock enable */
     __HAL_RCC_TIM15_CLK_ENABLE();
+
+    /* TIM15 DMA Init */
+    /* TIM15_UP Init */
+    hdma_tim15_up.Instance = DMA1_Stream0;
+    hdma_tim15_up.Init.Request = DMA_REQUEST_TIM15_UP;
+    hdma_tim15_up.Init.Direction = DMA_MEMORY_TO_PERIPH;
+    hdma_tim15_up.Init.PeriphInc = DMA_PINC_DISABLE;
+    hdma_tim15_up.Init.MemInc = DMA_MINC_ENABLE;
+    hdma_tim15_up.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD;
+    hdma_tim15_up.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;
+    hdma_tim15_up.Init.Mode = DMA_NORMAL;
+    hdma_tim15_up.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_tim15_up.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
+    if (HAL_DMA_Init(&hdma_tim15_up) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    __HAL_LINKDMA(htim_pwm,hdma[TIM_DMA_ID_CC2],hdma_tim15_up);
+
     /* USER CODE BEGIN TIM15_MspInit 1 */
 
     /* USER CODE END TIM15_MspInit 1 */
@@ -1287,6 +1309,9 @@ void HAL_TIM_PWM_MspDeInit(TIM_HandleTypeDef* htim_pwm)
     /* USER CODE END TIM15_MspDeInit 0 */
     /* Peripheral clock disable */
     __HAL_RCC_TIM15_CLK_DISABLE();
+
+    /* TIM15 DMA DeInit */
+    HAL_DMA_DeInit(htim_pwm->hdma[TIM_DMA_ID_UPDATE]);
     /* USER CODE BEGIN TIM15_MspDeInit 1 */
 
     /* USER CODE END TIM15_MspDeInit 1 */
@@ -1534,6 +1559,9 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     GPIO_InitStruct.Alternate = GPIO_AF14_UART5;
     HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
+    /* UART5 interrupt Init */
+    HAL_NVIC_SetPriority(UART5_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(UART5_IRQn);
     /* USER CODE BEGIN UART5_MspInit 1 */
 
     /* USER CODE END UART5_MspInit 1 */
@@ -1615,6 +1643,8 @@ void HAL_UART_MspDeInit(UART_HandleTypeDef* huart)
     */
     HAL_GPIO_DeInit(GPIOB, GPIO_PIN_12|GPIO_PIN_13);
 
+    /* UART5 interrupt DeInit */
+    HAL_NVIC_DisableIRQ(UART5_IRQn);
     /* USER CODE BEGIN UART5_MspDeInit 1 */
 
     /* USER CODE END UART5_MspDeInit 1 */
