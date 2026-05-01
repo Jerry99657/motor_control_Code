@@ -1975,7 +1975,7 @@ static void lvgl_app_sd_select_id(uintptr_t id)
 
     if (id == LVGL_APP_SD_ID_BACK)
     {
-        lvgl_app_show_main_menu();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
         return;
     }
 
@@ -2026,7 +2026,7 @@ static void lvgl_app_sd_left_action(void)
     }
 
     lvgl_app_set_status("Back to main menu");
-    lvgl_app_show_main_menu();
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
 }
 
 static void lvgl_app_sd_right_action(uintptr_t id)
@@ -2067,7 +2067,7 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
         if (key == LV_KEY_ESC)
         {
             lvgl_app_set_status("Main menu");
-            lvgl_app_show_main_menu();
+            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
             return;
         }
 
@@ -2122,7 +2122,7 @@ static void lvgl_app_sd_file_event_cb(lv_event_t *e)
         if (key == LV_KEY_ESC)
         {
             lvgl_app_set_status("Global exit");
-            lvgl_app_show_main_menu();
+            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
             return;
         }
 
@@ -2155,7 +2155,8 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_t *btn;
     lv_obj_t *first_btn;
 
-    // Reset WS2812 color on main menu
+    /* 恢复自动彩虹模式，并清空 WS2812 颜色 */
+    g_ws2812_manual_mode = 0U;
     ws2812_set_all(0);
     ws2812_update();
 
@@ -2663,7 +2664,7 @@ static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
                 s_mpu_timer = NULL;
             }
             lvgl_app_set_status("Global exit");
-            lvgl_app_show_main_menu();
+            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
         }
     }
 }
@@ -2780,62 +2781,71 @@ static lv_obj_t *s_ws2812_slider_b = NULL;
 
 #define WS2812_RGB_STEP 10U
 
-static uint8_t lvgl_app_ws2812_snap_value(uint8_t value)
+static void lvgl_app_ws2812_apply(void)
 {
-    uint32_t snapped = ((uint32_t)value + (WS2812_RGB_STEP / 2U)) / WS2812_RGB_STEP;
-    snapped *= WS2812_RGB_STEP;
-
-    if (snapped > 255U)
-    {
-        snapped = 255U;
-    }
-
-    return (uint8_t)snapped;
-}
-
-static void lvgl_app_ws2812_slider_cb(lv_event_t *e)
-{
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-
-    (void)e;
+    int32_t r;
+    int32_t g;
+    int32_t b;
 
     if (s_ctrl_page != LVGL_APP_CTRL_PAGE_WS2812)
     {
         return;
     }
 
-    r = (uint8_t)lv_slider_get_value(s_ws2812_slider_r);
-    g = (uint8_t)lv_slider_get_value(s_ws2812_slider_g);
-    b = (uint8_t)lv_slider_get_value(s_ws2812_slider_b);
-
-    if ((r != lvgl_app_ws2812_snap_value(r)) ||
-        (g != lvgl_app_ws2812_snap_value(g)) ||
-        (b != lvgl_app_ws2812_snap_value(b)))
-    {
-        lv_slider_set_value(s_ws2812_slider_r, lvgl_app_ws2812_snap_value(r), LV_ANIM_OFF);
-        lv_slider_set_value(s_ws2812_slider_g, lvgl_app_ws2812_snap_value(g), LV_ANIM_OFF);
-        lv_slider_set_value(s_ws2812_slider_b, lvgl_app_ws2812_snap_value(b), LV_ANIM_OFF);
-        return;
-    }
+    r = lv_slider_get_value(s_ws2812_slider_r);
+    g = lv_slider_get_value(s_ws2812_slider_g);
+    b = lv_slider_get_value(s_ws2812_slider_b);
 
     ws2812_set_all(rgb_to_color(r, g, b));
     ws2812_update();
 }
 
-static void lvgl_app_ws2812_event_cb(lv_event_t *e)
+/* VALUE_CHANGED: 仅负责把当前滑块值应用到 WS2812 */
+static void lvgl_app_ws2812_slider_cb(lv_event_t *e)
+{
+    (void)e;
+    lvgl_app_ws2812_apply();
+}
+
+/*
+ * KEY PREPROCESS 回调 — 在 LVGL 类回调(默认±1)之前运行。
+ * 直接 ±10，手动发送 VALUE_CHANGED（因为 stop_processing 会阻止类回调发送），
+ * 然后阻止后续回调，彻底避免与类回调的竞态。
+ */
+static void lvgl_app_ws2812_key_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
 
-    if (code == LV_EVENT_KEY)
-    {
-        uint32_t key = lv_event_get_key(e);
+    if (code != LV_EVENT_KEY) return;
 
-        if (key == LV_KEY_ESC)
-        {
-            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
-        }
+    lv_obj_t *slider = lv_event_get_target(e);
+    uint32_t key = lv_event_get_key(e);
+
+    if (key == LV_KEY_ESC)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+        return;
+    }
+
+    if (key == LV_KEY_RIGHT || key == LV_KEY_LEFT)
+    {
+        int32_t val = lv_slider_get_value(slider);
+        int32_t step = (key == LV_KEY_RIGHT) ? (int32_t)WS2812_RGB_STEP : -(int32_t)WS2812_RGB_STEP;
+
+        val += step;
+        if (val < 0)   val = 0;
+        if (val > 255) val = 255;
+
+        lv_slider_set_value(slider, val, LV_ANIM_OFF);
+
+        /*
+         * lv_bar_set_value 不发送 VALUE_CHANGED，类回调才发送。
+         * stop_processing 会阻止类回调，所以需要手动发送 VALUE_CHANGED。
+         */
+        lv_event_send(slider, LV_EVENT_VALUE_CHANGED, NULL);
+
+        /* 阻止类回调(lv_slider_event)再做 ±1 */
+        lv_event_stop_processing(e);
     }
 }
 
@@ -2847,11 +2857,14 @@ static void lvgl_app_show_ws2812_control(void)
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_WS2812;
 
+    /* 进入手动模式，暂停 main 循环自动彩虹 */
+    g_ws2812_manual_mode = 1U;
+
     lv_obj_t *title = lv_label_create(lv_scr_act());
     lv_label_set_text(title, "WS2812 RGB Control");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
 
-    // R Slider
+    // R Slider (value 0..255, one-to-one with RGB channel)
     s_ws2812_slider_r = lv_slider_create(lv_scr_act());
     lv_slider_set_range(s_ws2812_slider_r, 0, 255);
     lv_obj_set_size(s_ws2812_slider_r, 200, 15);
@@ -2878,24 +2891,29 @@ static void lvgl_app_show_ws2812_control(void)
     lv_label_set_text(lb, "B");
     lv_obj_align_to(lb, s_ws2812_slider_b, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
-    // Initial state: Off
-    lv_slider_set_value(s_ws2812_slider_r, 0, LV_ANIM_OFF);
-    lv_slider_set_value(s_ws2812_slider_g, 0, LV_ANIM_OFF);
-    lv_slider_set_value(s_ws2812_slider_b, 0, LV_ANIM_OFF);
-
-    // Bind slider events
+    // Bind slider VALUE_CHANGED events (必须在 set_value 之前注册)
     lv_obj_add_event_cb(s_ws2812_slider_r, lvgl_app_ws2812_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_ws2812_slider_g, lvgl_app_ws2812_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(s_ws2812_slider_b, lvgl_app_ws2812_slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
-    // Handle Left key navigation via group
-    lv_obj_add_event_cb(s_ws2812_slider_r, lvgl_app_ws2812_event_cb, LV_EVENT_KEY, NULL);
-    lv_obj_add_event_cb(s_ws2812_slider_g, lvgl_app_ws2812_event_cb, LV_EVENT_KEY, NULL);
-    lv_obj_add_event_cb(s_ws2812_slider_b, lvgl_app_ws2812_event_cb, LV_EVENT_KEY, NULL);
+    // KEY PREPROCESS: 在类回调(±1)之前执行，±10 并 stop_processing
+    lv_obj_add_event_cb(s_ws2812_slider_r, lvgl_app_ws2812_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, NULL);
+    lv_obj_add_event_cb(s_ws2812_slider_g, lvgl_app_ws2812_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, NULL);
+    lv_obj_add_event_cb(s_ws2812_slider_b, lvgl_app_ws2812_key_cb, LV_EVENT_KEY | LV_EVENT_PREPROCESS, NULL);
+
+    // Initial state: 10% green (G=20), R/B=0
+    lv_slider_set_value(s_ws2812_slider_r, 0,  LV_ANIM_OFF);
+    lv_slider_set_value(s_ws2812_slider_g, 20, LV_ANIM_OFF);
+    lv_slider_set_value(s_ws2812_slider_b, 0,  LV_ANIM_OFF);
+
+    // 显式触发一次 apply，确保 WS2812 显示初始绿色
+    lvgl_app_ws2812_apply();
 
     lv_group_add_obj(s_group, s_ws2812_slider_r);
     lv_group_add_obj(s_group, s_ws2812_slider_g);
     lv_group_add_obj(s_group, s_ws2812_slider_b);
+
+    lv_group_set_editing(s_group, true);
 
     lv_group_focus_obj(s_ws2812_slider_r);
 

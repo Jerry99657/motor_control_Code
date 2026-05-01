@@ -8,6 +8,9 @@ extern TIM_HandleTypeDef htim15;
 // LED颜色
 uint32_t ws2812_color[WS2812_NUM] = {0};
 
+// 手动控制模式标志：非 0 时禁止 main 循环自动彩虹
+uint8_t g_ws2812_manual_mode = 0U;
+
 // 当前LED颜色
 static uint32_t _ws2812_color_current[WS2812_NUM];
 
@@ -19,26 +22,52 @@ static volatile uint8_t _ws2812_dma_busy = 0;
  */
 void ws2812_update(void)
 {
-	// 数据缓冲，每个LED占用24个字节，�?0个LED，前100个字节用于复位信�?
+	// 数据缓冲，每个LED占用24个半字，共12个LED，前100个半字用于复位信号
 	static uint16_t ws2812_data[RST_PERIOD_NUM + WS2812_NUM * 24];
+
+	/* 如果上一次 DMA 还在跑，先等它完成或超时后强制终止 */
+	if (_ws2812_dma_busy)
+	{
+		ws2812_wait_dma(50);
+		if (_ws2812_dma_busy)
+		{
+			HAL_TIM_PWM_Stop_DMA(&htim15, TIM_CHANNEL_2);
+			_ws2812_dma_busy = 0;
+		}
+	}
+
+	// 显式清零复位脉冲区域（防止前次传输残留）
+	memset(ws2812_data, 0, RST_PERIOD_NUM * sizeof(uint16_t));
 
 	for (uint8_t led_id = 0; led_id < WS2812_NUM; led_id++)
 	{
 		_ws2812_color_current[led_id] = ws2812_color[led_id];
-		static uint8_t r, g, b;
+		uint8_t r, g, b;
 		color_to_rgb(_ws2812_color_current[led_id], &r, &g, &b);
 		uint16_t *p = ws2812_data + RST_PERIOD_NUM + led_id * 24;
 		for (uint8_t i = 0; i < 8; i++)
 		{
-			p[i] = (r << i) & (0x80) ? CODE_ONE_DUTY : CODE_ZERO_DUTY;
-			p[i + 8] = (g << i) & (0x80) ? CODE_ONE_DUTY : CODE_ZERO_DUTY;
-			p[i + 16] = (b << i) & (0x80) ? CODE_ONE_DUTY : CODE_ZERO_DUTY;
+			p[i]      = ((g << i) & 0x80) ? CODE_ONE_DUTY : CODE_ZERO_DUTY;
+			p[i + 8]  = ((r << i) & 0x80) ? CODE_ONE_DUTY : CODE_ZERO_DUTY;
+			p[i + 16] = ((b << i) & 0x80) ? CODE_ONE_DUTY : CODE_ZERO_DUTY;
 		}
 	}
 	// 标记为忙，DMA 传输将在完成回调中清除该标志
 	_ws2812_dma_busy = 1;
-	HAL_TIM_PWM_Start_DMA(&htim15, TIM_CHANNEL_2, (uint32_t *)ws2812_data,
-						  RST_PERIOD_NUM + WS2812_NUM * 24);
+	if (HAL_TIM_PWM_Start_DMA(&htim15, TIM_CHANNEL_2, (uint32_t *)ws2812_data,
+							  RST_PERIOD_NUM + WS2812_NUM * 24) != HAL_OK)
+	{
+		/* 启动 DMA 失败，清除忙标志以防死锁 */
+		_ws2812_dma_busy = 0;
+		return;
+	}
+
+	/*
+	 * H7 TIM15 的 DMA 线路只有 TIM15_UP 一条（没有独立的 CH2）。
+	 * HAL 仅置位了 CC2DE，我们需要改用 UDE（更新事件触发 DMA）
+	 * 以确保每次 PWM 周期结束才更新 CCR2，避免双重触发。
+	 */
+	htim15.Instance->DIER = (htim15.Instance->DIER & ~TIM_DIER_CC2DE) | TIM_DIER_UDE;
 }
 
 /**
@@ -169,61 +198,43 @@ void ws2812_set_all_white(float brightness)
 }
 
 /**
- * @brief 初始�?WS2812 驱动并将所�?LED 设为全灭
- *        调用后所有灯会被写为 0 并发送一次数据（阻塞等待 DMA 完成�?
+ * @brief 初始化 WS2812 驱动并将所有 LED 设为 10% 绿灯测试
  */
 void ws2812_Init(void)
 {
   /* Stop any ongoing transfer */
   HAL_TIM_PWM_Stop_DMA(&htim15, TIM_CHANNEL_2);
   _ws2812_dma_busy = 0;
-  
-  /* Set all to 0 (off) */
+
+  /* === 10% 绿灯亮 1 秒，然后熄灭 === */
+  ws2812_set_all(rgb_to_color(0, 25, 0));
+  ws2812_update();
+  ws2812_wait_dma(200);
+  HAL_Delay(1000);
+
   ws2812_set_all(0);
   ws2812_update();
-  ws2812_wait_dma(100);
+  ws2812_wait_dma(200);
 }
 
 void ws2812_running_rainbow_cycle(int step, float brightness)
 {
-  /* Clear background */
-  ws2812_set_all(0);
+  uint32_t color = rainbow_color(0.1f, step * 2, 128, 127);
 
-  /* Draw 4 LEDs: Head (brightest), Body1, Body2, Tail (dimmest) */
-  for (int i = 0; i < 4; i++)
-  {
-    /* Calculate index wrapping around WS2812_NUM */
-    int led_index = (step - i);
-    while (led_index < 0) led_index += WS2812_NUM;
-    led_index %= WS2812_NUM;
+  uint8_t r, g, b;
+  color_to_rgb(color, &r, &g, &b);
 
-    /* Brightness fade: Head=1.0, Body1=0.75, Body2=0.5, Tail=0.25 */
-    float fade = 1.0f - (i * 0.25f);
+  r = (uint8_t)((float)r * brightness);
+  g = (uint8_t)((float)g * brightness);
+  b = (uint8_t)((float)b * brightness);
 
-    /* Color: Rainbow based on step (moving color) */
-    /* Use step to shift hue so it looks like a rainbow cycle */
-    uint32_t color = rainbow_color(0.1f, step * 2 + i * 5, 128, 127);
-    
-    uint8_t r, g, b;
-    color_to_rgb(color, &r, &g, &b);
-
-    /* Apply global brightness and fade */
-    r = (uint8_t)((float)r * brightness * fade);
-    g = (uint8_t)((float)g * brightness * fade);
-    b = (uint8_t)((float)b * brightness * fade);
-
-    ws2812_set_rgb(led_index, r, g, b);
-  }
+  ws2812_set_rgb(0, r, g, b);
   ws2812_update();
   ws2812_wait_dma(50);
 }
 
 /**
- * @brief  RGB转换�?4bit颜色
- * @param  r: 红色亮度�?-255�?
- * @param  g: 绿色亮度�?-255�?
- * @param  b: 蓝色亮度�?-255�?
- * @retval 24bit颜色
+ * @brief  RGB转换为24bit颜色
  */
 uint32_t rgb_to_color(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -232,10 +243,6 @@ uint32_t rgb_to_color(uint8_t r, uint8_t g, uint8_t b)
 
 /**
  * @brief  24bit颜色转换为RGB
- * @param  color: 24bit颜色
- * @param  r: 红色亮度�?-255�?
- * @param  g: 绿色亮度�?-255�?
- * @param  b: 蓝色亮度�?-255�?
  */
 void color_to_rgb(uint32_t color, uint8_t *r, uint8_t *g, uint8_t *b)
 {

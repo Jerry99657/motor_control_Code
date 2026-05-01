@@ -8,9 +8,12 @@
 #define CODE_ZERO_DUTY 72
 
 #define RST_PERIOD_NUM 100
-#define WS2812_NUM 12
+#define WS2812_NUM 1
 
 extern uint32_t ws2812_color[WS2812_NUM];
+
+/* 非 0 = LVGL 手动控制模式（禁止 main 循环自动彩虹），0 = 自动彩虹模式 */
+extern uint8_t g_ws2812_manual_mode;
 
 // 将颜色数组直接更新到 LED，不使用渐变过渡
 void ws2812_update(void);

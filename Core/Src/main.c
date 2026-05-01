@@ -36,6 +36,7 @@
 #include "mjpeg_scheduler.h"
 #include "dc_motor_ol.h"
 #include "mecanum.h"
+#include "ws2812.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
@@ -1051,6 +1052,9 @@ int main(void)
 
   HAL_TIM_Base_Start_IT(&htim16);
 
+  /* Initialize WS2812 - 10% green 1s then off */
+  ws2812_Init();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1060,6 +1064,8 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    uint32_t now = HAL_GetTick();
+
 #if SD_SELF_TEST_ENABLE
     if (g_sd_self_test_done == 0U)
     {
@@ -1083,7 +1089,6 @@ int main(void)
 
     if (g_cdc_welcome_sent == 0U)
     {
-      uint32_t now = HAL_GetTick();
       static uint8_t cdc_welcome_msg[] = "USB CDC ready, type to echo.\r\n";
 
       if ((now - g_cdc_welcome_last_tick) >= 500U)
