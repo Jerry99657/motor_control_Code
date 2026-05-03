@@ -1,493 +1,547 @@
-# STM32H743ZIT6 KIT 启动动画排障记录
+# STM32H743ZIT6_KIT 工程说明
 
-## 目标
+## 1. 项目概述
+本工程基于 STM32H743ZIT6，使用 STM32CubeMX + HAL + CMake 构建，围绕以下核心能力实现：
 
-本项目的启动动画支持两条路径：
+- LVGL 人机交互（按键导航 + 菜单页面）
+- 四路直流电机闭环控制（速度环 + 位置环串级）
+- 麦克纳姆底盘运动控制（平移/旋转/混合轨迹）
+- MPU6500 姿态数据采集与航向角参与控制
+- WS2812 灯带控制（定时器 PWM + DMA）
+- SD 文件浏览与媒体相关功能
+- VOFA+ 实时数据显示（速度、占空比）
+- USB CDC 与 UART5 指令通道
 
-- SD 卡播放启动动画
-- QSPI Flash 回退播放启动动画
+---
 
-本次排障的目标是：
+## 2. 软件架构与主要模块
 
-- 解决 SD 播放黑屏、读取失败和回退异常
-- 解决启动时 HardFault / SIGTRAP 问题
-- 降低 RAM_D2 占用
-- 明确异步播放与同步播放的差异
-- 记录后续“真正异步”的实现计划
+### 2.1 控制层级
 
-## 问题回顾
+- 底层执行层：`dc_motor_ol.c`
+  - 负责编码器读取、速度测量、PWM 输出
+  - 实现速度 PID、位置 PID（外环）以及串级控制
+- 底盘运动层：`mecanum.c`
+  - 将车体速度/位移指令解算为四轮目标
+  - 提供航向角闭环（角度环）与混合模式（速度 + 距离）
+- UI 与协议层：`lvgl_app.c`
+  - 一级菜单、页面逻辑、键盘导航
+  - 命令帧解析、页面联动控制
+- 系统调度层：`main.c`
+  - 初始化全部外设与模块
+  - 周期任务调度（TIM6/TIM7/TIM13/TIM16）
 
-### 1. 启动动画黑屏
+### 2.2 定时任务分工
 
-最初的现象是：
+`HAL_TIM_PeriodElapsedCallback()` 中的任务分配：
 
-- SD 动画播放失败
-- 超时后回退到外置 Flash 也失败
-- 画面黑屏
+- TIM6：`lv_tick_inc(1)`，LVGL 1ms 系统时基
+- TIM7：`MJPEG_Scheduler_OnTim7Tick()`，媒体播放调度
+- TIM13：`DCMotor_OL_Tick10ms()` + `Mecanum_Tick10ms()`，10ms 控制周期
+- TIM16：ADC 采样与电压计算
 
-### 2. SD 首帧读取失败
+---
 
-后续日志显示：
+## 3. LVGL 一级菜单功能（Main Menu）
 
-- `SDA: frame0 read fail`
-- `QSA: ok`
+一级菜单位于 `lvgl_app_show_main_menu()`，共 6 项：
 
-这说明：
+1. `Motor Control`
+2. `Command Control`
+3. `SD Card Files`
+4. `Mecanum Control`
+5. `MPU6500 Data`
+6. `WS2812 Control`
 
-- QSPI 播放链路正常
-- SD 动画失败集中在首帧读取或其后续显示链路
+对应核心函数如下：
 
-### 3. HardFault / SIGTRAP
+- 主菜单构建：`lvgl_app_show_main_menu()`
+- 一级菜单事件分发：`lvgl_app_menu_event_cb()`
+- 二级页面入口：
+  - `lvgl_app_show_motor_control_menu()`
+  - `lvgl_app_show_command_control()`
+  - `lvgl_app_show_sd_browser()`
+  - `lvgl_app_show_mecanum_control()`
+  - `lvgl_app_show_mpu6500_data()`
+  - `lvgl_app_show_ws2812_control()`
 
-在调试器中，程序进入了异常停顿状态。
+---
 
-通过 `g_hardfault_snapshot` 最终定位到：
+## 4. 一级页面功能说明
 
-- `stacked_pc = 0x0801AB5E`
-- `stacked_lr = 0x0801AB0D`
-- `cfsr = 0x00000400`
-- `hfsr = 0x40000000`
+### 4.1 Motor Control
 
-这代表：
+包含两个子功能：
 
-- 精确数据总线错误
-- 被升级成 HardFault
+- `Motor Speed`：四路电机速度百分比设定与回读
+- `Servo Angle`：舵机角度控制
 
-最终追到的故障点是 LCD 异步 DMA 路径中的 DCache 维护函数，而不是 SD 读本身。
+核心函数：
 
-### 4. RAM_D2 占用偏高
+- `lvgl_app_show_motor_control_menu()`
+- `lvgl_app_show_motor_speed_control()`
+- `lvgl_app_motor_speed_send_cmd()`
+- `lvgl_app_motor_speed_sync_actual()`
 
-由于 SD 启动动画使用双帧缓冲，RAM_D2 占用一度较高，需要优化内存布局。
+### 4.2 Command Control
 
-## 已完成的修复
+用于接收并解析命令帧，转发到电机/底盘/舵机控制。
 
-### 1. 增加 HardFault 快照
+核心函数：
 
-在 `Core/Src/stm32h7xx_it.c` 中加入了：
+- `lvgl_app_show_command_control()`
+- `lvgl_app_com_rx_cb()`
+- `lvgl_app_cmd_parse()`
 
-- `g_hardfault_snapshot`
-- `HardFault_HandlerC()`
-- 堆栈寄存器、CFSR、HFSR、BFAR、MMFAR 采集
+### 4.3 SD Card Files
 
-作用：
+用于浏览 SD 卡目录并进入媒体相关功能。
 
-- 让 HardFault 不再“无现场”
-- 可以直接定位故障 PC
+核心函数：
 
-### 2. SD 读取增强
+- `lvgl_app_show_sd_browser()`
+- `lvgl_app_sd_scan_current_path()`
+- `lvgl_app_sd_file_event_cb()`
 
-在 `Drivers/User/Src/sd_start_anim.c` 中加入：
+### 4.4 Mecanum Control
 
-- `f_lseek()` 跳到动画数据区
-- 分块读取
-- 读取失败详细日志
-- 中转 stage buffer
+用于设置底盘 X/Y/旋转速度与位移参数，并执行或停止麦轮混合控制。
 
-作用：
+核心函数：
 
-- 让读取错误更容易定位
-- 避免直接把大块数据一次性压到目标缓冲区
+- `lvgl_app_show_mecanum_control()`
+- `lvgl_app_control_confirm_selected()`
+- `Mecanum_MixedControl()`
 
-### 3. QSPI 链路稳定化
+### 4.5 MPU6500 Data
 
-在 `Drivers/User/Src/qspi_w25q64.c` 和 `Drivers/User/Src/qspi_start_anim.c` 中做了加固：
+实时显示 MPU6500 采样与姿态相关信息。
 
-- QSPI 读写重试
-- 播放日志
-- 播放正常后可稳定回退
+核心函数：
 
-当前结果：
+- `lvgl_app_show_mpu6500_data()`
+- `mpu6500_timer_cb()`
 
-- `QSA: ok`
+### 4.6 WS2812 Control
 
-### 4. LCD 异步链路修复
+用于 RGB 实时调节与灯带验证显示。
 
-最终定位到异常来自 LCD 异步 DMA 路径中的 DCache 维护。
+核心函数：
 
-做过的处理包括：
+- `lvgl_app_show_ws2812_control()`
+- `lvgl_app_ws2812_key_cb()`
+- `lvgl_app_ws2812_slider_cb()`
+- `ws2812_update()`
 
-- 增加 `LCD_ResetTransferState()`
-- 避免超时后状态污染
-- 将异步播放路径修正为适合 DMA 读源数据的 cache 语义
-- 对 D2 SRAM 进行 MPU 非缓存配置
-- 让 LCD 驱动只对真正缓存的 AXI SRAM 做 cache 维护
+---
 
-### 5. RAM_D2 优化
+## 5. VOFA+ 显示与通信链路
 
-已经把 SD 启动动画的帧缓冲恢复到 `.ram_d2`，同时通过 MPU 把 D2 配置成非缓存区，避免 cache op 触发异常。
+### 5.1 VOFA+ 数据上传
 
-当前内存结果：
+`VOFA_Task_Process()` 每 20ms（50Hz）发送一帧 JustFloat 数据：
 
-- RAM 总占用约 52.54%
-- RAM_D2 占用约 39.06%
+- `speed[4]`：四个电机的实时转速 RPM
+- `duty[4]`：四个电机的实际 PWM 占空比百分比
+- 帧尾：`0x00 0x00 0x80 0x7f`
 
-### 6. 测速功能关闭
+数据源函数：
 
-为减少干扰，已将 SD benchmark 默认关闭。
+- `DCMotor_OL_GetSpeedRpm()`
+- `DCMotor_OL_GetDutyPercent()`
 
-## 关键结论
+发送接口：
 
-### 异步播放不等于一定更快
+- `CDC_Transmit_FS()`
 
-异步的作用是：
+### 5.2 下行命令输入
 
-- 让 CPU 不必一直等待 SPI 传输完成
-- 允许“读下一帧”和“发上一帧”重叠
+- USB CDC：`CDC_Receive_FS()` 中分发给
+  - `lvgl_app_com_rx_cb()`
+  - `vofa_usb_rx_cb()`
+- UART5：中断接收回调 `HAL_UART_RxCpltCallback()` 中分发给
+  - `lvgl_app_com_rx_cb()`
 
-但如果当前代码仍然是：
+简易调速命令（VOFA 输入）示例：
 
-- 单缓冲
-- 每帧仍然等待完成
-- 动画帧间隔固定
+- `M1:50`：1号电机 50%
+- `STOP`：四电机停止
 
-那么异步在观感上通常不会有明显差异。
+---
 
-### 速度瓶颈主要在三个地方
+## 6. 电机控制算法详解
 
-- LCD SPI 带宽
-- 动画文件的 frame delay
-- 是否真的实现了流水线并行
+控制算法核心文件：`dc_motor_ol.c`。
 
-## 当前可调参数
+### 6.1 速度环（内环）
 
-### 1. LCD SPI 分频
+#### 6.1.1 采样与测速
+每 10ms 从编码器计数差计算实际转速：
 
-位置：
+$$
+\omega_{meas\_rpm} = \frac{\Delta count \times 60000}{N_{enc} \times T_s}
+$$
 
-- `Drivers/User/Src/lcd_spi_154.c`
+其中：
 
-当前代码里存在：
+- $N_{enc}=1000$（每圈脉冲数）
+- $T_s=10ms$
 
-- `LCD_SPI.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;`
+#### 6.1.2 目标转速换算
 
-CubeMX 里也能改：
+$$
+\omega_{ref\_rpm} = \frac{speed_{\%} \times RPM_{max\_target}}{100}
+$$
 
-- `SPI6 -> Parameter Settings -> Clock Parameters -> Prescaler for Baud Rate`
+#### 6.1.3 前馈 + PID
+代码使用了前馈项 + PID：
 
-建议：
+$$
+u_{ff} = \frac{\omega_{ref\_rpm} \times 100}{RPM_{no\_load}}
+$$
 
-- 先试 `8`
-- 稳定后试 `4`
-- 如果面板允许，再试 `2`
+$$
+e = \omega_{ref\_rpm} - \omega_{meas\_rpm}
+$$
 
-### 2. QSPI 播放倍率
+$$
+u = u_{ff} + K_p e + K_i \sum e + K_d(e - e_{k-1})
+$$
 
-位置：
+并进行：
 
-- `Drivers/User/Inc/qspi_start_anim.h`
+- 输出限幅：$u \in [-100,100]$
+- 积分限幅：$I \in [-8000,8000]$
+- 抗积分饱和：当输出饱和且误差继续推动饱和时暂停积分
 
 当前参数：
 
-- `QSPI_START_ANIM_PLAYBACK_SPEED_NUM = 4U`
-- `QSPI_START_ANIM_PLAYBACK_SPEED_DEN = 1U`
+- `Kp = 0.08`
+- `Ki = 0.015`
+- `Kd = 0.0`
 
-含义：
+---
 
-- 当前约为 4 倍速
+### 6.2 位置环（外环）
 
-### 3. SD 动画帧延时
+位置环输出不是 PWM，而是“目标转速”，再交给速度环跟踪（典型串级控制）。
 
-位置：
+#### 6.2.1 误差与输出
 
-- 动画文件头中的 `frame_delay_ms`
-- `Drivers/User/Src/sd_start_anim.c`
+$$
+e_p = p_{ref} - p_{meas}
+$$
 
-当前播放节奏仍然跟随帧延时。
+$$
+\omega_{ref\_rpm} = K_{p,p}e_p + K_{i,p}\sum e_p + K_{d,p}(e_p - e_{p,k-1})
+$$
 
-如果要更快，可以：
+并加入速度上限约束（`speed_limit_percent`）：
 
-- 重新打包动画时减小 `frame_delay_ms`
-- 或给 SD 播放也加一个倍率参数
+$$
+\omega_{ref\_rpm} \in [-\omega_{limit},\omega_{limit}]
+$$
 
-## CubeMX 中的 SPI 修改位置
+其中：
 
-如果要改 SPI6 分频：
+$$
+\omega_{limit} = \frac{speed\_limit_{\%} \times RPM_{max\_target}}{100}
+$$
 
-- 打开 CubeMX
-- 进入 `Pinout & Configuration`
-- 找到 `Connectivity -> SPI6`
-- 打开 `Parameter Settings`
-- 修改 `Clock Parameters -> Prescaler for Baud Rate`
+#### 6.2.2 到位策略
 
-注意：
+- 位置误差死区：`|error| < 15 pulses` 直接输出 0，防止到位抖动
 
-- 运行时驱动里如果再次手动设置 SPI 分频，会覆盖 CubeMX 的配置
-- 需要保证 CubeMX 与代码中的值一致
+当前参数：
 
-## 真正异步的实现计划
+- `Kp = 0.5`
+- `Ki = 0.0`
+- `Kd = 0.0`
 
-目前的“异步”更多是：
+---
 
-- DMA 发送异步
-- 但读取与显示并没有充分流水线化
+## 7. 角度环（航向环）算法详解
 
-如果要做成真正异步，建议按下面方案推进：
+角度环位于底盘层 `mecanum.c` 的速度模式分支中，作用是维持车体航向或按设定角速度旋转。
 
-### 计划 1：双缓冲流水线
+### 7.1 目标角更新
+当用户给出旋转速度命令 `wz_raw` 时，积分生成目标角：
 
-目标：
+$$
+\theta_{ref}(k) = \theta_{ref}(k-1) + wz_{cmd} \cdot T_s
+$$
 
-- 当前帧 DMA 发屏时，后台读取下一帧
+并做 $[-180,180]$ 回绕。
 
-实现思路：
+### 7.2 角误差与 PI
 
-- 保留两个帧缓冲
-- buffer A 发送时，buffer B 读取下一帧
-- 发送完成后交换缓冲区
+$$
+e_\theta = \theta_{ref} - \theta_{meas}
+$$
 
-收益：
+对误差做最短角距离回绕后，计算：
 
-- 真正重叠 I/O 和显示
-- 才能明显缩短总播放时间
+$$
+wz_{corr} = K_{p,\theta} e_\theta + K_{i,\theta} \int e_\theta dt
+$$
 
-### 计划 2：把帧读取与发送解耦
+工程实现中包含以下实用策略：
 
-目标：
+- 小误差死区：`|error| < 1.5°` 输出置零
+- 积分限幅：`[-50,50]`
+- 破静摩擦补偿：非零小输出拉到 `±12`
+- 输出限幅：`[-100,100]`
 
-- 读帧和发屏不要写在同一个阻塞循环里
+当前参数：
 
-实现思路：
+- `Kp = 3.0`
+- `Ki = 0.15`
 
-- 读取任务负责填充下一帧
-- 显示任务负责把当前帧交给 LCD DMA
-- 用状态机管理两个阶段
+---
 
-### 计划 3：统一缓冲区内存策略
+## 8. 麦轮控制算法详解
 
-目标：
+控制核心：`Mecanum_MixedControl()` + `Mecanum_Tick10ms()`。
 
-- 让 DMA 读写缓冲区都放在明确策略下的内存区
+### 8.1 运动学逆解
+先将旋转角速度换算为线速度补偿：
 
-实现思路：
+$$
+V_w = \omega_{z,rad} \cdot K,\quad K = \frac{L+W}{2}
+$$
 
-- DMA 输入缓冲使用非缓存区，或严格做 invalidate/clean
-- 需要 cache 的区域只给 CPU 侧使用
-- 避免把 DMA buffer 和 cache maintenance 混用
+四轮线速度：
 
-### 计划 4：加入真正的性能度量
+$$
+\begin{aligned}
+V_1 &= V_x + V_y + V_w\\
+V_2 &= -V_x + V_y + V_w\\
+V_3 &= -V_x - V_y + V_w\\
+V_4 &= V_x - V_y + V_w
+\end{aligned}
+$$
 
-目标：
+再通过 `Mecanum_HW_SetSpeed()` 转换为电机百分比命令。
 
-- 判断到底是 LCD、SD 还是动画节奏限制了速度
+### 8.2 混合模式（速度 + 距离）
+当输入包含 `dx/dy/dw` 任一非零时，进入混合轨迹模式：
 
-实现思路：
+- 有距离约束的轴：按剩余距离积分推进，步进量受 `dt=10ms` 与当前速度限制
+- 无距离约束的轴：保留本次速度偏移
+- 每周期更新四轮目标脉冲：`DCMotor_OL_SetTargetPosition()`
+- 所有有界轴到达后，自动清零并切回速度模式，避免残余自转
 
-- 统计每帧读取耗时
-- 统计每帧显示耗时
-- 统计总帧率
-- 决定是调 SPI、调帧间隔还是调度策略
+---
 
-## 最后建议
+## 9. 关键函数速查（按用途）
 
-如果只想先“看起来更快”，优先做这三件事：
+### 系统与调度
 
-1. 把 LCD SPI 分频从 16 调小到 8 或 4
-2. 把动画文件的 `frame_delay_ms` 调小
-3. 如果要保留异步，就继续推进双缓冲流水线
+- `main()`：模块初始化与主循环
+- `HAL_TIM_PeriodElapsedCallback()`：控制任务调度
+- `VOFA_Task_Process()`：VOFA+ 数据帧上传
 
-如果要“真正加速”，核心是让读取和发送重叠，而不是仅仅把发送改成异步。
+### 电机与底盘
 
-## 时间轴总结
+- `DCMotor_OL_Init()`
+- `DCMotor_OL_Tick10ms()`
+- `DCMotor_OL_SetSpeed()`
+- `DCMotor_OL_SetTargetPosition()`
+- `Mecanum_MixedControl()`
+- `Mecanum_Tick10ms()`
 
-### 第一阶段：最开始移植 W25Q64
+### 界面与命令
 
-目标：
+- `LVGL_App_Init()`
+- `LVGL_App_Process()`
+- `lvgl_app_show_main_menu()`
+- `lvgl_app_menu_event_cb()`
+- `lvgl_app_com_rx_cb()`
+- `lvgl_app_cmd_parse()`
 
-- 让外置 QSPI Flash 正常初始化、读 ID、读写数据
+### 灯带
 
-遇到的问题：
+- `ws2812_Init()`
+- `ws2812_update()`
+- `ws2812_set_all()`
 
-- QSPI 初始化不稳定
-- 读写流程与原工程环境不一致
-- 用户层 QSPI 文件需要重新接回工程
-- CubeMX 重新生成后，外部 Flash 相关代码容易遗漏
+---
 
-最终处理：
+## 10. 构建与运行
 
-- 修正 QSPI 初始化流程
-- 增加读写重试和复位
-- 将 `qspi_w25q64.c`、`qspi_start_anim.c` 等文件重新纳入构建
-- 先把 W25Q64 的基础读写稳定下来
+### 10.1 构建
+建议使用 CMake 方式：
 
-### 第二阶段：用串口写入 W25Q64
+- 生成并进入构建目录（如 `build/Debug`）
+- 执行 Ninja 构建
 
-目标：
+### 10.2 运行前检查
 
-- 通过串口 / CDC 把动画数据写入 W25Q64
+- TIM13 中断正常（10ms 控制周期）
+- 编码器计数方向与电机方向一致
+- USB CDC 已枚举（VOFA+ 才能接收数据）
+- WS2812 使用 TIM15 CH2 + DMA，初始化后应可见测试灯
 
-遇到的问题：
+---
 
-- 普通 CDC 通道会和下载数据流冲突
-- 如果没有先进入下载模式，主循环中的 CDC echo 会干扰写入流
-- 下载过程需要明确区分“运行模式”和“下载模式”
+## 11. 后续可优化项（建议）
 
-最终处理：
+- 给速度环加入转速前馈线性标定表，改善低速一致性
+- 角度环增加 D 项或观测器，进一步降低动态超调
+- 麦轮混合模式支持 S 曲线速度规划，减少冲击
+- VOFA+ 增加航向角、位置误差、控制输出通道，提升调参效率
 
-- 增加串口下载入口
-- 在启动时区分正常运行和下载模式
-- 进入下载模式后再接收完整写入流
-- 避免正常 CDC echo 抢占写入数据
+---
 
-### 第三阶段：播放 W25Q64 中的动画
+## 12. 串口/CDC 指令全集（本工程当前实现）
 
-目标：
+本工程存在两套下行命令协议：
 
-- 从外置 W25Q64 读取动画并显示到 LCD
+- 文本协议（主要用于 VOFA+ 串口助手快速控制）
+- 二进制帧协议（`0x77 0x68` 帧头）
 
-遇到的问题：
+### 12.1 命令入口与通道
 
-- 动画数据头解析和数据偏移需要严格一致
-- 播放帧率和 LCD 刷新速度要匹配
-- 异步 DMA 发送路径涉及 cache 维护
-- 早期一度出现 HardFault / SIGTRAP
+#### 12.1.1 文本协议入口
 
-最终处理：
+- 入口函数：`vofa_usb_rx_cb()`（`Core/Src/main.c`）
+- 数据来源：`CDC_Receive_FS()`（USB CDC）
+- 说明：当前仅在 USB CDC 路径调用，不走 UART5。
 
-- 统一动画头格式
-- 增加帧读取与播放日志
-- 修正 LCD 异步 cache 维护语义
-- 通过 MPU 和内存布局规避 DMA 缓冲冲突
+#### 12.1.2 二进制帧协议入口
 
-### 第四阶段：启动动画集成到 SD / QSPI 双路径
+- 入口函数：`lvgl_app_com_rx_cb()` -> `lvgl_app_cmd_parse()`（`Drivers/User/Src/lvgl_app.c`）
+- 数据来源：
+  - USB CDC：`CDC_Receive_FS()` 中调用 `lvgl_app_com_rx_cb()`
+  - UART5：`HAL_UART_RxCpltCallback()` 中调用 `lvgl_app_com_rx_cb()`
+- 重要限制：仅当当前页面是 `Command Control` 时生效（`s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND`）。
 
-目标：
+### 12.2 文本协议指令
 
-- SD 优先播放，失败后回退 QSPI
+#### 12.2.1 单电机速度设置
 
-遇到的问题：
+- 格式：`M<电机号>:<速度百分比>`
+- 范围：
+  - 电机号：`1~4`
+  - 速度：`-100~100`（超出自动截断）
+- 示例：
+  - `M1:50` -> 1号电机 +50%
+  - `M3:-30` -> 3号电机 -30%
 
-- SD 首帧读取失败
-- 回退链路在 cache / DMA 上出问题
-- RAM_D2 占用偏高
+#### 12.2.2 全部停止
 
-最终处理：
+- 指令：`STOP`
+- 行为：调用 `DCMotor_OL_StopAll()`。
 
-- 引入 HardFault 快照
-- 定位到 LCD 异步传输链路
-- 调整 D2 SRAM 的 MPU 策略
-- 保留异步播放能力，同时把内存策略收敛到稳定状态
+### 12.3 二进制帧协议通用格式
 
-### 最终结论
+通用帧结构（按当前实现）：
 
-整个工程的主线可以概括为：
+- `Byte0`：`0x77`
+- `Byte1`：`0x68`
+- `Byte2`：`LEN`（整帧长度，包含头尾）
+- `Byte3`：`DEV_ID`
+- `Byte4`：`CMD`
+- `Byte5..`：负载
+- `Byte(LEN-1)`：`0x0A`
 
-1. 先让 W25Q64 基础读写稳定
-2. 再让串口写入流程不被正常 CDC 任务干扰
-3. 然后让 W25Q64 动画播放稳定
-4. 最后把 SD / QSPI 启动动画集成到统一播放链路里
+解析规则：
 
-这条时间轴里最核心的风险点是：
+- `LEN` 允许范围：`0x04~0x10`
+- 尾字节必须是 `0x0A`
+- 若帧头不对或长度异常，接收缓冲会移位丢弃并继续找同步。
 
-- 外设 DMA 与 cache 维护
-- CDC 正常模式和下载模式的通道冲突
-- 动画帧率、SPI 带宽和内存布局的耦合
+### 12.4 二进制写命令（`CMD=0x02`）
 
-## 本次对话中的故障总表
+#### 12.4.1 四电机同时写入
 
-### 故障 1：SD 启动动画黑屏
+- 识别条件：`DEV_ID=0x01` 且 `LEN=0x0A`
+- 负载：
+  - `Byte5~Byte8`：4 路电机速度（`int8`，对应 M1~M4）
+- 示例：
+  - `77 68 0A 01 02 0A F6 14 00 0A`
+  - 含义：M1=+10, M2=-10, M3=+20, M4=0
 
-现象：
+#### 12.4.2 单电机写入
 
-- SD 动画不能播放
-- 屏幕黑屏
-- 失败后回退外置 Flash 也不稳定
+- 识别条件：`DEV_ID=0x02` 且 `LEN>=0x08`
+- 负载：
+  - `Byte5`：端口号（1~4）
+  - `Byte6`：速度（`int8`）
+- 示例：
+  - `77 68 08 02 02 01 32 0A`
+  - 含义：1号电机 +50%
 
-根因：
+#### 12.4.3 麦轮混合控制写入
 
-- 启动动画播放链路没有稳定跑通
-- 后续定位到 SD 首帧读取与 LCD 发送链路叠加后会出问题
+- 识别条件：`DEV_ID=0x03` 且 `LEN>=0x0D`
+- 负载：
+  - `Byte5`：模式 `mode`
+    - `0`：速度模式
+    - `1`：距离模式
+  - `Byte6~7`：`Vx`（`int16`, little-endian）
+  - `Byte8~9`：`Vy`（`int16`, little-endian）
+  - `Byte10~11`：`Wz`（`int16`, little-endian）
+- 行为：
+  - `mode=0`：`Mecanum_MixedControl(Vx,Vy,Wz,0,0,0)`
+  - `mode=1`：`Mecanum_MixedControl(100,100,100,Vx,Vy,Wz)`（以固定默认速度执行距离）
+- 示例（速度模式）：
+  - `77 68 0D 03 02 00 64 00 00 00 14 00 0A`
+  - 含义：Vx=100, Vy=0, Wz=20
 
-最终处理：
+#### 12.4.4 舵机角度写入
 
-- 增加启动阶段日志
-- 增加 SD 读取分块和失败诊断
-- 加固 QSPI 回退链路
-- 加固 LCD 传输状态恢复
+- 识别条件：`DEV_ID=0x05` 且 `LEN>=0x09`
+- 负载：
+  - `Byte5`：舵机端口（当前有效 1~2）
+  - `Byte7`：角度（0~180）
+- 行为：内部映射到 0~270：`target_angle = angle * 3 / 2`
+- 示例：
+  - `77 68 09 05 02 01 00 5A 0A`
+  - 含义：1号舵机设为 90°（内部映射为 135）
 
-### 故障 2：SD 首帧读取失败
+### 12.5 二进制读命令（`CMD=0x01`）
 
-现象：
+在处理读命令前，系统会先刷新一次电机实际转速：`lvgl_app_motor_speed_sync_actual()`。
 
-- 日志出现 `SDA: frame0 read fail`
-- 但 `QSA: ok`
+#### 12.5.1 四路编码器/速度读取
 
-根因：
+- 请求条件：`DEV_ID=0x03`
+- 回复格式（长度 `0x0A`）：
+  - `77 68 0A 03 01 s1 s2 s3 s4 0A`
+  - 其中 `s1~s4` 为 4 路实际速度（按 `uint8` 打包）。
 
-- SD 链路失败集中在首帧读取或其后续显示路径
-- 后来确认根因并不在 SD 读本身，而在 LCD 异步路径的 cache 维护
+#### 12.5.2 单路编码器/速度读取
 
-最终处理：
+- 请求条件：`DEV_ID=0x04`
+- 请求负载：`Byte5=port(1~4)`
+- 回复格式（长度 `0x08`）：
+  - `77 68 08 04 01 port speed 0A`
 
-- SD 读取增加 `f_lseek()` 和分块读取
-- 增加 `fr/req/got` 详细日志
-- 调整 LCD 异步路径的缓存策略
+#### 12.5.3 回复发送通道注意事项
 
-### 故障 3：HardFault / SIGTRAP
+当前实现中，读命令回包固定使用 `HAL_UART_Transmit(&huart5, ...)`，即通过 UART5 发出。
 
-现象：
+这意味着：
 
-- 烧录后直接进入异常
-- 调试器停在 `SIGTRAP`
-- `g_hardfault_snapshot` 一开始还是全 0
+- 即使请求来自 USB CDC，回包也不会经 CDC 返回，而是走 UART5。
+- 如果上位机通过 USB CDC 发读命令却没接 UART5，会看到“无回包”。
 
-根因：
+### 12.6 虚拟摇杆帧（特殊分支）
 
-- 真正进入了 HardFault，但最初没有拿到有效现场
-- 之后通过 `g_hardfault_snapshot` 和反汇编定位到 `SCB_CleanDCache_by_Addr()` / `SCB_InvalidateDCache_by_Addr()`
-- 这是 LCD 异步 DMA 相关的 cache 维护问题
+存在一个特殊分支：当 `DEV_ID=0x0C` 且 `LEN=0x0A` 时，按虚拟摇杆解释：
 
-最终处理：
+- `Byte4~Byte7`：`LX, LY, RX, RY`（`int8`）
+- 映射关系：
+  - `wz = LX * 2.0`
+  - `vy = RX * 10.0`
+  - `vx = RY * 10.0`
+- 执行：`Mecanum_MixedControl(vx, vy, wz, 0, 0, 0)`
 
-- 增加 HardFault 快照抓取
-- 定位到 LCD 异步缓存维护路径
-- 调整 D2 SRAM 的 MPU 策略
-- 让 LCD 驱动只对真正缓存区域执行 cache maintenance
+注意：该分支优先于 `CMD=0x02/0x01` 的普通解析逻辑。
 
-### 故障 4：RAM_D2 占用偏高
+### 12.7 使用建议
 
-现象：
-
-- RAM_D2 占用一度接近 78%
-
-根因：
-
-- SD 启动动画使用双帧缓冲
-- 帧缓冲直接放在 D2 区域
-
-最终处理：
-
-- 优化帧缓冲布局
-- 配置 D2 SRAM 为非缓存区
-- 降低 cache 相关风险
-
-### 故障 5：异步播放“看起来没更快”
-
-现象：
-
-- 异步启用后，观感上与同步播放差别不大
-
-根因：
-
-- 异步只减少 CPU 等待，不等于总播放时间必然减少
-- 代码里尚未形成真正的读写流水线
-- 播放速度还受 frame delay 和 LCD 带宽限制
-
-最终处理：
-
-- 保留异步能力
-- 但明确后续要做真正双缓冲流水线
-
-## 本次对话中的最终解决方法汇总
-
-- 通过 HardFault 快照定位精确故障点
-- 将故障从 SD 读取链路进一步缩小到 LCD 异步 cache maintenance
-- 用 MPU 和缓存策略修正 DMA 缓冲区使用方式
-- 保留异步播放，但让其在正确的内存策略下运行
-- 通过 SPI 分频和帧延时作为主要提速参数
-
-## 后续仍可继续优化的方向
-
-- 让 SD 读取和 LCD 发送真正流水线并行
-- 进一步缩短动画文件的 `frame_delay_ms`
-- 继续下调 SPI6 分频，验证屏幕稳定上限
-
+- 需要二进制协议生效时，先进入 LVGL 的 `Command Control` 页面。
+- 需要读命令回包时，请连接并监听 UART5。
+- 文本协议（`M1:50`/`STOP`）优先用于快速调试，不依赖 Command 页面。
