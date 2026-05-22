@@ -8,11 +8,13 @@ extern TIM_HandleTypeDef htim5;
 
 #define DC_MOTOR_COUNT 4U
 
-#define DC_MOTOR_PID_KP                     0.08f
-#define DC_MOTOR_PID_KI                     0.015f
-#define DC_MOTOR_PID_KD                     0.0f
+#define DC_MOTOR_PID_KP                     0.03f
+#define DC_MOTOR_PID_KI                     0.005f
+#define DC_MOTOR_PID_KD                     0.005f
 #define DC_MOTOR_PID_INT_LIMIT              8000.0f
 #define DC_MOTOR_OUTPUT_LIMIT               100.0f
+#define DC_MOTOR_SPEED_LPF_ALPHA            0.4f
+#define DC_MOTOR_FF_SCALE                   1.05f
 
 #define DC_MOTOR_POS_KP                     0.5f
 #define DC_MOTOR_POS_KI                     0.0f
@@ -51,9 +53,11 @@ static uint32_t s_encoder_prev_cnt[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static int16_t s_target_speed_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_target_rpm[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static volatile int32_t s_measured_rpm[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static float s_filtered_rpm[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static volatile int16_t s_applied_duty_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static float s_pid_integral[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static float s_pid_prev_error[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+static float s_pid_prev_measured[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static uint8_t s_motor_init_done = 0U;
 
 static DCMotorControlMode s_control_mode[DC_MOTOR_COUNT] = {
@@ -168,15 +172,21 @@ static int16_t dc_motor_pid_update(uint8_t index, int32_t target_rpm, int32_t me
     float unsat_output;
     uint8_t integrate_enable;
 
-    ff = ((float)target_rpm * 100.0f) / (float)DCMOTOR_OL_NO_LOAD_RPM;
+    ff = ((float)target_rpm * 100.0f) / (float)DCMOTOR_OL_NO_LOAD_RPM * DC_MOTOR_FF_SCALE;
     error = (float)(target_rpm - measured_rpm);
 
     p_term = DC_MOTOR_PID_KP * error;
     i_term = DC_MOTOR_PID_KI * s_pid_integral[index];
-    d_term = DC_MOTOR_PID_KD * (error - s_pid_prev_error[index]);
+    d_term = -DC_MOTOR_PID_KD * ((float)measured_rpm - s_pid_prev_measured[index]);
 
     unsat_output = ff + p_term + i_term + d_term;
-    integrate_enable = 1U;
+    integrate_enable = 0U;
+
+    /* 只在误差较小时才积分，防止上升阶段积分累积 */
+    if ((error > -30.0f) && (error < 30.0f))
+    {
+        integrate_enable = 1U;
+    }
 
     if ((unsat_output > DC_MOTOR_OUTPUT_LIMIT) && (error > 0.0f))
     {
@@ -195,6 +205,7 @@ static int16_t dc_motor_pid_update(uint8_t index, int32_t target_rpm, int32_t me
     }
 
     s_pid_prev_error[index] = error;
+    s_pid_prev_measured[index] = (float)measured_rpm;
 
     output = ff + p_term + i_term + d_term;
     output = dc_motor_clampf(output, -DC_MOTOR_OUTPUT_LIMIT, DC_MOTOR_OUTPUT_LIMIT);
@@ -268,8 +279,10 @@ HAL_StatusTypeDef DCMotor_OL_Init(void)
         s_target_speed_percent[i] = 0;
         s_target_rpm[i] = 0;
         s_measured_rpm[i] = 0;
+        s_filtered_rpm[i] = 0.0f;
         s_pid_integral[i] = 0.0f;
         s_pid_prev_error[i] = 0.0f;
+        s_pid_prev_measured[i] = 0.0f;
         s_measured_pulses[i] = 0;
         s_target_pulses[i] = 0;
         s_pos_pid_integral[i] = 0.0f;
@@ -335,8 +348,10 @@ void DCMotor_OL_StopAll(void)
         s_target_speed_percent[i] = 0;
         s_target_rpm[i] = 0;
         s_measured_rpm[i] = 0;
+        s_filtered_rpm[i] = 0.0f;
         s_pid_integral[i] = 0.0f;
         s_pid_prev_error[i] = 0.0f;
+        s_pid_prev_measured[i] = 0.0f;
         s_pos_pid_integral[i] = 0.0f;
         s_pos_pid_prev_error[i] = 0.0f;
         s_target_pulses[i] = s_measured_pulses[i];
@@ -373,6 +388,10 @@ void DCMotor_OL_Tick10ms(void)
         measured_rpm = dc_motor_counts_to_rpm(delta);
         s_measured_rpm[i] = measured_rpm;
 
+        /* 一阶低通滤波: filtered = alpha * new + (1-alpha) * filtered */
+        s_filtered_rpm[i] = DC_MOTOR_SPEED_LPF_ALPHA * (float)measured_rpm
+                          + (1.0f - DC_MOTOR_SPEED_LPF_ALPHA) * s_filtered_rpm[i];
+
         if (s_control_mode[i] == DCMOTOR_CONTROL_MODE_POSITION)
         {
             s_target_rpm[i] = dc_motor_pos_pid_update(i, s_target_pulses[i], s_measured_pulses[i]);
@@ -385,7 +404,7 @@ void DCMotor_OL_Tick10ms(void)
                 continue;
             }
 
-            output_percent = dc_motor_pid_update(i, s_target_rpm[i], measured_rpm);
+            output_percent = dc_motor_pid_update(i, s_target_rpm[i], (int32_t)s_filtered_rpm[i]);
             dc_motor_apply_output(i, output_percent);
         }
         else
@@ -396,7 +415,7 @@ void DCMotor_OL_Tick10ms(void)
                 continue;
             }
 
-            output_percent = dc_motor_pid_update(i, s_target_rpm[i], measured_rpm);
+            output_percent = dc_motor_pid_update(i, s_target_rpm[i], (int32_t)s_filtered_rpm[i]);
             dc_motor_apply_output(i, output_percent);
         }
     }
