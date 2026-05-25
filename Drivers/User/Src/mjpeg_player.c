@@ -98,8 +98,8 @@ extern DMA2D_HandleTypeDef hdma2d;
 
 static uint8_t s_mjpeg_frame_io_buffer[MJPEG_PLAYER_MAX_FRAME_BYTES] __attribute__((aligned(32)));
 static uint8_t s_mjpeg_ycbcr_buffer[MJPEG_PLAYER_MAX_YCBCR_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
-static uint8_t s_mjpeg_dma_stage_buffer[MJPEG_PLAYER_JPEG_STAGE_BYTES] __attribute__((aligned(32)));
-static uint8_t s_mjpeg_dma_out_chunk[MJPEG_PLAYER_JPEG_OUT_CHUNK_BYTES] __attribute__((aligned(32)));
+static uint8_t s_mjpeg_dma_stage_buffer[MJPEG_PLAYER_JPEG_STAGE_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
+static uint8_t s_mjpeg_dma_out_chunk[MJPEG_PLAYER_JPEG_OUT_CHUNK_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
 static uint32_t s_mjpeg_decode_fail_count = 0U;
 static uint32_t s_mjpeg_skip_log_count = 0U;
 static uint32_t s_mjpeg_dht_inject_log_count = 0U;
@@ -465,10 +465,11 @@ static int8_t mjpeg_decode_frame_via_dma(uint8_t *jpeg_data, uint32_t decode_len
     return MJPEG_PLAYER_ERR_DECODE;
   }
 
-  if (s_mjpeg_dma_ctx.out_len != 0U)
+  if (s_mjpeg_dma_ctx.out_len >= s_mjpeg_dma_ctx.convert_block_size)
   {
     return MJPEG_PLAYER_ERR_DECODE;
   }
+  /* Trailing bytes smaller than one MCU block are normal for non-aligned images */
 
   return MJPEG_PLAYER_OK;
 }

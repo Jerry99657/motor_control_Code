@@ -963,6 +963,7 @@ int main(void)
   MX_TIM13_Init();
   MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
@@ -1231,7 +1232,7 @@ static void MX_ADC1_Init(void)
   */
   sConfig.Channel = ADC_CHANNEL_10;
   sConfig.Rank = ADC_REGULAR_RANK_1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  sConfig.SamplingTime = ADC_SAMPLETIME_387CYCLES_5;
   sConfig.SingleDiff = ADC_SINGLE_ENDED;
   sConfig.OffsetNumber = ADC_OFFSET_NONE;
   sConfig.Offset = 0;
@@ -2534,15 +2535,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
   else if (htim->Instance == TIM16)
   {
+    HAL_ADC_Start_IT(&hadc1);
+  }
+}
+
+void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
+{
+  if (hadc->Instance == ADC1)
+  {
     extern volatile uint8_t g_adc_update_flag;
     extern volatile float g_adc_voltage;
-    HAL_ADC_Start(&hadc1);
-    if (HAL_ADC_PollForConversion(&hadc1, 100) == HAL_OK)
-    {
-      uint32_t val = HAL_ADC_GetValue(&hadc1);
-      g_adc_voltage = ((float)val / 65535.0f) * 3.3f * 7.0f;
-      g_adc_update_flag = 1;
-    }
+    uint32_t val = HAL_ADC_GetValue(hadc);
+    g_adc_voltage = ((float)val / 65535.0f) * 3.3f * 7.0f;
+    g_adc_update_flag = 1;
   }
 }
 
