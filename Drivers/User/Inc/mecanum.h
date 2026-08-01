@@ -64,6 +64,9 @@ typedef enum {
  *   dw_deg  : 顺时针自旋角度
  */
 void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd, float dx_dist, float dy_dist, float dw_deg);
+void Mecanum_CancelControl(void);
+void Mecanum_EmergencyStop(void);
+uint8_t Mecanum_IsMotionActive(void);
 
 void Mecanum_Tick10ms(void);
 

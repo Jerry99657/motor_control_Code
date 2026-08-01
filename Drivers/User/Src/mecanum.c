@@ -1,7 +1,23 @@
 #include "mecanum.h"
 #include "dc_motor_ol.h"
-#include "imu.h"
-#include "mpu6500.h"
+#include "imu_service.h"
+#include "safety_manager.h"
+
+#define MECANUM_IMU_STALE_TIMEOUT_MS 30U
+
+typedef struct
+{
+    float vx_spd;
+    float vy_spd;
+    float wz_spd;
+    float dx_dist;
+    float dy_dist;
+    float dw_deg;
+    uint8_t cancel_only;
+} MecanumCommand_t;
+
+static MecanumCommand_t s_pending_command;
+static volatile uint8_t s_pending_command_valid = 0U;
 
 static float s_user_vx = 0.0f;
 static float s_user_vy = 0.0f;
@@ -88,7 +104,8 @@ void Mecanum_HW_SetDistance(uint8_t motor_id, float dist_val, float speed_val) {
  * 
  * 姝ゅ叕寮忎篃鍚屾椂鏀寔缁撳悎浣跨敤銆傛瘮濡傚墠杩涗笖瑕佸彸杞?寮х嚎): 杈撳叆Vx 鍜?Wz銆?
  *=================================================================================*/
-void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd, float dx_dist, float dy_dist, float dw_deg) {
+static void mecanum_apply_command(float vx_spd, float vy_spd, float wz_spd,
+                                  float dx_dist, float dy_dist, float dw_deg) {
     /* 1. Determine Control Mode (Speed vs Hybrid/Distance) */
     int has_dist = (dx_dist != 0.0f || dy_dist != 0.0f || dw_deg != 0.0f);
     
@@ -128,6 +145,65 @@ void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd, float dx_dis
     }
 }
 
+void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd,
+                          float dx_dist, float dy_dist, float dw_deg) {
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    s_pending_command.vx_spd = vx_spd;
+    s_pending_command.vy_spd = vy_spd;
+    s_pending_command.wz_spd = wz_spd;
+    s_pending_command.dx_dist = dx_dist;
+    s_pending_command.dy_dist = dy_dist;
+    s_pending_command.dw_deg = dw_deg;
+    s_pending_command.cancel_only = 0U;
+    __DMB();
+    s_pending_command_valid = 1U;
+    if (primask == 0U) {
+        __enable_irq();
+    }
+}
+
+void Mecanum_CancelControl(void) {
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    s_pending_command.cancel_only = 1U;
+    __DMB();
+    s_pending_command_valid = 1U;
+    if (primask == 0U) {
+        __enable_irq();
+    }
+}
+
+void Mecanum_EmergencyStop(void) {
+    s_pending_command_valid = 0U;
+    s_user_vx = 0.0f;
+    s_user_vy = 0.0f;
+    s_user_wz_raw = 0.0f;
+    s_is_speed_mode = 0U;
+    s_hybrid_active = 0U;
+    s_hybrid_bound_x = 0U;
+    s_hybrid_bound_y = 0U;
+    s_hybrid_bound_w = 0U;
+    s_hybrid_rem_dx = 0.0f;
+    s_hybrid_rem_dy = 0.0f;
+    s_hybrid_rem_dw = 0.0f;
+    s_hybrid_tgt_vx = 0.0f;
+    s_hybrid_tgt_vy = 0.0f;
+    s_hybrid_tgt_wz = 0.0f;
+    s_yaw_integral = 0.0f;
+    DCMotor_OL_StopAll();
+}
+
+uint8_t Mecanum_IsMotionActive(void) {
+    if (s_hybrid_active != 0U) {
+        return 1U;
+    }
+
+    return ((s_user_vx != 0.0f) || (s_user_vy != 0.0f) || (s_user_wz_raw != 0.0f)) ? 1U : 0U;
+}
+
 /* =================================================================================
  * 鍗曠嫭鍓ョ骞跺皝瑁呭嚭鐨勭嫭绔嬫帶鍒惰皟鐢ㄦ帴鍙?
  * =================================================================================*/
@@ -157,10 +233,40 @@ void Mecanum_Rotate_CCW(float speed, float dist) {
 }
 
 void Mecanum_Tick10ms(void) {
-    int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
-    MPU6500_GetData(&ax, &ay, &az, &gx, &gy, &gz);
-    imu_data_calibration(&gx, &gy, &gz, &ax, &ay, &az);
-    eulerian_angles_t angles = imu_get_eulerian_angles((float)gx, (float)gy, (float)gz, (float)ax, (float)ay, (float)az);
+    ImuServiceSnapshot_t imu_snapshot;
+    eulerian_angles_t angles = {0.0f, 0.0f, 0.0f};
+    uint8_t has_imu;
+
+    if (s_pending_command_valid != 0U) {
+        MecanumCommand_t command = s_pending_command;
+        s_pending_command_valid = 0U;
+
+        if (command.cancel_only != 0U) {
+            s_user_vx = 0.0f;
+            s_user_vy = 0.0f;
+            s_user_wz_raw = 0.0f;
+            s_is_speed_mode = 0U;
+            s_hybrid_active = 0U;
+            s_yaw_integral = 0.0f;
+        } else {
+            mecanum_apply_command(command.vx_spd, command.vy_spd, command.wz_spd,
+                                  command.dx_dist, command.dy_dist, command.dw_deg);
+        }
+    }
+
+    has_imu = IMU_Service_GetSnapshot(&imu_snapshot);
+    if (has_imu != 0U) {
+        angles = imu_snapshot.angles;
+    }
+
+    if (Mecanum_IsMotionActive() != 0U) {
+        if ((has_imu == 0U) ||
+            ((uint32_t)(HAL_GetTick() - imu_snapshot.sample_tick) > MECANUM_IMU_STALE_TIMEOUT_MS)) {
+            Safety_LatchFault(SAFETY_FAULT_IMU_STALE);
+            Mecanum_EmergencyStop();
+            return;
+        }
+    }
     
     if (!s_is_speed_mode) {
         if (s_hybrid_active) {

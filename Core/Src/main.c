@@ -36,6 +36,9 @@
 #include "mjpeg_scheduler.h"
 #include "dc_motor_ol.h"
 #include "mecanum.h"
+#include "imu_service.h"
+#include "safety_manager.h"
+#include "comm_service.h"
 #include "ws2812.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
@@ -143,6 +146,7 @@ static uint8_t g_dma2d_init_ok = 0U;
 static uint8_t g_tim7_init_ok = 0U;
 static uint8_t g_tim7_start_ok = 0U;
 volatile uint32_t g_tim7_frame_tick = 0U;
+static volatile uint8_t g_adc_start_pending = 0U;
 
 /* USER CODE END PV */
 
@@ -201,20 +205,33 @@ static void Boot_LogText(const char *text);
 static void Boot_LogStatus(const char *prefix, int32_t value);
 void vofa_usb_rx_cb(uint8_t *buf, uint32_t len);
 static void VOFA_Task_Process(void);
+static void ADC_Service_Process(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 uint8_t g_uart5_rx_byte;
-extern void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len);
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == UART5)
   {
-    lvgl_app_com_rx_cb(&g_uart5_rx_byte, 1);
-    HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
+    CommService_UartRxByteFromISR(g_uart5_rx_byte);
+    (void)HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
+  }
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  CommService_UartTxCompleteFromISR(huart);
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == UART5)
+  {
+    (void)HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
   }
 }
 
@@ -223,6 +240,12 @@ void vofa_usb_rx_cb(uint8_t *buf, uint32_t len)
   static char rx_buf[64];
   static uint8_t rx_idx = 0;
   uint32_t i;
+
+  if (LVGL_App_IsCommandControlActive() == 0U)
+  {
+    rx_idx = 0U;
+    return;
+  }
 
   for (i = 0; i < len; i++)
   {
@@ -241,12 +264,12 @@ void vofa_usb_rx_cb(uint8_t *buf, uint32_t len)
           {
             if (speed_pct > 100) speed_pct = 100;
             if (speed_pct < -100) speed_pct = -100;
-            DCMotor_OL_SetSpeed((uint8_t)motor_idx, (int16_t)speed_pct);
+            (void)LVGL_App_CommandSetMotorSpeed((uint8_t)motor_idx, (int16_t)speed_pct);
           }
         }
         else if (strcmp(rx_buf, "STOP") == 0)
         {
-          DCMotor_OL_StopAll();
+          LVGL_App_CommandStopMotors();
         }
         rx_idx = 0;
       }
@@ -292,6 +315,25 @@ static void VOFA_Task_Process(void)
 
       (void)CDC_Transmit_FS((uint8_t *)&frame, sizeof(frame));
     }
+  }
+}
+
+static void ADC_Service_Process(void)
+{
+  uint8_t start_requested;
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  start_requested = g_adc_start_pending;
+  g_adc_start_pending = 0U;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  if ((start_requested != 0U) && (HAL_ADC_Start_IT(&hadc1) != HAL_OK))
+  {
+    g_adc_start_pending = 1U;
   }
 }
 
@@ -964,6 +1006,7 @@ int main(void)
   MX_TIM16_Init();
   /* USER CODE BEGIN 2 */
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
+  CommService_Init();
   HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
@@ -1017,11 +1060,13 @@ int main(void)
   lv_port_disp_init();
   lv_port_indev_init();
   LVGL_App_Init();
+  IMU_Service_Init();
 
   if (DCMotor_OL_Init() != HAL_OK)
   {
     Error_Handler();
   }
+  Safety_Init();
 
   if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
   {
@@ -1066,6 +1111,10 @@ int main(void)
 
     /* USER CODE BEGIN 3 */
     uint32_t now = HAL_GetTick();
+
+    CommService_Process();
+    IMU_Service_Process();
+    ADC_Service_Process();
 
 #if SD_SELF_TEST_ENABLE
     if (g_sd_self_test_done == 0U)
@@ -2374,7 +2423,7 @@ static void MX_BDMA_Init(void)
 
   /* DMA interrupt init */
   /* BDMA_Channel0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(BDMA_Channel0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(BDMA_Channel0_IRQn, 7, 0);
   HAL_NVIC_EnableIRQ(BDMA_Channel0_IRQn);
 
 }
@@ -2390,7 +2439,7 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA1_Stream0_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA1_Stream0_IRQn, 7, 0);
   HAL_NVIC_EnableIRQ(DMA1_Stream0_IRQn);
 
 }
@@ -2407,7 +2456,7 @@ static void MX_MDMA_Init(void)
 
   /* MDMA interrupt initialization */
   /* MDMA_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(MDMA_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(MDMA_IRQn, 9, 0);
   HAL_NVIC_EnableIRQ(MDMA_IRQn);
 
 }
@@ -2530,12 +2579,39 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   }
   else if (htim->Instance == TIM13)
   {
-    DCMotor_OL_Tick10ms();
-    Mecanum_Tick10ms();
+    uint32_t control_start = Safety_ControlTimingStart();
+
+    Safety_ControlTick10ms();
+    if (Safety_IsMotionAllowed() != 0U)
+    {
+      Mecanum_Tick10ms();
+      if (Safety_IsMotionAllowed() != 0U)
+      {
+        DCMotor_OL_ApplyPendingCommands();
+        DCMotor_OL_Tick10ms();
+      }
+      else
+      {
+        Mecanum_EmergencyStop();
+      }
+    }
+    else
+    {
+      Mecanum_EmergencyStop();
+    }
+
+    Safety_SetMotionActive(
+      ((Mecanum_IsMotionActive() != 0U) || (DCMotor_OL_IsMotionActive() != 0U)) ? 1U : 0U);
+
+    Safety_ControlTimingFinish(control_start);
+    if (Safety_IsMotionAllowed() == 0U)
+    {
+      Mecanum_EmergencyStop();
+    }
   }
   else if (htim->Instance == TIM16)
   {
-    HAL_ADC_Start_IT(&hadc1);
+    g_adc_start_pending = 1U;
   }
 }
 

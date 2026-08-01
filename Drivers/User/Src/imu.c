@@ -151,10 +151,17 @@ static void imu_ahrsupdate_nomagnetic(float gx, float gy, float gz, float ax, fl
     delta_2 = (half_t * gx) * (half_t * gx) + (half_t * gy) * (half_t * gy) + (half_t * gz) * (half_t * gz);
 
     /* ������Ԫ����    ��Ԫ��΢�ַ���  ��Ԫ�������㷨�����ױϿ��� */
-    q0 = (1 - delta_2 / 2.0f) * q0 + (-q1 * gx - q2 * gy - q3 * gz) * half_t;
-    q1 = (1 - delta_2 / 2.0f) * q1 + (q0 * gx + q2 * gz - q3 * gy) * half_t;
-    q2 = (1 - delta_2 / 2.0f) * q2 + (q0 * gy - q1 * gz + q3 * gx) * half_t;
-    q3 = (1 - delta_2 / 2.0f) * q3 + (q0 * gz + q1 * gy - q2 * gx) * half_t;
+    {
+        float old_q0 = q0;
+        float old_q1 = q1;
+        float old_q2 = q2;
+        float old_q3 = q3;
+
+        q0 = (1 - delta_2 / 2.0f) * old_q0 + (-old_q1 * gx - old_q2 * gy - old_q3 * gz) * half_t;
+        q1 = (1 - delta_2 / 2.0f) * old_q1 + ( old_q0 * gx + old_q2 * gz - old_q3 * gy) * half_t;
+        q2 = (1 - delta_2 / 2.0f) * old_q2 + ( old_q0 * gy - old_q1 * gz + old_q3 * gx) * half_t;
+        q3 = (1 - delta_2 / 2.0f) * old_q3 + ( old_q0 * gz + old_q1 * gy - old_q2 * gx) * half_t;
+    }
 
     /* normalise quaternion */
     norm = imu_inv_sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
@@ -247,6 +254,7 @@ void imu_data_calibration(short *gx, short *gy, short *gz, short *ax, short *ay,
 void imu_init(void)
 {
     uint16_t i = 0;
+    uint16_t sample_count = 0U;
     int acc_sum[3] = {0}, gyro_sum[3] = {0};
 
     short acc_data[3];          /* ���ٶȴ�����ԭʼ���� */
@@ -255,7 +263,12 @@ void imu_init(void)
     HAL_Delay(100);
     for (i = 0; i < 250; i++)   /* 循锟斤拷锟斤拷取250锟斤拷 取平锟斤拷 */
     {
-        MPU6500_GetData(&acc_data[0], &acc_data[1], &acc_data[2], &gyro_data[0], &gyro_data[1], &gyro_data[2]);
+        if (MPU6500_GetData(&acc_data[0], &acc_data[1], &acc_data[2],
+                            &gyro_data[0], &gyro_data[1], &gyro_data[2]) != HAL_OK)
+        {
+            HAL_Delay(5);
+            continue;
+        }
 
         acc_sum[0] += acc_data[0];
         acc_sum[1] += acc_data[1];
@@ -263,15 +276,19 @@ void imu_init(void)
         gyro_sum[0] += gyro_data[0];
         gyro_sum[1] += gyro_data[1];
         gyro_sum[2] += gyro_data[2];
+        sample_count++;
 
         HAL_Delay(5);
     }
 
-    g_acc_avg[0] = acc_sum[0] / 250;
-    g_acc_avg[1] = acc_sum[1] / 250;
-    g_acc_avg[2] = acc_sum[2] / 250;
-    g_gyro_avg[0] = gyro_sum[0] / 250;
-    g_gyro_avg[1] = gyro_sum[1] / 250;
-    g_gyro_avg[2] = gyro_sum[2] / 250;
+    if (sample_count > 0U)
+    {
+        g_acc_avg[0] = acc_sum[0] / sample_count;
+        g_acc_avg[1] = acc_sum[1] / sample_count;
+        g_acc_avg[2] = acc_sum[2] / sample_count;
+        g_gyro_avg[0] = gyro_sum[0] / sample_count;
+        g_gyro_avg[1] = gyro_sum[1] / sample_count;
+        g_gyro_avg[2] = gyro_sum[2] / sample_count;
+    }
 }
 

@@ -43,21 +43,21 @@ uint8_t MPU6500_Init(void) {
     return who_am_i; // Return the ID
 }
 
-void MPU6500_GetData(int16_t *Accx, int16_t *Accy, int16_t *Accz, int16_t *Gyrox, int16_t *Gyroy, int16_t *Gyroz) {
-    uint8_t buf[14] = {0};
-    
-    // Split the burst read to avoid STM32H7 I2C Arbitration Lost (ARLO) on long reads due to slow rise time
-    HAL_StatusTypeDef status1 = HAL_I2C_Mem_Read(&hi2c1, MPU_Addr, MPU6500_ACCEL_XOUT_H, I2C_MEMADD_SIZE_8BIT, buf, 6, 100);
-    if (status1 == HAL_OK) {
-        HAL_I2C_Mem_Read(&hi2c1, MPU_Addr, MPU6500_TEMP_OUT_H,   I2C_MEMADD_SIZE_8BIT, buf+6, 2, 100);
-        HAL_I2C_Mem_Read(&hi2c1, MPU_Addr, MPU6500_GYRO_XOUT_H,  I2C_MEMADD_SIZE_8BIT, buf+8, 6, 100);
+HAL_StatusTypeDef MPU6500_GetData(int16_t *Accx, int16_t *Accy, int16_t *Accz,
+                                  int16_t *Gyrox, int16_t *Gyroy, int16_t *Gyroz) {
+    uint8_t buf[14];
+    HAL_StatusTypeDef status;
+
+    if ((Accx == NULL) || (Accy == NULL) || (Accz == NULL) ||
+        (Gyrox == NULL) || (Gyroy == NULL) || (Gyroz == NULL)) {
+        return HAL_ERROR;
     }
-    
-    // Fallback: If burst reading fails with ARLO error, read byte by byte
-    if (status1 != HAL_OK || hi2c1.ErrorCode != HAL_I2C_ERROR_NONE) {
-        for(int i = 0; i < 14; i++) {
-            buf[i] = MPU6500_ReadReg(MPU6500_ACCEL_XOUT_H + i);
-        }
+
+    /* Accelerometer, temperature and gyroscope registers are contiguous. */
+    status = HAL_I2C_Mem_Read(&hi2c1, MPU_Addr, MPU6500_ACCEL_XOUT_H,
+                              I2C_MEMADD_SIZE_8BIT, buf, sizeof(buf), 5U);
+    if (status != HAL_OK) {
+        return status;
     }
 
     *Accx  = (int16_t)((buf[0]  << 8) | buf[1]);
@@ -66,4 +66,5 @@ void MPU6500_GetData(int16_t *Accx, int16_t *Accy, int16_t *Accz, int16_t *Gyrox
     *Gyrox = (int16_t)((buf[8]  << 8) | buf[9]);
     *Gyroy = (int16_t)((buf[10] << 8) | buf[11]);
     *Gyroz = (int16_t)((buf[12] << 8) | buf[13]);
+    return HAL_OK;
 }

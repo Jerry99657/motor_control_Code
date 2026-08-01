@@ -52,6 +52,12 @@
 
 /* USER CODE BEGIN PRIVATE_TYPES */
 
+typedef struct
+{
+  uint16_t length;
+  uint8_t data[APP_TX_DATA_SIZE];
+} CDC_TxPacket_t;
+
 /* USER CODE END PRIVATE_TYPES */
 
 /**
@@ -64,6 +70,9 @@
   */
 
 /* USER CODE BEGIN PRIVATE_DEFINES */
+#define CDC_APP_RX_BUFFER_SIZE 512U
+#define CDC_TX_QUEUE_DEPTH     3U
+#define CDC_TX_PACKET_SIZE     APP_TX_DATA_SIZE
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -102,6 +111,17 @@ static volatile uint32_t g_cdc_rx_head = 0U;
 static volatile uint32_t g_cdc_rx_tail = 0U;
 static volatile uint8_t g_cdc_rx_overflow = 0U;
 static uint8_t g_cdc_rx_buffer[131072U];
+static volatile uint16_t g_cdc_app_rx_head = 0U;
+static volatile uint16_t g_cdc_app_rx_tail = 0U;
+static volatile uint32_t g_cdc_app_rx_overflow_count = 0U;
+static uint8_t g_cdc_app_rx_buffer[CDC_APP_RX_BUFFER_SIZE]
+  __attribute__((section(".ram_d2"), aligned(32)));
+static CDC_TxPacket_t g_cdc_tx_queue[CDC_TX_QUEUE_DEPTH]
+  __attribute__((section(".ram_d2"), aligned(32)));
+static volatile uint8_t g_cdc_tx_head = 0U;
+static volatile uint8_t g_cdc_tx_tail = 0U;
+static volatile uint8_t g_cdc_tx_busy = 0U;
+static volatile uint32_t g_cdc_tx_drop_count = 0U;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -137,6 +157,8 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
 static void CDC_RxPush(uint8_t byte);
+static void CDC_AppRxPush(uint8_t byte);
+static void CDC_TxKick(void);
 
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
@@ -161,6 +183,11 @@ USBD_CDC_ItfTypeDef USBD_Interface_fops_FS =
 static int8_t CDC_Init_FS(void)
 {
   /* USER CODE BEGIN 3 */
+  g_cdc_app_rx_head = 0U;
+  g_cdc_app_rx_tail = 0U;
+  g_cdc_tx_head = 0U;
+  g_cdc_tx_tail = 0U;
+  g_cdc_tx_busy = 0U;
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -175,6 +202,9 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  g_cdc_tx_head = 0U;
+  g_cdc_tx_tail = 0U;
+  g_cdc_tx_busy = 0U;
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -278,16 +308,12 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-  extern void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len);
-  extern void vofa_usb_rx_cb(uint8_t *buf, uint32_t len);
   uint32_t rx_len = 0U;
   uint32_t index;
 
   if ((Buf != NULL) && (Len != NULL))
   {
     rx_len = *Len;
-    lvgl_app_com_rx_cb(Buf, rx_len);
-    vofa_usb_rx_cb(Buf, rx_len);
     if (rx_len > APP_TX_DATA_SIZE)
     {
       rx_len = APP_TX_DATA_SIZE;
@@ -298,6 +324,13 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
       for (index = 0U; index < rx_len; ++index)
       {
         CDC_RxPush(Buf[index]);
+      }
+    }
+    else
+    {
+      for (index = 0U; index < rx_len; ++index)
+      {
+        CDC_AppRxPush(Buf[index]);
       }
     }
   }
@@ -321,9 +354,11 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   */
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
-  uint8_t result = USBD_OK;
+  uint8_t next;
+  uint8_t index;
+  uint32_t primask;
   /* USER CODE BEGIN 7 */
-  if ((Buf == NULL) || (Len == 0U))
+  if ((Buf == NULL) || (Len == 0U) || (Len > CDC_TX_PACKET_SIZE))
   {
     return USBD_FAIL;
   }
@@ -333,14 +368,37 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
     return USBD_FAIL;
   }
 
-  USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
-  if (hcdc->TxState != 0){
+  primask = __get_PRIMASK();
+  __disable_irq();
+  next = (uint8_t)(g_cdc_tx_head + 1U);
+  if (next >= CDC_TX_QUEUE_DEPTH)
+  {
+    next = 0U;
+  }
+
+  if (next == g_cdc_tx_tail)
+  {
+    g_cdc_tx_drop_count++;
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
     return USBD_BUSY;
   }
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, Buf, Len);
-  result = USBD_CDC_TransmitPacket(&hUsbDeviceFS);
+
+  index = g_cdc_tx_head;
+  memcpy(g_cdc_tx_queue[index].data, Buf, Len);
+  g_cdc_tx_queue[index].length = Len;
+  __DMB();
+  g_cdc_tx_head = next;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  CDC_TxKick();
   /* USER CODE END 7 */
-  return result;
+  return USBD_OK;
 }
 
 /**
@@ -362,6 +420,17 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  if (g_cdc_tx_busy != 0U)
+  {
+    uint8_t next = (uint8_t)(g_cdc_tx_tail + 1U);
+    if (next >= CDC_TX_QUEUE_DEPTH)
+    {
+      next = 0U;
+    }
+    g_cdc_tx_tail = next;
+    g_cdc_tx_busy = 0U;
+  }
+  CDC_TxKick();
   /* USER CODE END 13 */
   return result;
 }
@@ -384,6 +453,100 @@ static void CDC_RxPush(uint8_t byte)
 
   g_cdc_rx_buffer[g_cdc_rx_head] = byte;
   g_cdc_rx_head = next;
+}
+
+static void CDC_AppRxPush(uint8_t byte)
+{
+  uint16_t next = (uint16_t)(g_cdc_app_rx_head + 1U);
+
+  if (next >= CDC_APP_RX_BUFFER_SIZE)
+  {
+    next = 0U;
+  }
+
+  if (next == g_cdc_app_rx_tail)
+  {
+    g_cdc_app_rx_overflow_count++;
+    return;
+  }
+
+  g_cdc_app_rx_buffer[g_cdc_app_rx_head] = byte;
+  g_cdc_app_rx_head = next;
+}
+
+static void CDC_TxKick(void)
+{
+  uint8_t index;
+  uint16_t length;
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+  if ((g_cdc_tx_busy != 0U) || (g_cdc_tx_tail == g_cdc_tx_head) ||
+      (hUsbDeviceFS.pClassData == NULL))
+  {
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
+    return;
+  }
+
+  index = g_cdc_tx_tail;
+  length = g_cdc_tx_queue[index].length;
+  g_cdc_tx_busy = 1U;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, g_cdc_tx_queue[index].data, length);
+  if (USBD_CDC_TransmitPacket(&hUsbDeviceFS) != USBD_OK)
+  {
+    primask = __get_PRIMASK();
+    __disable_irq();
+    g_cdc_tx_busy = 0U;
+    if (primask == 0U)
+    {
+      __enable_irq();
+    }
+  }
+}
+
+uint32_t CDC_ReadAppBytes(uint8_t *buf, uint32_t len)
+{
+  uint32_t count = 0U;
+
+  if ((buf == NULL) || (len == 0U))
+  {
+    return 0U;
+  }
+
+  while ((count < len) && (g_cdc_app_rx_tail != g_cdc_app_rx_head))
+  {
+    buf[count++] = g_cdc_app_rx_buffer[g_cdc_app_rx_tail];
+    g_cdc_app_rx_tail++;
+    if (g_cdc_app_rx_tail >= CDC_APP_RX_BUFFER_SIZE)
+    {
+      g_cdc_app_rx_tail = 0U;
+    }
+  }
+
+  return count;
+}
+
+void CDC_TxService(void)
+{
+  CDC_TxKick();
+}
+
+uint32_t CDC_GetAppRxOverflowCount(void)
+{
+  return g_cdc_app_rx_overflow_count;
+}
+
+uint32_t CDC_GetTxDropCount(void)
+{
+  return g_cdc_tx_drop_count;
 }
 
 void CDC_SetDownloadMode(uint8_t enable)

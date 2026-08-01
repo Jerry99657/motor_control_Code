@@ -112,6 +112,10 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len);
 void CDC_SetDownloadMode(uint8_t enable);
 uint32_t CDC_ReadBytes(uint8_t *buf, uint32_t len, uint32_t timeout_ms);
 uint8_t CDC_GetAndClearRxOverflow(void);
+uint32_t CDC_ReadAppBytes(uint8_t *buf, uint32_t len);
+void CDC_TxService(void);
+uint32_t CDC_GetAppRxOverflowCount(void);
+uint32_t CDC_GetTxDropCount(void);
 
 /* USER CODE END EXPORTED_FUNCTIONS */
 

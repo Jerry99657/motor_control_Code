@@ -69,6 +69,9 @@ static int64_t s_target_pulses[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static int16_t s_speed_limit_percent[DC_MOTOR_COUNT] = {100, 100, 100, 100};
 static float s_pos_pid_integral[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static float s_pos_pid_prev_error[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
+static int16_t s_pending_speed_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static volatile uint8_t s_pending_speed_mask = 0U;
+static volatile uint8_t s_pending_stop_all = 0U;
 
 static int16_t dc_motor_clamp_speed(int16_t speed)
 {
@@ -357,6 +360,91 @@ void DCMotor_OL_StopAll(void)
         s_target_pulses[i] = s_measured_pulses[i];
         dc_motor_apply_output(i, 0);
     }
+
+    s_pending_speed_mask = 0U;
+    s_pending_stop_all = 0U;
+}
+
+void DCMotor_OL_RequestSpeed(uint8_t motor_index, int16_t speed_percent)
+{
+    uint32_t primask;
+    uint8_t index;
+
+    if ((motor_index == 0U) || (motor_index > DC_MOTOR_COUNT))
+    {
+        return;
+    }
+
+    index = (uint8_t)(motor_index - 1U);
+    primask = __get_PRIMASK();
+    __disable_irq();
+    s_pending_speed_percent[index] = dc_motor_clamp_speed(speed_percent);
+    s_pending_speed_mask |= (uint8_t)(1U << index);
+    __DMB();
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
+
+void DCMotor_OL_RequestStopAll(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    s_pending_speed_mask = 0U;
+    s_pending_stop_all = 1U;
+    __DMB();
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
+
+void DCMotor_OL_ApplyPendingCommands(void)
+{
+    uint8_t mask = s_pending_speed_mask;
+    uint8_t stop_all = s_pending_stop_all;
+    uint8_t i;
+
+    s_pending_speed_mask = 0U;
+    s_pending_stop_all = 0U;
+
+    if (stop_all != 0U)
+    {
+        DCMotor_OL_StopAll();
+        return;
+    }
+
+    for (i = 0U; i < DC_MOTOR_COUNT; ++i)
+    {
+        if ((mask & (uint8_t)(1U << i)) != 0U)
+        {
+            DCMotor_OL_SetSpeed((uint8_t)(i + 1U), s_pending_speed_percent[i]);
+        }
+    }
+}
+
+uint8_t DCMotor_OL_IsMotionActive(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < DC_MOTOR_COUNT; ++i)
+    {
+        if (s_control_mode[i] == DCMOTOR_CONTROL_MODE_POSITION)
+        {
+            if (s_target_pulses[i] != s_measured_pulses[i])
+            {
+                return 1U;
+            }
+        }
+        else if (s_target_speed_percent[i] != 0)
+        {
+            return 1U;
+        }
+    }
+
+    return 0U;
 }
 
 void DCMotor_OL_Tick10ms(void)

@@ -13,6 +13,9 @@
 #include "ff.h"
 #include "mpu6500.h"
 #include "imu.h"
+#include "imu_service.h"
+#include "comm_service.h"
+#include "safety_manager.h"
 #include <stdlib.h>
 #include <ctype.h>
 #include <stdint.h>
@@ -26,6 +29,7 @@ volatile uint8_t g_adc_update_flag = 0;
 volatile float g_adc_voltage = 0.0f;
 static lv_group_t *s_group = NULL;
 static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play";
+static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 
 #define LVGL_APP_MAX_BROWSER_ENTRIES 48U
 #define LVGL_APP_ENTRY_NAME_LEN      256U
@@ -121,6 +125,7 @@ static lvgl_app_screen_req_t s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
 static uint8_t s_ctrl_selected_row = 0U;
 static uint8_t s_ctrl_editing = 0U;
 static int16_t s_motor_speed_preset[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
+static int16_t s_command_motor_speed_setpoint[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int16_t s_servo_angle_preset[LVGL_APP_SERVO_COUNT] = {0, 0};
 static int16_t s_mec_trans_x = 0;
@@ -632,7 +637,8 @@ static void lvgl_app_fs_init(void)
 
 static void lvgl_app_motor_speed_send_cmd(uint8_t motor_index, int16_t speed)
 {
-    DCMotor_OL_SetSpeed(motor_index, speed);
+    Mecanum_CancelControl();
+    DCMotor_OL_RequestSpeed(motor_index, speed);
 }
 
 static void lvgl_app_motor_speed_sync_actual(void)
@@ -734,6 +740,57 @@ static int8_t s_joy_ly = 0;
 static int8_t s_joy_rx = 0;
 static int8_t s_joy_ry = 0;
 
+uint8_t LVGL_App_IsCommandControlActive(void)
+{
+    return (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND) ? 1U : 0U;
+}
+
+uint8_t LVGL_App_CommandSetMotorSpeed(uint8_t motor_index, int16_t speed_percent)
+{
+    if ((LVGL_App_IsCommandControlActive() == 0U) ||
+        (motor_index == 0U) || (motor_index > LVGL_APP_MOTOR_COUNT))
+    {
+        return 0U;
+    }
+
+    if (speed_percent < LVGL_APP_SPEED_MIN)
+    {
+        speed_percent = LVGL_APP_SPEED_MIN;
+    }
+    else if (speed_percent > LVGL_APP_SPEED_MAX)
+    {
+        speed_percent = LVGL_APP_SPEED_MAX;
+    }
+
+    s_command_motor_speed_setpoint[motor_index - 1U] = speed_percent;
+    lvgl_app_motor_speed_send_cmd(motor_index, speed_percent);
+    s_ctrl_last_actual_refresh_tick = 0U;
+    return 1U;
+}
+
+void LVGL_App_CommandStopMotors(void)
+{
+    uint8_t i;
+
+    if (LVGL_App_IsCommandControlActive() == 0U)
+    {
+        return;
+    }
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        s_command_motor_speed_setpoint[i] = 0;
+    }
+    s_joy_lx = 0;
+    s_joy_ly = 0;
+    s_joy_rx = 0;
+    s_joy_ry = 0;
+
+    Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    DCMotor_OL_RequestStopAll();
+    s_ctrl_last_actual_refresh_tick = 0U;
+}
+
 static void lvgl_app_control_refresh_rows(void)
 {
     uint8_t i;
@@ -754,10 +811,10 @@ static void lvgl_app_control_refresh_rows(void)
                      "M4 Set: %+4d, Act: %+5ld\n"
                      "Sv Set: %3d, %3d\n"
                      "Joy: L(%+3d,%+3d) R(%+3d,%+3d)",
-                     s_motor_speed_preset[0], s_motor_speed_actual[0],
-                     s_motor_speed_preset[1], s_motor_speed_actual[1],
-                     s_motor_speed_preset[2], s_motor_speed_actual[2],
-                     s_motor_speed_preset[3], s_motor_speed_actual[3],
+                     s_command_motor_speed_setpoint[0], s_motor_speed_actual[0],
+                     s_command_motor_speed_setpoint[1], s_motor_speed_actual[1],
+                     s_command_motor_speed_setpoint[2], s_motor_speed_actual[2],
+                     s_command_motor_speed_setpoint[3], s_motor_speed_actual[3],
                      s_servo_angle_preset[0], s_servo_angle_preset[1],
                      s_joy_lx, s_joy_ly, s_joy_rx, s_joy_ry);
             lv_label_set_text(s_cmd_ctrl_label, big_buf);
@@ -873,6 +930,7 @@ static void lvgl_app_control_refresh_rows(void)
 
 static void mecanum_start_timer_cb(lv_timer_t *timer)
 {
+    (void)timer;
     s_mecanum_timer = NULL;
     if (s_mecanum_executing)
     {
@@ -2212,13 +2270,18 @@ static void lvgl_app_show_main_menu(void)
 
 #include "usbd_cdc_if.h"
 
-static uint8_t s_cmd_rx_buf[64];
-static uint16_t s_cmd_rx_idx = 0;
+static uint8_t s_cmd_rx_buf[2][64];
+static uint16_t s_cmd_rx_idx[2] = {0U, 0U};
 
-static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
+static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
 {
     uint8_t dev_id = frame[3];
     uint8_t cmd    = frame[4];
+
+    if (LVGL_App_IsCommandControlActive() == 0U)
+    {
+        return;
+    }
     
     if (dev_id == 0x0C && len == 0x0A) // Virtual Joystick Mecanum Control
     {
@@ -2243,8 +2306,8 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
         {
             uint8_t i;
             for (i = 0; i < 4; i++) {
-                s_motor_speed_preset[i] = (int8_t)frame[5 + i];
-                lvgl_app_motor_speed_send_cmd((uint8_t)(i + 1), s_motor_speed_preset[i]);
+                (void)LVGL_App_CommandSetMotorSpeed((uint8_t)(i + 1U),
+                                                    (int8_t)frame[5 + i]);
             }
         }
         else if (dev_id == 0x02 && len >= 0x08) // Single-motor
@@ -2252,8 +2315,7 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
             uint8_t port = frame[5];
             int8_t speed = (int8_t)frame[6];
             if (port >= 1 && port <= 4) {
-                s_motor_speed_preset[port - 1] = speed;
-                lvgl_app_motor_speed_send_cmd(port, speed);
+                (void)LVGL_App_CommandSetMotorSpeed(port, speed);
             }
         }
         else if (dev_id == 0x03 && len >= 0x0D) // Mecanum Mixed Control
@@ -2324,8 +2386,14 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
         }
         
         if (tx_len > 0) {
-            extern UART_HandleTypeDef huart5;
-            HAL_UART_Transmit(&huart5, tx_buf, tx_len, 100);
+            if (channel == 0U)
+            {
+                (void)CommService_UartSend(tx_buf, tx_len);
+            }
+            else
+            {
+                (void)CDC_Transmit_FS(tx_buf, tx_len);
+            }
         }
     }
     
@@ -2335,39 +2403,54 @@ static void lvgl_app_cmd_parse(uint8_t *frame, uint8_t len)
 
 void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len)
 {
+    lvgl_app_com_rx_channel_cb(0U, buf, len);
+}
+
+void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
+{
     uint32_t i;
-    if (s_ctrl_page != LVGL_APP_CTRL_PAGE_COMMAND) return;
+    uint8_t *rx_buf;
+    uint16_t *rx_idx;
+
+    if ((buf == NULL) || (channel >= 2U)) return;
+    if (LVGL_App_IsCommandControlActive() == 0U)
+    {
+        s_cmd_rx_idx[channel] = 0U;
+        return;
+    }
+    rx_buf = s_cmd_rx_buf[channel];
+    rx_idx = &s_cmd_rx_idx[channel];
 
     for (i = 0; i < len; i++) {
-        if (s_cmd_rx_idx < sizeof(s_cmd_rx_buf)) {
-            s_cmd_rx_buf[s_cmd_rx_idx++] = buf[i];
+        if (*rx_idx < sizeof(s_cmd_rx_buf[channel])) {
+            rx_buf[(*rx_idx)++] = buf[i];
         }
         
-        while (s_cmd_rx_idx >= 3) { 
-            if (s_cmd_rx_buf[0] != 0x77 || s_cmd_rx_buf[1] != 0x68) {
+        while (*rx_idx >= 3U) { 
+            if (rx_buf[0] != 0x77 || rx_buf[1] != 0x68) {
                 uint16_t j;
-                for (j = 0; j < s_cmd_rx_idx - 1; j++) s_cmd_rx_buf[j] = s_cmd_rx_buf[j+1];
-                s_cmd_rx_idx--;
+                for (j = 0; j < *rx_idx - 1U; j++) rx_buf[j] = rx_buf[j+1U];
+                (*rx_idx)--;
                 continue;
             }
             
-            uint8_t frame_len = s_cmd_rx_buf[2];
+            uint8_t frame_len = rx_buf[2];
             if (frame_len < 0x04 || frame_len > 0x10) { 
                 uint16_t j;
-                for (j = 0; j < s_cmd_rx_idx - 2; j++) s_cmd_rx_buf[j] = s_cmd_rx_buf[j+2];
-                s_cmd_rx_idx -= 2;
+                for (j = 0; j < *rx_idx - 2U; j++) rx_buf[j] = rx_buf[j+2U];
+                *rx_idx -= 2U;
                 continue;
             }
             
-            if (s_cmd_rx_idx >= frame_len) {
-                if (s_cmd_rx_buf[frame_len - 1] == 0x0A) {
-                    lvgl_app_cmd_parse(s_cmd_rx_buf, frame_len);
+            if (*rx_idx >= frame_len) {
+                if (rx_buf[frame_len - 1U] == 0x0A) {
+                    lvgl_app_cmd_parse(channel, rx_buf, frame_len);
                 }
                 uint16_t j;
-                for (j = 0; j < s_cmd_rx_idx - frame_len; j++) {
-                    s_cmd_rx_buf[j] = s_cmd_rx_buf[j + frame_len];
+                for (j = 0; j < *rx_idx - frame_len; j++) {
+                    rx_buf[j] = rx_buf[j + frame_len];
                 }
-                s_cmd_rx_idx -= frame_len;
+                *rx_idx -= frame_len;
             } else {
                 break;
             }
@@ -2386,9 +2469,10 @@ static void lvgl_app_command_exit_event_cb(lv_event_t *e)
                 return;
             }
         }
+        LVGL_App_CommandStopMotors();
+        s_cmd_rx_idx[0] = 0U;
+        s_cmd_rx_idx[1] = 0U;
         s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
-        s_cmd_rx_idx = 0;
-        lvgl_app_motor_speed_force_clear_all();
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
     }
 }
@@ -2404,13 +2488,16 @@ static void lvgl_app_show_command_control(void)
     ws2812_update();
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_COMMAND;
+    LVGL_App_CommandStopMotors();
+    s_cmd_rx_idx[0] = 0U;
+    s_cmd_rx_idx[1] = 0U;
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
     lv_obj_clean(lv_scr_act());
 
     title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Command Control RX");
+    lv_label_set_text(title, "Command Control USB/USART");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
     s_cmd_ctrl_label = lv_label_create(lv_scr_act());
@@ -2428,7 +2515,7 @@ static void lvgl_app_show_command_control(void)
     lv_obj_add_event_cb(btn, lvgl_app_command_exit_event_cb, LV_EVENT_ALL, NULL);
     
     s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, "Wait CDC... Press ENTER/LEFT to exit");
+    lv_label_set_text(s_status_label, "Remote control enabled - ENTER/LEFT exits");
     lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     lvgl_app_motor_speed_sync_actual();
@@ -2540,7 +2627,7 @@ static void lvgl_app_process_global_stop_key(void)
     }
 
     s_key2_latched = 1U;
-    
+
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
     {
         // Emergency stop logic for Mecanum specifically
@@ -2552,6 +2639,14 @@ static void lvgl_app_process_global_stop_key(void)
             lv_timer_del(s_mecanum_timer);
             s_mecanum_timer = NULL;
         }
+        lvgl_app_set_status("EMERGENCY STOP!");
+        lvgl_app_control_refresh_rows();
+    }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
+    {
+        LVGL_App_CommandStopMotors();
+        s_cmd_rx_idx[0] = 0U;
+        s_cmd_rx_idx[1] = 0U;
         lvgl_app_set_status("EMERGENCY STOP!");
         lvgl_app_control_refresh_rows();
     }
@@ -2577,6 +2672,22 @@ void LVGL_App_Init(void)
 
 void LVGL_App_Process(void)
 {
+    uint32_t safety_faults = Safety_GetFaults();
+
+    if (safety_faults != s_last_safety_faults)
+    {
+        s_last_safety_faults = safety_faults;
+        if (safety_faults != SAFETY_FAULT_NONE)
+        {
+            lvgl_app_set_status("SAFETY FAULT 0x%02lX",
+                                (unsigned long)safety_faults);
+        }
+        else
+        {
+            lvgl_app_set_status("Safety stop released");
+        }
+    }
+
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED || s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
     {
         uint32_t now = HAL_GetTick();
@@ -2615,37 +2726,33 @@ void LVGL_App_Process(void)
 #include "mpu6500_reg.h"
 #include "imu.h"
 
-static uint8_t s_mpu_id = 0;
 static lv_obj_t *s_mpu_label = NULL;
 static lv_timer_t *s_mpu_timer = NULL;
 
 static void mpu6500_timer_cb(lv_timer_t *timer)
 {
+    ImuServiceSnapshot_t snapshot;
+
+    (void)timer;
     if (s_ctrl_page != LVGL_APP_CTRL_PAGE_MPU6500) {
         return;
     }
-    int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
-    MPU6500_GetData(&ax, &ay, &az, &gx, &gy, &gz);
-    
-    if (ax == 0 && ay == 0 && az == 0 && gx == 0 && gy == 0 && gz == 0) {
-        uint8_t id = MPU6500_ReadReg(MPU6500_WHO_AM_I);
+
+    if (IMU_Service_GetSnapshot(&snapshot) == 0U) {
         if (s_mpu_label) {
             char errmsg[64];
-            snprintf(errmsg, sizeof(errmsg), "IIC Error! ID: 0x%02X Check wiring!", id);
+            snprintf(errmsg, sizeof(errmsg), "IIC Error! No valid IMU sample");
             lv_label_set_text(s_mpu_label, errmsg);
         }
         return;
     }
     
-    imu_data_calibration(&gx, &gy, &gz, &ax, &ay, &az);
-    eulerian_angles_t angles = imu_get_eulerian_angles((float)gx, (float)gy, (float)gz, (float)ax, (float)ay, (float)az);
-    
     char buf[128];
     snprintf(buf, sizeof(buf), "Pitch: %d.%02d\nRoll: %d.%02d\nYaw: %d.%02d\nAcc: %d, %d, %d\nGyro: %d, %d, %d", 
-             (int)angles.pitch, abs((int)(angles.pitch*100)%100), 
-             (int)angles.roll, abs((int)(angles.roll*100)%100), 
-             (int)angles.yaw, abs((int)(angles.yaw*100)%100), 
-             ax, ay, az, gx, gy, gz);
+             (int)snapshot.angles.pitch, abs((int)(snapshot.angles.pitch*100)%100), 
+             (int)snapshot.angles.roll, abs((int)(snapshot.angles.roll*100)%100), 
+             (int)snapshot.angles.yaw, abs((int)(snapshot.angles.yaw*100)%100), 
+             snapshot.ax, snapshot.ay, snapshot.az, snapshot.gx, snapshot.gy, snapshot.gz);
     if (s_mpu_label) {
         lv_label_set_text(s_mpu_label, buf);
     }
