@@ -66,6 +66,15 @@
 #define SD_TEST_STAGE_VERIFY        8U
 #define STAGE_LOG_BUFFER_SIZE       2048U
 
+/* Cache rollout:
+ *   0: disabled (diagnostics)
+ *   1: I-Cache only
+ *   2: I-Cache + D-Cache, with DMA-owned D2/D3 SRAM kept non-cacheable
+ */
+#ifndef APP_CACHE_STAGE
+#define APP_CACHE_STAGE             2U
+#endif
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -206,12 +215,57 @@ static void Boot_LogStatus(const char *prefix, int32_t value);
 void vofa_usb_rx_cb(uint8_t *buf, uint32_t len);
 static void VOFA_Task_Process(void);
 static void ADC_Service_Process(void);
+static void App_Cache_Enable(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 uint8_t g_uart5_rx_byte;
+
+static void App_Cache_Enable(void)
+{
+#if (APP_CACHE_STAGE >= 2U)
+  MPU_Region_InitTypeDef region = {0};
+
+  HAL_MPU_Disable();
+
+  /* D2 SRAM is shared by SDMMC, USB and JPEG/MDMA.  Split its 288 KiB into
+     MPU-compatible regions and keep it non-cacheable. */
+  region.Enable = MPU_REGION_ENABLE;
+  region.Number = MPU_REGION_NUMBER1;
+  region.BaseAddress = 0x30000000U;
+  region.Size = MPU_REGION_SIZE_256KB;
+  region.SubRegionDisable = 0x00U;
+  region.TypeExtField = MPU_TEX_LEVEL1;
+  region.AccessPermission = MPU_REGION_FULL_ACCESS;
+  region.DisableExec = MPU_INSTRUCTION_ACCESS_DISABLE;
+  region.IsShareable = MPU_ACCESS_SHAREABLE;
+  region.IsCacheable = MPU_ACCESS_NOT_CACHEABLE;
+  region.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
+  HAL_MPU_ConfigRegion(&region);
+
+  region.Number = MPU_REGION_NUMBER2;
+  region.BaseAddress = 0x30040000U;
+  region.Size = MPU_REGION_SIZE_32KB;
+  HAL_MPU_ConfigRegion(&region);
+
+  /* SPI6 BDMA staging lives in D3 SRAM4. */
+  region.Number = MPU_REGION_NUMBER3;
+  region.BaseAddress = 0x38000000U;
+  region.Size = MPU_REGION_SIZE_64KB;
+  HAL_MPU_ConfigRegion(&region);
+
+  HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
+#endif
+
+#if (APP_CACHE_STAGE >= 1U)
+  SCB_EnableICache();
+#endif
+#if (APP_CACHE_STAGE >= 2U)
+  SCB_EnableDCache();
+#endif
+}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -463,6 +517,8 @@ static const char *QSPI_GetStartAnimErrorText(int8_t status)
       return "ANIM HEADER ERROR";
     case QSPI_START_ANIM_ERR_QSPI:
       return "ANIM QSPI ERROR";
+    case QSPI_START_ANIM_ERR_BUSY:
+      return "ANIM MEMORY BUSY";
     default:
       return "ANIM PLAY ERROR";
   }
@@ -480,6 +536,8 @@ static const char *SD_GetStartAnimErrorText(int8_t status)
       return "SD ANIM HEADER";
     case SD_START_ANIM_ERR_IO:
       return "SD ANIM IO ERR";
+    case SD_START_ANIM_ERR_BUSY:
+      return "SD ANIM MEM BUSY";
     default:
       return "SD ANIM ERROR";
   }
@@ -962,6 +1020,7 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
+  App_Cache_Enable();
 
   /* USER CODE END Init */
 
@@ -2653,6 +2712,7 @@ void MPU_Config(void)
   MPU_InitStruct.IsBufferable = MPU_ACCESS_NOT_BUFFERABLE;
 
   HAL_MPU_ConfigRegion(&MPU_InitStruct);
+
   /* Enables the MPU */
   HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 

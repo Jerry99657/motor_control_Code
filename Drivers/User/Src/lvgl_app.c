@@ -2,6 +2,12 @@
 #include "ws2812.h"
 
 #include "lv_port_indev.h"
+#include "lv_port_disp.h"
+#include "ui_animation.h"
+#include "ui_feedback.h"
+#include "ui_page.h"
+#include "ui_perf_diag.h"
+#include "ui_theme.h"
 #include "dc_motor_ol.h"
 #include "mjpeg_player.h"
 #include "sd_start_anim.h"
@@ -42,6 +48,7 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_MENU_ID_MECANUM     4U
 #define LVGL_APP_MENU_ID_MPU6500     5U
 #define LVGL_APP_MENU_ID_WS2812      6U
+#define LVGL_APP_MENU_ID_DIAGNOSTICS 7U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -57,6 +64,8 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_SERVO_MIN           0
 #define LVGL_APP_SERVO_MAX           270
 #define LVGL_APP_SERVO_STEP          10
+#define LVGL_APP_CTRL_REFRESH_MS     50U
+#define LVGL_APP_MEDIA_FLUSH_WAIT_MS 250U
 
 typedef enum
 {
@@ -100,12 +109,26 @@ typedef enum
     LVGL_APP_SCREEN_REQ_SD_BROWSER,
     LVGL_APP_SCREEN_REQ_MECANUM,
     LVGL_APP_SCREEN_REQ_MPU6500,
-    LVGL_APP_SCREEN_REQ_WS2812
+    LVGL_APP_SCREEN_REQ_WS2812,
+    LVGL_APP_SCREEN_REQ_DIAGNOSTICS,
+    LVGL_APP_SCREEN_REQ_GIF
 } lvgl_app_screen_req_t;
+
+typedef enum
+{
+    LVGL_APP_ACTIVITY_NONE = 0,
+    LVGL_APP_ACTIVITY_RUNNING,
+    LVGL_APP_ACTIVITY_PAUSED,
+    LVGL_APP_ACTIVITY_STORAGE,
+    LVGL_APP_ACTIVITY_COMMAND,
+    LVGL_APP_ACTIVITY_DIAGNOSTIC,
+    LVGL_APP_ACTIVITY_FAULT
+} lvgl_app_activity_t;
 
 static uint16_t s_browser_entry_count = 0U;
 static lvgl_app_browser_entry_t s_browser_entries[LVGL_APP_MAX_BROWSER_ENTRIES];
 static char s_browser_path[LVGL_APP_BROWSER_PATH_LEN] = "/";
+static FRESULT s_browser_scan_result = FR_OK;
 
 static gd_GIF *s_gif = NULL;
 static lv_obj_t *s_gif_obj = NULL;
@@ -114,7 +137,12 @@ static lv_img_dsc_t s_gif_imgdsc;
 static uint32_t s_gif_last_call = 0U;
 static uint16_t s_gif_current_frame = 0U;
 static uint8_t s_gif_playing = 0U;
+static uint8_t s_gif_paused = 0U;
+static uint8_t s_gif_seek_key_latched = 0U;
+static lv_obj_t *s_gif_control_card = NULL;
+static lv_obj_t *s_gif_control_label = NULL;
 static uint8_t s_key2_latched = 0U;
+static uint8_t s_key3_latched = 0U;
 static char s_gif_lvfs_path[LVGL_APP_LVFS_PATH_LEN] = "S:/";
 
 static lv_fs_drv_t s_lvfs_drv;
@@ -122,11 +150,19 @@ static uint8_t s_lvfs_registered = 0U;
 
 static lvgl_app_ctrl_page_t s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
 static lvgl_app_screen_req_t s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
+static lvgl_app_screen_req_t s_current_screen = LVGL_APP_SCREEN_REQ_NONE;
+static ui_page_t s_page;
+static ui_feedback_t s_feedback;
+static lv_obj_t *s_page_root = NULL;
+static lv_obj_t *s_page_content = NULL;
+static ui_transition_manager_t s_transition_manager;
 static uint8_t s_ctrl_selected_row = 0U;
 static uint8_t s_ctrl_editing = 0U;
 static int16_t s_motor_speed_preset[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int16_t s_command_motor_speed_setpoint[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
+static int32_t s_motor_speed_display[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
+static ui_value_follower_t s_motor_speed_followers[LVGL_APP_MOTOR_COUNT];
 static int16_t s_servo_angle_preset[LVGL_APP_SERVO_COUNT] = {0, 0};
 static int16_t s_mec_trans_x = 0;
 static int16_t s_mec_trans_y = 0;
@@ -139,8 +175,120 @@ static lv_timer_t *s_mecanum_timer = NULL;
 
 static lv_obj_t *s_ctrl_row_btns[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 static lv_obj_t *s_ctrl_row_labels[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+static lv_obj_t *s_ctrl_row_bars[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
+static uint8_t s_ctrl_row_visual_state[7] = {0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU, 0xFFU};
+static int16_t s_ctrl_row_bar_values[7] = {-1, -1, -1, -1, -1, -1, -1};
+static int8_t s_ctrl_row_bar_directions[7] = {2, 2, 2, 2, 2, 2, 2};
 static uint32_t s_ctrl_last_confirm_tick = 0U;
 static uint32_t s_ctrl_last_actual_refresh_tick = 0U;
+static lv_obj_t *s_diag_status_card = NULL;
+static lv_obj_t *s_diag_page_label = NULL;
+static lv_obj_t *s_diag_data_label = NULL;
+static lv_obj_t *s_diag_data_panel = NULL;
+static lv_obj_t *s_diag_chart = NULL;
+static lv_chart_series_t *s_diag_fps_series = NULL;
+static lv_chart_series_t *s_diag_heap_series = NULL;
+static ui_perf_status_t s_diag_last_status = (ui_perf_status_t)0xFFU;
+static uint8_t s_diag_page_index = 0U;
+static uint32_t s_diag_last_refresh_tick = 0U;
+static lvgl_app_activity_t s_header_activity = (lvgl_app_activity_t)0xFFU;
+static uint32_t s_header_activity_tick = 0U;
+
+static void lvgl_app_update_header_activity(void)
+{
+    lvgl_app_activity_t activity = LVGL_APP_ACTIVITY_NONE;
+    const char *symbol = "";
+    lv_color_t color = lv_color_white();
+    uint8_t spin = 0U;
+    uint8_t i;
+    uint32_t now = HAL_GetTick();
+
+    if ((now - s_header_activity_tick) < 50U)
+    {
+        return;
+    }
+    s_header_activity_tick = now;
+
+    if ((s_page.status_icon == NULL) ||
+        (lv_obj_is_valid(s_page.status_icon) == false))
+    {
+        return;
+    }
+
+    if (s_last_safety_faults != SAFETY_FAULT_NONE)
+    {
+        activity = LVGL_APP_ACTIVITY_FAULT;
+        symbol = LV_SYMBOL_WARNING;
+        color = lv_color_hex(0xFCA5A5);
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_GIF)
+    {
+        activity = (s_gif_paused != 0U) ?
+                   LVGL_APP_ACTIVITY_PAUSED : LVGL_APP_ACTIVITY_RUNNING;
+        symbol = (s_gif_paused != 0U) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY;
+        color = (s_gif_paused != 0U) ? lv_color_hex(0xFCD34D) : lv_color_hex(0x86EFAC);
+        spin = 0U;
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_SD_BROWSER)
+    {
+        activity = LVGL_APP_ACTIVITY_STORAGE;
+        symbol = LV_SYMBOL_SD_CARD;
+        color = lv_color_hex(0x93C5FD);
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_COMMAND)
+    {
+        activity = LVGL_APP_ACTIVITY_COMMAND;
+        symbol = LV_SYMBOL_USB;
+        color = lv_color_hex(0x93C5FD);
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_DIAGNOSTICS)
+    {
+        activity = LVGL_APP_ACTIVITY_DIAGNOSTIC;
+        symbol = LV_SYMBOL_EYE_OPEN;
+        color = lv_color_hex(0xC4B5FD);
+    }
+    else if ((s_current_screen == LVGL_APP_SCREEN_REQ_MECANUM) &&
+             ((s_mecanum_executing != 0U) || (Mecanum_IsMotionActive() != 0U)))
+    {
+        activity = LVGL_APP_ACTIVITY_RUNNING;
+        symbol = LV_SYMBOL_REFRESH;
+        color = lv_color_hex(0x86EFAC);
+        spin = 1U;
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_MOTOR_SPEED)
+    {
+        for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+        {
+            if ((s_motor_speed_actual[i] > 20) || (s_motor_speed_actual[i] < -20))
+            {
+                activity = LVGL_APP_ACTIVITY_RUNNING;
+                symbol = LV_SYMBOL_REFRESH;
+                color = lv_color_hex(0x86EFAC);
+                spin = 1U;
+                break;
+            }
+        }
+    }
+
+    if (activity == s_header_activity)
+    {
+        return;
+    }
+
+    s_header_activity = activity;
+    UI_Anim_IconSpin(s_page.status_icon, 0U);
+    if (activity == LVGL_APP_ACTIVITY_NONE)
+    {
+        lv_obj_add_flag(s_page.status_icon, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    lv_label_set_text(s_page.status_icon, symbol);
+    lv_obj_set_style_text_color(s_page.status_icon, color, LV_PART_MAIN);
+    lv_obj_clear_flag(s_page.status_icon, LV_OBJ_FLAG_HIDDEN);
+    UI_Anim_StateBounce(s_page.status_icon);
+    UI_Anim_IconSpin(s_page.status_icon, spin);
+}
 
 static void lvgl_app_control_clear_row_refs(void)
 {
@@ -150,6 +298,10 @@ static void lvgl_app_control_clear_row_refs(void)
     {
         s_ctrl_row_btns[i] = NULL;
         s_ctrl_row_labels[i] = NULL;
+        s_ctrl_row_bars[i] = NULL;
+        s_ctrl_row_visual_state[i] = 0xFFU;
+        s_ctrl_row_bar_values[i] = -1;
+        s_ctrl_row_bar_directions[i] = 2;
     }
 }
 
@@ -162,12 +314,105 @@ static void lvgl_app_show_mecanum_control(void);
 static void lvgl_app_show_sd_browser(void);
 static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_ws2812_control(void);
+static void lvgl_app_show_diagnostics(void);
+static void lvgl_app_diagnostics_refresh(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
 static void lvgl_app_control_event_cb(lv_event_t *e);
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req);
 static void lvgl_app_process_pending_screen(void);
+
+static uint8_t lvgl_app_screen_depth(lvgl_app_screen_req_t screen)
+{
+    if (screen == LVGL_APP_SCREEN_REQ_MAIN)
+    {
+        return 0U;
+    }
+
+    if ((screen == LVGL_APP_SCREEN_REQ_MOTOR_SPEED) ||
+        (screen == LVGL_APP_SCREEN_REQ_SERVO_ANGLE) ||
+        (screen == LVGL_APP_SCREEN_REQ_GIF))
+    {
+        return 2U;
+    }
+
+    return 1U;
+}
+
+static void lvgl_app_page_begin(lvgl_app_screen_req_t target, const char *title)
+{
+    ui_transition_t transition = UI_TRANSITION_NONE;
+    lv_obj_t *outgoing = NULL;
+
+    if ((s_current_screen != LVGL_APP_SCREEN_REQ_NONE) && (s_current_screen != target))
+    {
+        transition = (lvgl_app_screen_depth(target) < lvgl_app_screen_depth(s_current_screen))
+                         ? UI_TRANSITION_BACKWARD
+                         : UI_TRANSITION_FORWARD;
+    }
+
+    /* Finish an interrupted transition before allocating another layer. */
+    UI_TransitionManager_Cancel(&s_transition_manager);
+
+    if ((s_page.root == NULL) || (lv_obj_is_valid(s_page.root) == false))
+    {
+        UI_Feedback_Detach(&s_feedback);
+        lv_obj_clean(lv_scr_act());
+        if (UI_Page_Create(&s_page, lv_scr_act(), title) == 0U)
+        {
+            s_page_root = NULL;
+            s_page_content = NULL;
+            s_status_label = NULL;
+            return;
+        }
+
+        UI_Feedback_Attach(&s_feedback, s_page.root, s_page.footer,
+                           s_page.status_label);
+        s_header_activity = (lvgl_app_activity_t)0xFFU;
+    }
+    else
+    {
+        outgoing = s_page_content;
+        lv_label_set_text(s_page.title_label, title);
+    }
+
+    s_page_root = s_page.root;
+    s_page_content = UI_Page_CreateContentLayer(&s_page);
+    s_status_label = s_page.status_label;
+    if (s_page_content == NULL)
+    {
+        return;
+    }
+
+    UI_Feedback_SetStatus(&s_feedback, s_status_text);
+    UI_Feedback_SetFault(&s_feedback, s_last_safety_faults, s_status_text);
+    s_current_screen = target;
+    UI_TransitionManager_Prepare(&s_transition_manager, outgoing,
+                                 s_page_content, transition);
+}
+
+static void lvgl_app_page_finish(void)
+{
+    if ((s_page_root != NULL) && (lv_obj_is_valid(s_page_root) != false) &&
+        (s_page_content != NULL) && (lv_obj_is_valid(s_page_content) != false))
+    {
+        /* Resolve all child alignment before animating only the content region. */
+        lv_obj_update_layout(s_page_root);
+        UI_TransitionManager_Start(&s_transition_manager);
+    }
+}
+
+static void lvgl_app_group_add_obj(lv_obj_t *obj)
+{
+    if ((s_group == NULL) || (obj == NULL))
+    {
+        return;
+    }
+
+    UI_Anim_AttachFocus(obj);
+    lv_group_add_obj(s_group, obj);
+}
 
 static void lvgl_app_set_status(const char *fmt, ...)
 {
@@ -177,10 +422,20 @@ static void lvgl_app_set_status(const char *fmt, ...)
            (void)vsnprintf(s_status_text, sizeof(s_status_text), fmt, args);
     va_end(args);
 
-    if (s_status_label != NULL)
-    {
-        lv_label_set_text(s_status_label, s_status_text);
-    }
+    UI_Feedback_SetStatus(&s_feedback, s_status_text);
+}
+
+static void lvgl_app_show_toast(ui_notice_level_t level, const char *fmt, ...)
+{
+    va_list args;
+    char text[128];
+
+    va_start(args, fmt);
+    (void)vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+
+    UI_Feedback_ShowToast(&s_feedback, level, text,
+                          (level == UI_NOTICE_ERROR) ? 2400U : 1500U);
 }
 
 static void lvgl_app_group_reset(void)
@@ -397,10 +652,12 @@ static uint16_t lvgl_app_scan_browser_entries(void)
     FRESULT fr;
 
     s_browser_entry_count = 0U;
+    s_browser_scan_result = FR_OK;
 
     fr = f_mount(&SDFatFS, (TCHAR const *)SDPath, 1U);
     if (fr != FR_OK)
     {
+        s_browser_scan_result = fr;
         lvgl_app_set_status("SD mount failed (%d)", (int)fr);
         return 0U;
     }
@@ -413,7 +670,14 @@ static uint16_t lvgl_app_scan_browser_entries(void)
             lvgl_app_entry_type_t file_type;
 
             fr = f_readdir(&dir, &fno);
-            if ((fr != FR_OK) || (fno.fname[0] == '\0'))
+            if (fr != FR_OK)
+            {
+                s_browser_scan_result = fr;
+                lvgl_app_set_status("Read dir fail (%d)", (int)fr);
+                break;
+            }
+
+            if (fno.fname[0] == '\0')
             {
                 break;
             }
@@ -464,6 +728,7 @@ static uint16_t lvgl_app_scan_browser_entries(void)
     }
     else
     {
+        s_browser_scan_result = fr;
         lvgl_app_set_status("Open dir fail (%d)", (int)fr);
     }
 
@@ -731,6 +996,10 @@ static void lvgl_app_process_pending_screen(void)
     {
         lvgl_app_show_ws2812_control();
     }
+    else if (req == LVGL_APP_SCREEN_REQ_DIAGNOSTICS)
+    {
+        lvgl_app_show_diagnostics();
+    }
 }
 
 static lv_obj_t *s_cmd_ctrl_label = NULL;
@@ -795,9 +1064,9 @@ static void lvgl_app_control_refresh_rows(void)
 {
     uint8_t i;
     char line[64];
-    char mark;
     lv_obj_t *row_label;
     lv_obj_t *row_btn;
+    uint8_t mecanum_active = 0U;
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
     {
@@ -811,15 +1080,21 @@ static void lvgl_app_control_refresh_rows(void)
                      "M4 Set: %+4d, Act: %+5ld\n"
                      "Sv Set: %3d, %3d\n"
                      "Joy: L(%+3d,%+3d) R(%+3d,%+3d)",
-                     s_command_motor_speed_setpoint[0], s_motor_speed_actual[0],
-                     s_command_motor_speed_setpoint[1], s_motor_speed_actual[1],
-                     s_command_motor_speed_setpoint[2], s_motor_speed_actual[2],
-                     s_command_motor_speed_setpoint[3], s_motor_speed_actual[3],
+                     s_command_motor_speed_setpoint[0], s_motor_speed_display[0],
+                     s_command_motor_speed_setpoint[1], s_motor_speed_display[1],
+                     s_command_motor_speed_setpoint[2], s_motor_speed_display[2],
+                     s_command_motor_speed_setpoint[3], s_motor_speed_display[3],
                      s_servo_angle_preset[0], s_servo_angle_preset[1],
                      s_joy_lx, s_joy_ly, s_joy_rx, s_joy_ry);
-            lv_label_set_text(s_cmd_ctrl_label, big_buf);
+            (void)UI_LabelSetTextIfChanged(s_cmd_ctrl_label, big_buf);
         }
         return;
+    }
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
+    {
+        mecanum_active = ((s_mecanum_executing != 0U) ||
+                          (Mecanum_IsMotionActive() != 0U)) ? 1U : 0U;
     }
 
     uint8_t loop_count = LVGL_APP_MOTOR_COUNT;
@@ -831,6 +1106,11 @@ static void lvgl_app_control_refresh_rows(void)
     
     for (i = 0U; i < loop_count; ++i)
     {
+        ui_visual_state_t visual_state;
+        int32_t signed_bar_value = 0;
+        int32_t bar_max = 100;
+        int32_t bar_percent;
+
         row_label = s_ctrl_row_labels[i];
         row_btn = s_ctrl_row_btns[i];
 
@@ -847,36 +1127,86 @@ static void lvgl_app_control_refresh_rows(void)
             s_ctrl_row_btns[i] = NULL;
         }
 
-        if ((row_btn != NULL) && (i == s_ctrl_selected_row))
+        visual_state = UI_VISUAL_NORMAL;
+        if (s_last_safety_faults != SAFETY_FAULT_NONE)
         {
-            lv_obj_set_style_bg_opa(row_btn, LV_OPA_COVER, 0);
-            lv_obj_set_style_bg_opa(row_btn, LV_OPA_COVER, LV_STATE_FOCUSED);
-            if (s_ctrl_editing != 0U)
-            {
-                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_AMBER), 0);
-                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_AMBER), LV_STATE_FOCUSED);
-            }
-            else
-            {
-                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_BLUE), 0);
-                lv_obj_set_style_bg_color(row_btn, lv_palette_main(LV_PALETTE_BLUE), LV_STATE_FOCUSED);
-            }
-            lv_obj_set_style_text_color(row_label, lv_color_white(), 0);
+            visual_state = UI_VISUAL_FAULT;
         }
-        else
+        else if ((i == s_ctrl_selected_row) && (s_ctrl_editing != 0U))
         {
-            if (row_btn != NULL)
-            {
-                lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, 0);
-                lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_STATE_FOCUSED);
-            }
-            lv_obj_set_style_text_color(row_label, lv_color_black(), 0);
+            visual_state = UI_VISUAL_EDITING;
+        }
+        else if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) &&
+                 (i == 6U) && (mecanum_active != 0U))
+        {
+            visual_state = UI_VISUAL_RUNNING;
+        }
+        else if (i == s_ctrl_selected_row)
+        {
+            visual_state = UI_VISUAL_FOCUSED;
+        }
+        else if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED) &&
+                 ((s_motor_speed_preset[i] != 0) ||
+                  (s_motor_speed_actual[i] > 20) || (s_motor_speed_actual[i] < -20)))
+        {
+            visual_state = UI_VISUAL_RUNNING;
         }
 
-        mark = ' ';
-        if ((s_ctrl_editing == 0U) && (i == s_ctrl_selected_row))
+        if ((row_btn != NULL) &&
+            (s_ctrl_row_visual_state[i] != (uint8_t)visual_state))
         {
-            mark = '>';
+            s_ctrl_row_visual_state[i] = (uint8_t)visual_state;
+            UI_Theme_SetVisualState(row_btn, row_label, visual_state);
+            UI_Anim_SetFocusColor(row_btn, UI_Theme_GetVisualColor(visual_state));
+        }
+
+        if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
+        {
+            signed_bar_value = s_motor_speed_preset[i];
+        }
+        else if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) && (i < 6U))
+        {
+            if (i == 0U) { signed_bar_value = s_mec_trans_x; bar_max = 200; }
+            else if (i == 1U) { signed_bar_value = s_mec_trans_y; bar_max = 200; }
+            else if (i == 2U) { signed_bar_value = s_mec_rot_z; bar_max = 360; }
+            else if (i == 3U) { signed_bar_value = s_mec_speed_x; }
+            else if (i == 4U) { signed_bar_value = s_mec_speed_y; }
+            else { signed_bar_value = s_mec_speed_z; }
+        }
+
+        if ((s_ctrl_row_bars[i] != NULL) &&
+            (lv_obj_is_valid(s_ctrl_row_bars[i]) != false))
+        {
+            int8_t bar_direction;
+            int32_t magnitude = (signed_bar_value < 0) ? -signed_bar_value : signed_bar_value;
+
+            if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) &&
+                (visual_state == UI_VISUAL_FAULT))
+            {
+                magnitude = 0;
+            }
+            if (magnitude > bar_max) { magnitude = bar_max; }
+            bar_percent = (magnitude * 100) / bar_max;
+
+            bar_direction = (signed_bar_value > 0) ? 1 :
+                            ((signed_bar_value < 0) ? -1 : 0);
+            if (s_ctrl_row_bar_values[i] != (int16_t)bar_percent)
+            {
+                s_ctrl_row_bar_values[i] = (int16_t)bar_percent;
+                UI_Anim_SetBarValue(s_ctrl_row_bars[i], bar_percent);
+            }
+            if (s_ctrl_row_bar_directions[i] != bar_direction)
+            {
+                s_ctrl_row_bar_directions[i] = bar_direction;
+                if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
+                {
+                    UI_Theme_SetValueFillColor(s_ctrl_row_bars[i], signed_bar_value);
+                }
+                else
+                {
+                    UI_Theme_SetValueBarColor(s_ctrl_row_bars[i], signed_bar_value);
+                }
+            }
         }
 
         if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
@@ -884,11 +1214,10 @@ static void lvgl_app_control_refresh_rows(void)
             (void)snprintf(
                 line,
                 sizeof(line),
-                "%c M%u   %+4d   %+8ld",
-                mark,
+                "M%u  Set:%+4d%%  Act:%+5ld",
                 (unsigned int)(i + 1U),
                 (int)s_motor_speed_preset[i],
-                (long)s_motor_speed_actual[i]
+                (long)s_motor_speed_display[i]
             );
         }
         else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
@@ -896,8 +1225,7 @@ static void lvgl_app_control_refresh_rows(void)
             (void)snprintf(
                 line,
                 sizeof(line),
-                "%c S%u   %3d",
-                mark,
+                "S%u  Angle:%3d deg",
                 (unsigned int)(i + 1U),
                 (int)s_servo_angle_preset[i]
             );
@@ -905,26 +1233,26 @@ static void lvgl_app_control_refresh_rows(void)
         else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
         {
             if (i == 0)
-                (void)snprintf(line, sizeof(line), "%c X Dist(cm): %4d", mark, (int)s_mec_trans_x);
+                (void)snprintf(line, sizeof(line), "X Dist(cm)  %+5d", (int)s_mec_trans_x);
             else if (i == 1)
-                (void)snprintf(line, sizeof(line), "%c Y Dist(cm): %4d", mark, (int)s_mec_trans_y);
+                (void)snprintf(line, sizeof(line), "Y Dist(cm)  %+5d", (int)s_mec_trans_y);
             else if (i == 2)
-                (void)snprintf(line, sizeof(line), "%c Z Rot(deg): %4d", mark, (int)s_mec_rot_z);
+                (void)snprintf(line, sizeof(line), "Z Rot(deg)  %+5d", (int)s_mec_rot_z);
             else if (i == 3)
-                (void)snprintf(line, sizeof(line), "%c X Speed   : %4d", mark, (int)s_mec_speed_x);
+                (void)snprintf(line, sizeof(line), "X Speed     %5d", (int)s_mec_speed_x);
             else if (i == 4)
-                (void)snprintf(line, sizeof(line), "%c Y Speed   : %4d", mark, (int)s_mec_speed_y);
+                (void)snprintf(line, sizeof(line), "Y Speed     %5d", (int)s_mec_speed_y);
             else if (i == 5)
-                (void)snprintf(line, sizeof(line), "%c Z Speed   : %4d", mark, (int)s_mec_speed_z);
+                (void)snprintf(line, sizeof(line), "Z Speed     %5d", (int)s_mec_speed_z);
             else if (i == 6)
-                (void)snprintf(line, sizeof(line), "%c [ %s ]", mark, s_mecanum_executing ? "STOP" : "EXECUTE");
+                (void)snprintf(line, sizeof(line), "[ %s ]", mecanum_active ? "STOP ACTIVE" : "EXECUTE");
         }
         else
         {
             line[0] = '\0';
         }
 
-        lv_label_set_text(row_label, line);
+        (void)UI_LabelSetTextIfChanged(row_label, line);
     }
 }
 
@@ -935,6 +1263,7 @@ static void mecanum_start_timer_cb(lv_timer_t *timer)
     if (s_mecanum_executing)
     {
         lvgl_app_set_status("Mecanum EXECUTING");
+        lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Mecanum executing");
         
         float vx = (float)s_mec_speed_x * 10.0f; // Input was cm/s, convert to mm/s
         float vy = (float)s_mec_speed_y * 10.0f; // Input was cm/s, convert to mm/s
@@ -963,11 +1292,12 @@ static void lvgl_app_control_confirm_selected(void)
     {
         if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM && s_ctrl_selected_row == 6)
         {
-            if (s_mecanum_executing)
+            if ((s_mecanum_executing != 0U) || (Mecanum_IsMotionActive() != 0U))
             {
                 s_mecanum_executing = 0;
                 Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
                 lvgl_app_set_status("Mecanum STOPPED");
+                lvgl_app_show_toast(UI_NOTICE_WARNING, "Mecanum stopped");
                 if (s_mecanum_timer)
                 {
                     lv_timer_del(s_mecanum_timer);
@@ -978,6 +1308,7 @@ static void lvgl_app_control_confirm_selected(void)
             {
                 s_mecanum_executing = 1;
                 lvgl_app_set_status("Mecanum Wait 3s...");
+                lvgl_app_show_toast(UI_NOTICE_INFO, "Starting in 3 seconds");
                 if (s_mecanum_timer == NULL)
                 {
                     extern void mecanum_start_timer_cb(lv_timer_t *timer); // will define below
@@ -1023,6 +1354,8 @@ static void lvgl_app_control_confirm_selected(void)
                 (unsigned int)(s_ctrl_selected_row + 1U),
                 (int)s_motor_speed_preset[s_ctrl_selected_row]
             );
+            lvgl_app_show_toast(UI_NOTICE_SUCCESS, "M%u speed command sent",
+                                (unsigned int)(s_ctrl_selected_row + 1U));
         }
         else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
         {
@@ -1032,6 +1365,8 @@ static void lvgl_app_control_confirm_selected(void)
                 (unsigned int)(s_ctrl_selected_row + 1U),
                 (int)s_servo_angle_preset[s_ctrl_selected_row]
             );
+            lvgl_app_show_toast(UI_NOTICE_SUCCESS, "S%u angle command sent",
+                                (unsigned int)(s_ctrl_selected_row + 1U));
         }
     }
 
@@ -1176,6 +1511,36 @@ static void lvgl_app_control_adjust_selected(int8_t direction)
     }
 
     lvgl_app_control_refresh_rows();
+    if ((s_ctrl_selected_row < 7U) &&
+        (s_ctrl_row_labels[s_ctrl_selected_row] != NULL) &&
+        (lv_obj_is_valid(s_ctrl_row_labels[s_ctrl_selected_row]) != false))
+    {
+        UI_Anim_PulseOpacity(s_ctrl_row_labels[s_ctrl_selected_row]);
+    }
+}
+
+static void lvgl_app_motor_speed_reset_followers(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        UI_ValueFollower_Reset(&s_motor_speed_followers[i], 0);
+        s_motor_speed_display[i] = 0;
+    }
+}
+
+static void lvgl_app_motor_speed_update_followers(uint32_t now)
+{
+    uint8_t i;
+
+    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
+    {
+        UI_ValueFollower_SetTarget(&s_motor_speed_followers[i],
+                                   s_motor_speed_actual[i]);
+        s_motor_speed_display[i] = UI_ValueFollower_Update(
+            &s_motor_speed_followers[i], now, 160U);
+    }
 }
 
 static void lvgl_app_control_event_cb(lv_event_t *e)
@@ -1292,8 +1657,6 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
 
 static void lvgl_app_show_motor_speed_control(void)
 {
-    lv_obj_t *title;
-    lv_obj_t *header;
     lv_obj_t *row_btn;
     uint8_t i;
 
@@ -1309,45 +1672,32 @@ static void lvgl_app_show_motor_speed_control(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
-
-    title = lv_label_create(lv_scr_act());
-            lv_label_set_text(title, "Motor Speed");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    header = lv_label_create(lv_scr_act());
-            lv_label_set_text(header, "ID   PRESET(%)   ACTUAL(r/min)");
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 32);
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MOTOR_SPEED, "Motor Speed");
 
     for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
     {
-        row_btn = lv_btn_create(lv_scr_act());
+        row_btn = lv_btn_create(s_page_content);
         s_ctrl_row_btns[i] = row_btn;
-        lv_obj_set_size(row_btn, 220, 22);
-        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 54 + (lv_coord_t)i * 24);
-        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_set_size(row_btn, 220, 38);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 3 + (lv_coord_t)i * 43);
+        UI_Theme_ApplyDataCard(row_btn);
         lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
 
         s_ctrl_row_labels[i] = lv_label_create(row_btn);
-        lv_obj_set_style_pad_left(s_ctrl_row_labels[i], 6, 0);
-        lv_obj_set_style_pad_right(s_ctrl_row_labels[i], 6, 0);
-        lv_obj_set_style_pad_top(s_ctrl_row_labels[i], 2, 0);
-        lv_obj_set_style_pad_bottom(s_ctrl_row_labels[i], 2, 0);
-        lv_obj_set_style_radius(s_ctrl_row_labels[i], 4, 0);
-        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_text_font(s_ctrl_row_labels[i], &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_TOP_LEFT, 8, 3);
 
-        lv_group_add_obj(s_group, row_btn);
+        s_ctrl_row_bars[i] = lv_bar_create(row_btn);
+        lv_bar_set_range(s_ctrl_row_bars[i], 0, 100);
+        lv_obj_set_size(s_ctrl_row_bars[i], 202, 5);
+        lv_obj_align(s_ctrl_row_bars[i], LV_ALIGN_BOTTOM_MID, 0, -4);
+        UI_Theme_ApplyValueBar(s_ctrl_row_bars[i]);
+
+        lvgl_app_group_add_obj(row_btn);
+        UI_Anim_StaggerIn(row_btn, i);
     }
 
     if (s_ctrl_row_btns[0] != NULL)
@@ -1356,19 +1706,16 @@ static void lvgl_app_show_motor_speed_control(void)
     }
     lv_group_set_editing(s_group, false);
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
-
     lvgl_app_motor_speed_sync_actual();
+    lvgl_app_motor_speed_reset_followers();
     s_ctrl_last_actual_refresh_tick = HAL_GetTick();
     lvgl_app_control_refresh_rows();
-        lvgl_app_set_status("Up/Down select motor, OK to edit, OK sends while editing, KEY2 exits edit, Left returns and clears speed cmd");
+    lvgl_app_set_status("Up/Down select | OK edit/send | KEY2 cancel | Left back");
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_show_servo_angle_control(void)
 {
-    lv_obj_t *title;
     lv_obj_t *header;
     lv_obj_t *row_btn;
     uint8_t i;
@@ -1381,31 +1728,19 @@ static void lvgl_app_show_servo_angle_control(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_SERVO_ANGLE, "Servo Angle");
 
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Servo Angle");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    header = lv_label_create(lv_scr_act());
+    header = lv_label_create(s_page_content);
     lv_label_set_text(header, "ID   ANGLE");
-    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 32);
+    lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 8);
 
     for (i = 0U; i < LVGL_APP_SERVO_COUNT; ++i)
     {
-        row_btn = lv_btn_create(lv_scr_act());
+        row_btn = lv_btn_create(s_page_content);
         s_ctrl_row_btns[i] = row_btn;
         lv_obj_set_size(row_btn, 220, 22);
-        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 54 + (lv_coord_t)i * 24);
-        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 38 + (lv_coord_t)i * 34);
+        UI_Theme_ApplyControlRow(row_btn);
         lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
@@ -1419,7 +1754,8 @@ static void lvgl_app_show_servo_angle_control(void)
         lv_obj_set_style_radius(s_ctrl_row_labels[i], 4, 0);
         lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
 
-        lv_group_add_obj(s_group, row_btn);
+        lvgl_app_group_add_obj(row_btn);
+        UI_Anim_StaggerIn(row_btn, i);
     }
 
     if (s_ctrl_row_btns[0] != NULL)
@@ -1428,12 +1764,9 @@ static void lvgl_app_show_servo_angle_control(void)
     }
     lv_group_set_editing(s_group, false);
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
-
     lvgl_app_control_refresh_rows();
-    lvgl_app_set_status("Up/Down select servo, OK to edit, OK sends while editing, KEY2 exits edit, Left returns");
+    lvgl_app_set_status("Up/Down select | OK edit/send | KEY2 cancel | Left back");
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e)
@@ -1480,7 +1813,6 @@ static void lvgl_app_motor_menu_event_cb(lv_event_t *e)
 
 static void lvgl_app_show_motor_control_menu(void)
 {
-    lv_obj_t *title;
     lv_obj_t *list;
     lv_obj_t *btn;
     lv_obj_t *first_btn;
@@ -1491,38 +1823,35 @@ static void lvgl_app_show_motor_control_menu(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MOTOR_MENU, "Motor Control");
 
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Motor Control");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    list = lv_list_create(lv_scr_act());
-    lv_obj_set_size(list, 220, 160);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
+    list = lv_list_create(s_page_content);
+    lv_obj_set_size(list, 224, 160);
+    lv_obj_center(list);
+    UI_Theme_ApplyPanel(list);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "1 Motor Speed");
     first_btn = btn;
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 0U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 Servo Angle");
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 1U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back to Main Menu");
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 2U);
     lv_group_focus_obj(first_btn);
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
-
     lvgl_app_set_status("Motor first, Left to go back");
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
@@ -1640,10 +1969,31 @@ static void lvgl_app_gif_seek_relative(int32_t step_frames)
 static void lvgl_app_gif_timer_cb(lv_timer_t *timer)
 {
     uint32_t delay_ms;
+    uint8_t left_pressed;
+    uint8_t right_pressed;
 
     (void)timer;
 
-    if ((s_gif_playing == 0U) || (s_gif == NULL))
+    left_pressed = (HAL_GPIO_ReadPin(Key_Left_GPIO_Port, Key_Left_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+    right_pressed = (HAL_GPIO_ReadPin(Key_Right_GPIO_Port, Key_Right_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+
+    if ((left_pressed == 0U) && (right_pressed == 0U))
+    {
+        if (s_gif_seek_key_latched != 0U)
+        {
+            s_gif_last_call = lv_tick_get();
+        }
+        s_gif_seek_key_latched = 0U;
+    }
+    else if (((left_pressed != 0U) && (right_pressed == 0U)) ||
+             ((right_pressed != 0U) && (left_pressed == 0U)))
+    {
+        /* LVGL emits the initial/repeat seek events; freeze auto advance here. */
+        s_gif_seek_key_latched = 1U;
+        return;
+    }
+
+    if ((s_gif_playing == 0U) || (s_gif_paused != 0U) || (s_gif == NULL))
     {
         return;
     }
@@ -1774,6 +2124,7 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
 {
     int8_t play_status;
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
+    char played_name[LVGL_APP_ENTRY_NAME_LEN];
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
@@ -1782,24 +2133,39 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
         return;
     }
 
-    lvgl_app_set_status("Playing BIN %s...", s_browser_entries[index].name);
+    (void)snprintf(played_name, sizeof(played_name), "%s", s_browser_entries[index].name);
+    lvgl_app_set_status("BIN: OK pause, Left/Right seek, KEY3 return");
     lv_refr_now(NULL);
+    (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
 
     play_status = SD_StartAnim_PlayFile(play_path);
+    if ((play_status == SD_START_ANIM_ERR_BACK) ||
+        (play_status == SD_START_ANIM_ERR_STOPPED))
+    {
+        lv_port_indev_suppress_exit_keys_until_release();
+    }
+
+    lvgl_app_show_sd_browser();
     if (play_status == SD_START_ANIM_OK)
     {
-          lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
+          lvgl_app_set_status("Done: %s", played_name);
+          lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Playback complete");
+    }
+    else if (play_status == SD_START_ANIM_ERR_BACK)
+    {
+          lvgl_app_set_status("Returned by KEY3");
+          lvgl_app_show_toast(UI_NOTICE_INFO, "Returned by KEY3");
     }
     else if (play_status == SD_START_ANIM_ERR_STOPPED)
     {
           lvgl_app_set_status("Stopped by KEY2");
+          lvgl_app_show_toast(UI_NOTICE_WARNING, "Stopped by KEY2");
     }
     else
     {
-          lvgl_app_set_status("Failed (%d): %s", (int)play_status, s_browser_entries[index].name);
+          lvgl_app_set_status("Failed (%d): %s", (int)play_status, played_name);
+          lvgl_app_show_toast(UI_NOTICE_ERROR, "BIN playback failed (%d)", (int)play_status);
     }
-
-    lvgl_app_show_sd_browser();
 }
 
 static void lvgl_app_gif_event_cb(lv_event_t *e)
@@ -1810,7 +2176,28 @@ static void lvgl_app_gif_event_cb(lv_event_t *e)
     code = lv_event_get_code(e);
     if (code == LV_EVENT_CLICKED)
     {
-        lvgl_app_exit_gif_player("GIF stopped");
+        s_gif_paused = (s_gif_paused == 0U) ? 1U : 0U;
+        s_gif_last_call = lv_tick_get();
+        if ((s_gif_control_label != NULL) &&
+            (lv_obj_is_valid(s_gif_control_label) != false))
+        {
+            lv_label_set_text(s_gif_control_label,
+                              (s_gif_paused != 0U) ?
+                              "|<<    OK Play    >>|" :
+                              "|<<   OK Pause    >>|");
+        }
+        if ((s_gif_control_card != NULL) &&
+            (lv_obj_is_valid(s_gif_control_card) != false))
+        {
+            lv_obj_set_style_bg_color(
+                s_gif_control_card,
+                lv_color_hex((s_gif_paused != 0U) ? 0xFFF2CC : 0xE8F1FF),
+                LV_PART_MAIN);
+            UI_Anim_StateBounce(s_gif_control_card);
+        }
+        lvgl_app_set_status((s_gif_paused != 0U) ?
+                            "Paused - OK plays, KEY3 returns" :
+                            "Playing - OK pauses, Left/Right seek");
         return;
     }
 
@@ -1829,7 +2216,7 @@ static void lvgl_app_gif_event_cb(lv_event_t *e)
             return;
         }
 
-        if ((key == LV_KEY_ESC) || (key == LV_KEY_ENTER))
+        if (key == LV_KEY_ESC)
         {
             lvgl_app_exit_gif_player("GIF stopped");
         }
@@ -1838,10 +2225,10 @@ static void lvgl_app_gif_event_cb(lv_event_t *e)
 
 static void lvgl_app_show_gif_player(const char *full_path, const char *name)
 {
-    lv_obj_t *title;
     lv_obj_t *ctrl_btn;
-    lv_obj_t *ctrl_label;
     char gif_probe_reason[96];
+    uint32_t zoom;
+    uint32_t fit_zoom;
     int n;
     FRESULT fr;
 
@@ -1895,53 +2282,81 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
         return;
     }
 
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_GIF, "Media Player");
 
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "GIF Player");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    s_gif_obj = lv_img_create(lv_scr_act());
+    s_gif_obj = lv_img_create(s_page_content);
     s_gif_imgdsc.header.always_zero = 0;
     s_gif_imgdsc.header.cf = LV_IMG_CF_TRUE_COLOR_ALPHA;
     s_gif_imgdsc.header.w = s_gif->width;
     s_gif_imgdsc.header.h = s_gif->height;
     s_gif_imgdsc.data = s_gif->canvas;
     lv_img_set_src(s_gif_obj, &s_gif_imgdsc);
-    lv_obj_align(s_gif_obj, LV_ALIGN_CENTER, 0, 0);
+    zoom = 256U;
+    if (s_gif->width > 236U)
+    {
+        zoom = (236U * 256U) / s_gif->width;
+    }
+    if (s_gif->height > 146U)
+    {
+        fit_zoom = (146U * 256U) / s_gif->height;
+        if (fit_zoom < zoom)
+        {
+            zoom = fit_zoom;
+        }
+    }
+    if (zoom == 0U)
+    {
+        zoom = 1U;
+    }
+    lv_img_set_zoom(s_gif_obj, (uint16_t)zoom);
+    lv_obj_align(s_gif_obj, LV_ALIGN_TOP_MID, 0, 2);
 
-    ctrl_btn = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(ctrl_btn, 220, 34);
-    lv_obj_align(ctrl_btn, LV_ALIGN_BOTTOM_MID, 0, -8);
+    s_gif_control_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(s_gif_control_card, 224, 26);
+    lv_obj_align(s_gif_control_card, LV_ALIGN_BOTTOM_MID, 0, -2);
+    UI_Theme_ApplyDataCard(s_gif_control_card);
+    lv_obj_set_style_bg_color(s_gif_control_card, lv_color_hex(0xE8F1FF), LV_PART_MAIN);
+    lv_obj_clear_flag(s_gif_control_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    ctrl_label = lv_label_create(ctrl_btn);
-    lv_label_set_text(ctrl_label, "Left/Right seek 10s, KEY2 stop");
-    lv_obj_center(ctrl_label);
+    s_gif_control_label = lv_label_create(s_gif_control_card);
+    lv_label_set_text(s_gif_control_label, "|<<   OK Pause    >>|");
+    lv_obj_set_style_text_font(s_gif_control_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_gif_control_label, lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_obj_center(s_gif_control_label);
 
+    /* Invisible focus target keeps encoder/key events without covering media. */
+    ctrl_btn = lv_btn_create(s_page_content);
+    lv_obj_set_size(ctrl_btn, 1, 1);
+    lv_obj_set_style_opa(ctrl_btn, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_clear_flag(ctrl_btn, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(ctrl_btn, lvgl_app_gif_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_add_event_cb(ctrl_btn, lvgl_app_gif_event_cb, LV_EVENT_KEY, NULL);
     lv_group_add_obj(s_group, ctrl_btn);
     lv_group_focus_obj(ctrl_btn);
 
-    s_status_label = lv_label_create(lv_scr_act());
     if (name != NULL)
     {
-        lvgl_app_set_status("GIF: %s", name);
+        lvgl_app_set_status("Playing %s - OK pauses", name);
     }
     else
     {
         lvgl_app_set_status("Playing GIF");
     }
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 30);
 
     s_gif_playing = 1U;
+    s_gif_paused = 0U;
+    s_gif_seek_key_latched = 0U;
+    s_key3_latched = (HAL_GPIO_ReadPin(Key3_GPIO_Port, Key3_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
     s_key2_latched = (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
     s_gif_current_frame = 0U;
     s_gif_last_call = lv_tick_get();
     s_gif_timer = lv_timer_create(lvgl_app_gif_timer_cb, 10U, NULL);
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_exit_gif_player(const char *reason)
@@ -1952,6 +2367,10 @@ static void lvgl_app_exit_gif_player(const char *reason)
     }
 
     s_gif_playing = 0U;
+    s_gif_paused = 0U;
+    s_gif_seek_key_latched = 0U;
+    s_gif_control_card = NULL;
+    s_gif_control_label = NULL;
 
     if (s_gif_timer != NULL)
     {
@@ -1979,6 +2398,10 @@ static void lvgl_app_exit_gif_player(const char *reason)
     }
 
     lvgl_app_show_sd_browser();
+    if (reason != NULL)
+    {
+        lvgl_app_show_toast(UI_NOTICE_INFO, "%s", reason);
+    }
 }
 
 static void lvgl_app_sd_play_gif_by_index(uint16_t index)
@@ -1999,6 +2422,7 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
 {
     int8_t play_status;
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
+    char played_name[LVGL_APP_ENTRY_NAME_LEN];
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
@@ -2007,24 +2431,57 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
         return;
     }
 
-    lvgl_app_set_status("Playing %s...", s_browser_entries[index].name);
+    (void)snprintf(played_name, sizeof(played_name), "%s", s_browser_entries[index].name);
+    lvgl_app_set_status("Video: OK pause, Left/Right seek, KEY3 return");
     lv_refr_now(NULL);
+    (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
 
     play_status = MJPEG_Player_PlayFile(play_path);
+    if ((play_status == MJPEG_PLAYER_ERR_BACK) ||
+        (play_status == MJPEG_PLAYER_ERR_STOPPED))
+    {
+        lv_port_indev_suppress_exit_keys_until_release();
+    }
+    lvgl_app_show_sd_browser();
+
+    if (s_browser_scan_result != FR_OK)
+    {
+        lvgl_app_set_status(
+            "MJPEG %d, SD scan failed (%d)",
+            (int)play_status,
+            (int)s_browser_scan_result
+        );
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "SD scan failed (%d)",
+                            (int)s_browser_scan_result);
+        return;
+    }
+
     if (play_status == MJPEG_PLAYER_OK)
     {
-          lvgl_app_set_status("Done: %s", s_browser_entries[index].name);
+          lvgl_app_set_status("Done: %s", played_name);
+          lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Playback complete");
+    }
+    else if (play_status == MJPEG_PLAYER_ERR_BACK)
+    {
+          lvgl_app_set_status("Returned by KEY3");
+          lvgl_app_show_toast(UI_NOTICE_INFO, "Returned by KEY3");
     }
     else if (play_status == MJPEG_PLAYER_ERR_STOPPED)
     {
           lvgl_app_set_status("Stopped by KEY2");
+          lvgl_app_show_toast(UI_NOTICE_WARNING, "Stopped by KEY2");
     }
     else
     {
-          lvgl_app_set_status("MJPEG failed (%d): %s", (int)play_status, s_browser_entries[index].name);
+          lvgl_app_set_status(
+              "MJPEG failed (%d, fs=%u): %s",
+              (int)play_status,
+              (unsigned int)MJPEG_Player_GetLastFsError(),
+              played_name
+          );
+          lvgl_app_show_toast(UI_NOTICE_ERROR, "MJPEG playback failed (%d)",
+                              (int)play_status);
     }
-
-    lvgl_app_show_sd_browser();
 }
 
 static void lvgl_app_sd_select_id(uintptr_t id)
@@ -2129,7 +2586,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
             return;
         }
 
-        return;
+        if (key != LV_KEY_RIGHT)
+        {
+            return;
+        }
     }
     else if (code != LV_EVENT_CLICKED)
     {
@@ -2161,6 +2621,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     else if (id == LVGL_APP_MENU_ID_WS2812)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_WS2812);
+    }
+    else if (id == LVGL_APP_MENU_ID_DIAGNOSTICS)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_DIAGNOSTICS);
     }
 }
 
@@ -2206,12 +2670,234 @@ static void lvgl_app_sd_file_event_cb(lv_event_t *e)
     lvgl_app_sd_select_id(id);
 }
 
+static void lvgl_app_diagnostics_refresh(void)
+{
+    ui_perf_snapshot_t snapshot;
+    const char *page_name;
+    const char *status_text;
+    lv_color_t status_bg;
+    char text_buf[320];
+
+    if ((s_diag_page_label == NULL) || (s_diag_data_label == NULL) ||
+        (lv_obj_is_valid(s_diag_page_label) == false) ||
+        (lv_obj_is_valid(s_diag_data_label) == false))
+    {
+        return;
+    }
+
+    UI_PerfDiag_GetSnapshot(&snapshot);
+    if ((s_diag_chart != NULL) &&
+        (lv_obj_is_valid(s_diag_chart) != false) &&
+        (s_diag_fps_series != NULL) && (s_diag_heap_series != NULL))
+    {
+        lv_chart_set_next_value(s_diag_chart, s_diag_fps_series,
+                                (snapshot.refresh_fps > 100U) ? 100 :
+                                (lv_coord_t)snapshot.refresh_fps);
+        lv_chart_set_next_value(s_diag_chart, s_diag_heap_series,
+                                (lv_coord_t)snapshot.lv_mem_used_pct);
+    }
+    if (snapshot.status == UI_PERF_STATUS_OVERLOAD)
+    {
+        status_text = "OVERLOAD";
+        status_bg = lv_color_hex(0xFDE8E8);
+    }
+    else if (snapshot.status == UI_PERF_STATUS_BUSY)
+    {
+        status_text = "BUSY";
+        status_bg = lv_color_hex(0xFFF2CC);
+    }
+    else
+    {
+        status_text = "GOOD";
+        status_bg = lv_color_hex(0xE4F7EA);
+    }
+
+    if (s_diag_page_index == 0U)
+    {
+        page_name = "1/3  OVERVIEW";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "FPS                 %5u\n"
+            "Refresh avg/max %3u.%1u/%3u ms\n"
+            "UI loop avg/max %5u/%5u us\n"
+            "Pixels avg/max %6lu/%6lu\n"
+            "Control max       %6lu us\n"
+            "State               %s",
+            (unsigned int)snapshot.refresh_fps,
+            (unsigned int)(snapshot.refresh_avg_ms_x10 / 10U),
+            (unsigned int)(snapshot.refresh_avg_ms_x10 % 10U),
+            (unsigned int)snapshot.refresh_max_ms,
+            (unsigned int)snapshot.ui_handler_avg_us,
+            (unsigned int)snapshot.ui_handler_max_us,
+            (unsigned long)snapshot.pixels_avg,
+            (unsigned long)snapshot.pixels_max,
+            (unsigned long)snapshot.control_max_us,
+            status_text);
+    }
+    else if (s_diag_page_index == 1U)
+    {
+        page_name = "2/3  DISPLAY";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "Refresh rate        %5u fps\n"
+            "Refresh max         %5u ms\n"
+            "Flush avg/max   %5u/%5u us\n"
+            "Flush count       %7lu\n"
+            "Wait / timeout %6lu/%4lu\n"
+            "Transfer errors   %7lu",
+            (unsigned int)snapshot.refresh_fps,
+            (unsigned int)snapshot.refresh_max_ms,
+            (unsigned int)snapshot.flush_avg_us,
+            (unsigned int)snapshot.flush_max_us,
+            (unsigned long)snapshot.flush_count,
+            (unsigned long)snapshot.flush_wait_count,
+            (unsigned long)snapshot.flush_timeout_count,
+            (unsigned long)snapshot.flush_error_count);
+    }
+    else
+    {
+        page_name = "3/3  MEMORY";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "LV heap used          %3u %%\n"
+            "Free bytes          %7lu\n"
+            "Largest block       %7lu\n"
+            "Fragmentation         %3u %%\n"
+            "Peak used           %7lu\n"
+            "Control overruns    %7lu",
+            (unsigned int)snapshot.lv_mem_used_pct,
+            (unsigned long)snapshot.lv_mem_free,
+            (unsigned long)snapshot.lv_mem_biggest_free,
+            (unsigned int)snapshot.lv_mem_frag_pct,
+            (unsigned long)snapshot.lv_mem_max_used,
+            (unsigned long)snapshot.control_overrun_count);
+    }
+
+    (void)UI_LabelSetTextIfChanged(s_diag_page_label, page_name);
+    (void)UI_LabelSetTextIfChanged(s_diag_data_label, text_buf);
+    if ((s_diag_status_card != NULL) &&
+        (lv_obj_is_valid(s_diag_status_card) != false))
+    {
+        lv_obj_set_style_bg_color(s_diag_status_card, status_bg, LV_PART_MAIN);
+        if (s_diag_last_status != snapshot.status)
+        {
+            s_diag_last_status = snapshot.status;
+            UI_Anim_StateBounce(s_diag_status_card);
+        }
+    }
+}
+
+static void lvgl_app_diagnostics_event_cb(lv_event_t *e)
+{
+    uint32_t key;
+
+    if (lv_event_get_code(e) != LV_EVENT_KEY)
+    {
+        return;
+    }
+
+    key = lvgl_app_event_get_key(e);
+    if (key == LV_KEY_RIGHT)
+    {
+        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 3U);
+        lvgl_app_diagnostics_refresh();
+        UI_Anim_CarouselIn(s_diag_data_panel, 1);
+    }
+    else if (key == LV_KEY_LEFT)
+    {
+        s_diag_page_index = (s_diag_page_index == 0U) ? 2U : (uint8_t)(s_diag_page_index - 1U);
+        lvgl_app_diagnostics_refresh();
+        UI_Anim_CarouselIn(s_diag_data_panel, -1);
+    }
+    else if (key == LV_KEY_ESC)
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+    }
+}
+
+static void lvgl_app_show_diagnostics(void)
+{
+    lv_obj_t *key_receiver;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_DIAGNOSTICS, "UI Diagnostics");
+
+    s_diag_status_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(s_diag_status_card, 220, 28);
+    lv_obj_align(s_diag_status_card, LV_ALIGN_TOP_MID, 0, 3);
+    UI_Theme_ApplyDataCard(s_diag_status_card);
+    lv_obj_clear_flag(s_diag_status_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_diag_page_label = lv_label_create(s_diag_status_card);
+    lv_obj_set_style_text_font(s_diag_page_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_diag_page_label, lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_obj_center(s_diag_page_label);
+    UI_Anim_StaggerIn(s_diag_status_card, 0U);
+
+    s_diag_data_panel = lv_obj_create(s_page_content);
+    lv_obj_set_size(s_diag_data_panel, 220, 142);
+    lv_obj_align(s_diag_data_panel, LV_ALIGN_BOTTOM_MID, 0, -3);
+    UI_Theme_ApplyPanel(s_diag_data_panel);
+    lv_obj_clear_flag(s_diag_data_panel, LV_OBJ_FLAG_SCROLLABLE);
+    UI_Anim_StaggerIn(s_diag_data_panel, 1U);
+
+    s_diag_data_label = lv_label_create(s_diag_data_panel);
+    lv_obj_set_style_text_font(s_diag_data_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_diag_data_label, lv_color_hex(0x111827), LV_PART_MAIN);
+    lv_obj_align(s_diag_data_label, LV_ALIGN_TOP_LEFT, 7, 8);
+
+    s_diag_chart = lv_chart_create(s_diag_data_panel);
+    lv_obj_set_size(s_diag_chart, 204, 40);
+    lv_obj_align(s_diag_chart, LV_ALIGN_BOTTOM_MID, 0, -3);
+    lv_obj_set_style_bg_opa(s_diag_chart, LV_OPA_20, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_diag_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_line_width(s_diag_chart, 1, LV_PART_ITEMS);
+    lv_chart_set_type(s_diag_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(s_diag_chart, 24U);
+    lv_chart_set_range(s_diag_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_chart_set_div_line_count(s_diag_chart, 2U, 4U);
+    s_diag_fps_series = lv_chart_add_series(s_diag_chart,
+                                            lv_color_hex(0x2563EB),
+                                            LV_CHART_AXIS_PRIMARY_Y);
+    s_diag_heap_series = lv_chart_add_series(s_diag_chart,
+                                             lv_color_hex(0xF59E0B),
+                                             LV_CHART_AXIS_PRIMARY_Y);
+    lv_obj_clear_flag(s_diag_chart, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    key_receiver = lv_obj_create(s_page_content);
+    lv_obj_set_size(key_receiver, 1, 1);
+    lv_obj_set_style_opa(key_receiver, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(key_receiver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(key_receiver, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(key_receiver, lvgl_app_diagnostics_event_cb, LV_EVENT_KEY, NULL);
+    lv_group_add_obj(s_group, key_receiver);
+    lv_group_focus_obj(key_receiver);
+
+    s_diag_page_index = 0U;
+    s_diag_last_status = (ui_perf_status_t)0xFFU;
+    s_diag_last_refresh_tick = HAL_GetTick();
+    lvgl_app_diagnostics_refresh();
+    lvgl_app_set_status("Left/Right pages - KEY2/KEY3 exits");
+    lvgl_app_page_finish();
+}
+
 static void lvgl_app_show_main_menu(void)
 {
-    lv_obj_t *title;
     lv_obj_t *list;
     lv_obj_t *btn;
     lv_obj_t *first_btn;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
 
     /* 恢复自动彩虹模式，并清空 WS2812 颜色 */
     g_ws2812_manual_mode = 0U;
@@ -2220,52 +2906,56 @@ static void lvgl_app_show_main_menu(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MAIN, "Main Menu");
 
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Main Menu");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    list = lv_list_create(lv_scr_act());
-    lv_obj_set_size(list, 220, 160);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 34);
+    list = lv_list_create(s_page_content);
+    lv_obj_set_size(list, 224, 172);
+    lv_obj_center(list);
+    UI_Theme_ApplyPanel(list);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_PLAY, "1 Motor Control");
     first_btn = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 0U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "2 Command Control");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 1U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, "3 SD Card Files");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 2U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_SHUFFLE, "4 Mecanum Control");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MECANUM);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MECANUM);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 3U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_LOOP, "5 MPU6500 Data");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_EDIT, "6 WS2812 Control");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_EYE_OPEN, "7 UI Diagnostics");
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
+    lvgl_app_group_add_obj(btn);
 
     lv_group_focus_obj(first_btn);
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lvgl_app_page_finish();
 }
 
 #include "usbd_cdc_if.h"
@@ -2462,25 +3152,31 @@ static void lvgl_app_command_exit_event_cb(lv_event_t *e)
 {
     uint32_t key;
     lv_event_code_t code = lv_event_get_code(e);
-    if (code == LV_EVENT_CLICKED || code == LV_EVENT_KEY) {
-        if (code == LV_EVENT_KEY) {
-            key = lvgl_app_event_get_key(e);
-            if (key != LV_KEY_ESC && key != LV_KEY_LEFT && key != LV_KEY_ENTER) {
-                return;
-            }
-        }
-        LVGL_App_CommandStopMotors();
-        s_cmd_rx_idx[0] = 0U;
-        s_cmd_rx_idx[1] = 0U;
-        s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
-        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+
+    if (code != LV_EVENT_KEY)
+    {
+        return;
     }
+
+    key = lvgl_app_event_get_key(e);
+    if ((key != LV_KEY_ESC) && (key != LV_KEY_LEFT))
+    {
+        return;
+    }
+
+    LVGL_App_CommandStopMotors();
+    s_cmd_rx_idx[0] = 0U;
+    s_cmd_rx_idx[1] = 0U;
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    lv_port_indev_suppress_all_keys_until_release();
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
 }
 
 static void lvgl_app_show_command_control(void)
 {
-    lv_obj_t *title;
-    lv_obj_t *btn;
+    lv_obj_t *status_card;
+    lv_obj_t *data_panel;
+    lv_obj_t *key_receiver;
     lv_obj_t *lbl;
 
     // Set WS2812 to 20% Red
@@ -2494,38 +3190,61 @@ static void lvgl_app_show_command_control(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_COMMAND, "Command Control");
 
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Command Control USB/USART");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    status_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(status_card, 220, 28);
+    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 3);
+    UI_Theme_ApplyDataCard(status_card);
+    lv_obj_set_style_bg_color(status_card, lv_color_hex(0xE8F1FF), LV_PART_MAIN);
+    lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_cmd_ctrl_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_cmd_ctrl_label, "Listening...");
-    lv_obj_align(s_cmd_ctrl_label, LV_ALIGN_CENTER, 0, -20);
-    
-    btn = lv_btn_create(lv_scr_act());
-    lv_obj_set_size(btn, 120, 30);
-    lv_obj_align(btn, LV_ALIGN_BOTTOM_MID, 0, -40);
-    lbl = lv_label_create(btn);
-    lv_label_set_text(lbl, "Exit Mode");
+    lbl = lv_label_create(status_card);
+    lv_label_set_text(lbl, "USB / USART COMMAND MODE");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, LV_PART_MAIN);
     lv_obj_center(lbl);
-    
-    lv_group_add_obj(s_group, btn);
-    lv_obj_add_event_cb(btn, lvgl_app_command_exit_event_cb, LV_EVENT_ALL, NULL);
-    
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, "Remote control enabled - ENTER/LEFT exits");
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    UI_Anim_StaggerIn(status_card, 0U);
+
+    data_panel = lv_obj_create(s_page_content);
+    lv_obj_set_size(data_panel, 220, 142);
+    lv_obj_align(data_panel, LV_ALIGN_BOTTOM_MID, 0, -3);
+    UI_Theme_ApplyPanel(data_panel);
+    lv_obj_clear_flag(data_panel, LV_OBJ_FLAG_SCROLLABLE);
+    UI_Anim_StaggerIn(data_panel, 1U);
+
+    lbl = lv_label_create(data_panel);
+    lv_label_set_text(lbl, "LIVE CONTROL DATA");
+    lv_obj_set_style_text_color(lbl, lv_color_hex(0x475467), LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(lbl, LV_ALIGN_TOP_LEFT, 7, 4);
+
+    s_cmd_ctrl_label = lv_label_create(data_panel);
+    lv_label_set_text(s_cmd_ctrl_label, "Listening...");
+    lv_obj_set_style_text_color(s_cmd_ctrl_label, lv_color_hex(0x111827), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_cmd_ctrl_label, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_align(s_cmd_ctrl_label, LV_ALIGN_TOP_LEFT, 7, 25);
+
+    key_receiver = lv_obj_create(s_page_content);
+    lv_obj_set_size(key_receiver, 1, 1);
+    lv_obj_set_style_opa(key_receiver, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(key_receiver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(key_receiver, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(key_receiver, lvgl_app_command_exit_event_cb, LV_EVENT_KEY, NULL);
+    lv_group_add_obj(s_group, key_receiver);
+    lv_group_focus_obj(key_receiver);
+
+    lvgl_app_set_status("USB/USART active - Left/KEY2 returns");
 
     lvgl_app_motor_speed_sync_actual();
+    lvgl_app_motor_speed_reset_followers();
     s_ctrl_last_actual_refresh_tick = 0;
     lvgl_app_control_refresh_rows();
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_show_sd_browser(void)
 {
-    lv_obj_t *title;
     lv_obj_t *list;
     lv_obj_t *btn;
     lv_obj_t *back_btn;
@@ -2534,42 +3253,54 @@ static void lvgl_app_show_sd_browser(void)
     char path_line[LVGL_APP_BROWSER_PATH_LEN + 8U];
     uint16_t i;
 
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
     (void)lvgl_app_scan_browser_entries();
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
-
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "SD Card Files");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_SD_BROWSER, "SD Card Files");
 
     (void)snprintf(path_line, sizeof(path_line), "Path: %s", s_browser_path);
-    btn = lv_label_create(lv_scr_act());
+    btn = lv_label_create(s_page_content);
+    lv_label_set_long_mode(btn, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(btn, 224);
     lv_label_set_text(btn, path_line);
-    lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 24);
+    lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 2);
 
-    list = lv_list_create(lv_scr_act());
-    lv_obj_set_size(list, 220, 146);
-    lv_obj_align(list, LV_ALIGN_TOP_MID, 0, 44);
+    list = lv_list_create(s_page_content);
+    lv_obj_set_size(list, 224, 154);
+    lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, -2);
+    UI_Theme_ApplyPanel(list);
 
     back_btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back");
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
-    lv_group_add_obj(s_group, back_btn);
+    lvgl_app_group_add_obj(back_btn);
+    UI_Anim_StaggerIn(back_btn, 0U);
 
     up_btn = lv_list_add_btn(list, LV_SYMBOL_UP, "Parent");
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
-    lv_group_add_obj(s_group, up_btn);
+    lvgl_app_group_add_obj(up_btn);
+    UI_Anim_StaggerIn(up_btn, 1U);
 
     focus_obj = up_btn;
 
     if (s_browser_entry_count == 0U)
     {
-        btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "No folders or media");
+        if (s_browser_scan_result == FR_OK)
+        {
+            btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "No folders or media");
+            lvgl_app_set_status("Empty: %s", s_browser_path);
+        }
+        else
+        {
+            btn = lv_list_add_btn(list, LV_SYMBOL_WARNING, "SD read failed");
+            lvgl_app_set_status("SD scan failed (%d): %s", (int)s_browser_scan_result, s_browser_path);
+        }
         lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
-        lvgl_app_set_status("Empty: %s", s_browser_path);
         lv_group_focus_obj(up_btn);
     }
     else
@@ -2597,7 +3328,8 @@ static void lvgl_app_show_sd_browser(void)
 
             lv_obj_add_event_cb(btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)(i + LVGL_APP_SD_ID_BASE));
             lv_obj_add_event_cb(btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)(i + LVGL_APP_SD_ID_BASE));
-            lv_group_add_obj(s_group, btn);
+            lvgl_app_group_add_obj(btn);
+            UI_Anim_StaggerIn(btn, (uint8_t)(i + 2U));
             if (i == 0U)
             {
                 focus_obj = btn;
@@ -2607,9 +3339,7 @@ static void lvgl_app_show_sd_browser(void)
         lv_group_focus_obj(focus_obj);
     }
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_process_global_stop_key(void)
@@ -2653,12 +3383,42 @@ static void lvgl_app_process_global_stop_key(void)
 
     if (s_gif_playing != 0U)
     {
+        lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_exit_gif_player("Stopped by KEY2");
+    }
+}
+
+static void lvgl_app_process_media_return_key(void)
+{
+    uint8_t key3_pressed =
+        (HAL_GPIO_ReadPin(Key3_GPIO_Port, Key3_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+
+    if (key3_pressed == 0U)
+    {
+        s_key3_latched = 0U;
+        return;
+    }
+
+    if (s_key3_latched != 0U)
+    {
+        return;
+    }
+
+    s_key3_latched = 1U;
+    if (s_gif_playing != 0U)
+    {
+        lv_port_indev_suppress_exit_keys_until_release();
+        lvgl_app_exit_gif_player("Returned by KEY3");
     }
 }
 
 void LVGL_App_Init(void)
 {
+    UI_Theme_Init(lv_disp_get_default());
+    UI_TransitionManager_Init(&s_transition_manager);
+    UI_Feedback_Init(&s_feedback);
+    UI_PerfDiag_Init();
+
     /* Start TIM8 PWM for servos (1 and 2 only, 3 and 4 used by SDMMC1) */
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
@@ -2673,28 +3433,45 @@ void LVGL_App_Init(void)
 void LVGL_App_Process(void)
 {
     uint32_t safety_faults = Safety_GetFaults();
+    uint32_t ui_handler_start;
+
+    UI_PerfDiag_Process();
+    if ((s_current_screen == LVGL_APP_SCREEN_REQ_DIAGNOSTICS) &&
+        ((HAL_GetTick() - s_diag_last_refresh_tick) >= 500U))
+    {
+        s_diag_last_refresh_tick = HAL_GetTick();
+        lvgl_app_diagnostics_refresh();
+    }
 
     if (safety_faults != s_last_safety_faults)
     {
         s_last_safety_faults = safety_faults;
+        UI_Feedback_SetFault(&s_feedback, safety_faults, s_status_text);
         if (safety_faults != SAFETY_FAULT_NONE)
         {
-            lvgl_app_set_status("SAFETY FAULT 0x%02lX",
-                                (unsigned long)safety_faults);
+            lvgl_app_show_toast(UI_NOTICE_ERROR, "Safety stop active");
         }
         else
         {
-            lvgl_app_set_status("Safety stop released");
+            lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Safety stop released");
         }
+        lvgl_app_control_refresh_rows();
     }
 
-    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED || s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
+    if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED) ||
+        (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND) ||
+        (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM))
     {
         uint32_t now = HAL_GetTick();
-        if ((now - s_ctrl_last_actual_refresh_tick) >= 10U)
+        if ((now - s_ctrl_last_actual_refresh_tick) >= LVGL_APP_CTRL_REFRESH_MS)
         {
             s_ctrl_last_actual_refresh_tick = now;
-            lvgl_app_motor_speed_sync_actual();
+            if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED) ||
+                (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND))
+            {
+                lvgl_app_motor_speed_sync_actual();
+                lvgl_app_motor_speed_update_followers(now);
+            }
             lvgl_app_control_refresh_rows();
         }
     }
@@ -2714,11 +3491,18 @@ void LVGL_App_Process(void)
         int v_frac = (int)((g_adc_voltage - v_int) * 100.0f + 0.5f);
         if (v_frac < 0) v_frac = -v_frac;
         snprintf(buf, sizeof(buf), "%d.%02dV", v_int, v_frac);
-        lv_label_set_text(s_adc_label, buf);
+        (void)UI_LabelSetTextIfChanged(s_adc_label, buf);
     }
 
+    lvgl_app_process_media_return_key();
     lvgl_app_process_global_stop_key();
+    lvgl_app_update_header_activity();
+    UI_Feedback_Process(&s_feedback);
+    lv_port_disp_process();
+    ui_handler_start = UI_PerfDiag_BeginMeasure();
     lv_timer_handler();
+    UI_PerfDiag_EndUiHandler(ui_handler_start);
+    lv_port_disp_process();
     lvgl_app_process_pending_screen();
 }
 
@@ -2728,10 +3512,47 @@ void LVGL_App_Process(void)
 
 static lv_obj_t *s_mpu_label = NULL;
 static lv_timer_t *s_mpu_timer = NULL;
+static lv_obj_t *s_mpu_chart = NULL;
+static lv_chart_series_t *s_mpu_pitch_series = NULL;
+static lv_chart_series_t *s_mpu_roll_series = NULL;
+static ui_value_follower_t s_mpu_angle_followers[3];
+static uint32_t s_mpu_last_chart_tick = 0U;
+
+static void lvgl_app_format_centi(char *buffer, size_t size, int32_t value)
+{
+    int32_t whole;
+    int32_t fraction;
+
+    if ((buffer == NULL) || (size == 0U))
+    {
+        return;
+    }
+
+    whole = value / 100;
+    fraction = value % 100;
+    if (fraction < 0)
+    {
+        fraction = -fraction;
+    }
+
+    if ((value < 0) && (whole == 0))
+    {
+        (void)snprintf(buffer, size, "-0.%02ld", (long)fraction);
+    }
+    else
+    {
+        (void)snprintf(buffer, size, "%ld.%02ld", (long)whole, (long)fraction);
+    }
+}
 
 static void mpu6500_timer_cb(lv_timer_t *timer)
 {
     ImuServiceSnapshot_t snapshot;
+    uint32_t now;
+    int32_t angles[3];
+    char pitch_text[20];
+    char roll_text[20];
+    char yaw_text[20];
 
     (void)timer;
     if (s_ctrl_page != LVGL_APP_CTRL_PAGE_MPU6500) {
@@ -2742,19 +3563,48 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
         if (s_mpu_label) {
             char errmsg[64];
             snprintf(errmsg, sizeof(errmsg), "IIC Error! No valid IMU sample");
-            lv_label_set_text(s_mpu_label, errmsg);
+            (void)UI_LabelSetTextIfChanged(s_mpu_label, errmsg);
         }
         return;
     }
     
-    char buf[128];
-    snprintf(buf, sizeof(buf), "Pitch: %d.%02d\nRoll: %d.%02d\nYaw: %d.%02d\nAcc: %d, %d, %d\nGyro: %d, %d, %d", 
-             (int)snapshot.angles.pitch, abs((int)(snapshot.angles.pitch*100)%100), 
-             (int)snapshot.angles.roll, abs((int)(snapshot.angles.roll*100)%100), 
-             (int)snapshot.angles.yaw, abs((int)(snapshot.angles.yaw*100)%100), 
-             snapshot.ax, snapshot.ay, snapshot.az, snapshot.gx, snapshot.gy, snapshot.gz);
+    now = HAL_GetTick();
+    UI_ValueFollower_SetTarget(&s_mpu_angle_followers[0],
+                               (int32_t)(snapshot.angles.pitch * 100.0f));
+    UI_ValueFollower_SetTarget(&s_mpu_angle_followers[1],
+                               (int32_t)(snapshot.angles.roll * 100.0f));
+    UI_ValueFollower_SetTarget(&s_mpu_angle_followers[2],
+                               (int32_t)(snapshot.angles.yaw * 100.0f));
+    angles[0] = UI_ValueFollower_Update(&s_mpu_angle_followers[0], now, 160U);
+    angles[1] = UI_ValueFollower_Update(&s_mpu_angle_followers[1], now, 160U);
+    angles[2] = UI_ValueFollower_Update(&s_mpu_angle_followers[2], now, 160U);
+
+    lvgl_app_format_centi(pitch_text, sizeof(pitch_text), angles[0]);
+    lvgl_app_format_centi(roll_text, sizeof(roll_text), angles[1]);
+    lvgl_app_format_centi(yaw_text, sizeof(yaw_text), angles[2]);
+
+    if ((s_mpu_chart != NULL) && (lv_obj_is_valid(s_mpu_chart) != false) &&
+        (s_mpu_pitch_series != NULL) && (s_mpu_roll_series != NULL) &&
+        ((now - s_mpu_last_chart_tick) >= 100U))
+    {
+        s_mpu_last_chart_tick = now;
+        lv_chart_set_next_value(s_mpu_chart, s_mpu_pitch_series,
+                                (lv_coord_t)(angles[0] / 100));
+        lv_chart_set_next_value(s_mpu_chart, s_mpu_roll_series,
+                                (lv_coord_t)(angles[1] / 100));
+    }
+
+    char buf[160];
+    snprintf(buf, sizeof(buf),
+             "Pitch: %s   Roll: %s\n"
+             "Yaw: %s\n"
+             "Acc: %d, %d, %d\n"
+             "Gyro: %d, %d, %d",
+             pitch_text, roll_text, yaw_text,
+             snapshot.ax, snapshot.ay, snapshot.az,
+             snapshot.gx, snapshot.gy, snapshot.gz);
     if (s_mpu_label) {
-        lv_label_set_text(s_mpu_label, buf);
+        (void)UI_LabelSetTextIfChanged(s_mpu_label, buf);
     }
 }
 
@@ -2770,6 +3620,9 @@ static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
                 lv_timer_del(s_mpu_timer);
                 s_mpu_timer = NULL;
             }
+            s_mpu_chart = NULL;
+            s_mpu_pitch_series = NULL;
+            s_mpu_roll_series = NULL;
             lvgl_app_set_status("Global exit");
             lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
         }
@@ -2778,7 +3631,6 @@ static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
 
 static void lvgl_app_show_mecanum_control(void)
 {
-    lv_obj_t *title;
     lv_obj_t *row_btn;
     uint8_t i;
 
@@ -2800,41 +3652,38 @@ static void lvgl_app_show_mecanum_control(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
-
-    title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "Mecanum Control");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MECANUM, "Mecanum Control");
 
     for (i = 0U; i < 7U; ++i)
     {
-        row_btn = lv_btn_create(lv_scr_act());
+        row_btn = lv_btn_create(s_page_content);
         s_ctrl_row_btns[i] = row_btn;
         lv_obj_set_size(row_btn, 220, 22);
-        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 36 + (lv_coord_t)i * 22);
-        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_bg_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_border_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_shadow_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_outline_opa(row_btn, LV_OPA_TRANSP, LV_PART_MAIN | LV_STATE_FOCUSED);
-        lv_obj_set_style_radius(row_btn, 4, LV_PART_MAIN | LV_STATE_DEFAULT);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0, 2 + (lv_coord_t)i * 25);
+        UI_Theme_ApplyDataCard(row_btn);
         lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)i);
         lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)i);
 
         s_ctrl_row_labels[i] = lv_label_create(row_btn);
-        lv_obj_set_style_pad_left(s_ctrl_row_labels[i], 6, 0);
-        lv_obj_set_style_pad_right(s_ctrl_row_labels[i], 6, 0);
-        lv_obj_set_style_pad_top(s_ctrl_row_labels[i], 2, 0);
-        lv_obj_set_style_pad_bottom(s_ctrl_row_labels[i], 2, 0);
-        lv_obj_set_style_radius(s_ctrl_row_labels[i], 4, 0);
-        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_LEFT_MID, 0, 0);
+        lv_obj_set_style_text_font(s_ctrl_row_labels[i], &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_TOP_LEFT, 8, 1);
 
-        lv_group_add_obj(s_group, row_btn);
+        if (i < 6U)
+        {
+            s_ctrl_row_bars[i] = lv_bar_create(row_btn);
+            lv_bar_set_range(s_ctrl_row_bars[i], 0, 100);
+            lv_obj_set_size(s_ctrl_row_bars[i], 212, 18);
+            lv_obj_align(s_ctrl_row_bars[i], LV_ALIGN_RIGHT_MID, -3, 0);
+            UI_Theme_ApplyValueFill(s_ctrl_row_bars[i]);
+            lv_obj_clear_flag(s_ctrl_row_bars[i], LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_move_background(s_ctrl_row_bars[i]);
+            lv_obj_move_foreground(s_ctrl_row_labels[i]);
+        }
+
+        lvgl_app_group_add_obj(row_btn);
+        UI_Anim_StaggerIn(row_btn, i);
     }
 
     if (s_ctrl_row_btns[0] != NULL)
@@ -2843,43 +3692,67 @@ static void lvgl_app_show_mecanum_control(void)
     }
     lv_group_set_editing(s_group, false);
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, s_status_text);
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
-
     lvgl_app_control_refresh_rows();
+    s_ctrl_last_actual_refresh_tick = HAL_GetTick();
     lvgl_app_set_status("OK to edit/exec, Left returns");
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_show_mpu6500_data(void)
 {
+    uint8_t i;
+
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MPU6500, "MPU6500 Data");
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_MPU6500;
 
-    lv_obj_t *title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "MPU6500 Data");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
-
-    s_mpu_label = lv_label_create(lv_scr_act());
+    s_mpu_label = lv_label_create(s_page_content);
+    lv_label_set_long_mode(s_mpu_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(s_mpu_label, 228);
+    lv_obj_set_style_text_align(s_mpu_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_label_set_text(s_mpu_label, "Loading...");
-    lv_obj_align(s_mpu_label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_align(s_mpu_label, LV_ALIGN_TOP_MID, 0, 5);
+    UI_Anim_StaggerIn(s_mpu_label, 0U);
 
-    lv_obj_t *btn = lv_btn_create(lv_scr_act());
+    s_mpu_chart = lv_chart_create(s_page_content);
+    lv_obj_set_size(s_mpu_chart, 220, 70);
+    lv_obj_align(s_mpu_chart, LV_ALIGN_BOTTOM_MID, 0, -2);
+    lv_obj_set_style_bg_opa(s_mpu_chart, LV_OPA_20, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_mpu_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_line_width(s_mpu_chart, 2, LV_PART_ITEMS);
+    lv_chart_set_type(s_mpu_chart, LV_CHART_TYPE_LINE);
+    lv_chart_set_point_count(s_mpu_chart, 32U);
+    lv_chart_set_range(s_mpu_chart, LV_CHART_AXIS_PRIMARY_Y, -180, 180);
+    lv_chart_set_div_line_count(s_mpu_chart, 3U, 4U);
+    s_mpu_pitch_series = lv_chart_add_series(s_mpu_chart,
+                                             lv_color_hex(0x2563EB),
+                                             LV_CHART_AXIS_PRIMARY_Y);
+    s_mpu_roll_series = lv_chart_add_series(s_mpu_chart,
+                                            lv_color_hex(0xF59E0B),
+                                            LV_CHART_AXIS_PRIMARY_Y);
+    lv_obj_clear_flag(s_mpu_chart, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    UI_Anim_StaggerIn(s_mpu_chart, 1U);
+
+    for (i = 0U; i < 3U; ++i)
+    {
+        UI_ValueFollower_Reset(&s_mpu_angle_followers[i], 0);
+    }
+    s_mpu_last_chart_tick = HAL_GetTick();
+
+    lv_obj_t *btn = lv_btn_create(s_page_content);
     lv_obj_set_size(btn, 0, 0); 
     lv_obj_add_event_cb(btn, lvgl_app_mpu6500_event_cb, LV_EVENT_KEY, NULL);
-    lv_group_add_obj(s_group, btn);
+    lvgl_app_group_add_obj(btn);
     lv_group_focus_obj(btn);
 
     if (s_mpu_timer == NULL) {
         s_mpu_timer = lv_timer_create(mpu6500_timer_cb, 50, NULL);
     }
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, "KEY2 or Left to go back");
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lvgl_app_set_status("KEY2 or Left to go back");
+    lvgl_app_page_finish();
 }
 
 static lv_obj_t *s_ws2812_slider_r = NULL;
@@ -2960,41 +3833,40 @@ static void lvgl_app_show_ws2812_control(void)
 {
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lv_obj_clean(lv_scr_act());
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_WS2812, "WS2812 RGB Control");
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_WS2812;
 
     /* 进入手动模式，暂停 main 循环自动彩虹 */
     g_ws2812_manual_mode = 1U;
 
-    lv_obj_t *title = lv_label_create(lv_scr_act());
-    lv_label_set_text(title, "WS2812 RGB Control");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
-
     // R Slider (value 0..255, one-to-one with RGB channel)
-    s_ws2812_slider_r = lv_slider_create(lv_scr_act());
+    s_ws2812_slider_r = lv_slider_create(s_page_content);
     lv_slider_set_range(s_ws2812_slider_r, 0, 255);
-    lv_obj_set_size(s_ws2812_slider_r, 200, 15);
-    lv_obj_align(s_ws2812_slider_r, LV_ALIGN_CENTER, 0, -40);
-    lv_obj_t *lr = lv_label_create(lv_scr_act());
+    lv_obj_set_size(s_ws2812_slider_r, 190, 15);
+    lv_obj_align(s_ws2812_slider_r, LV_ALIGN_CENTER, -4, -50);
+    UI_Theme_ApplySlider(s_ws2812_slider_r);
+    lv_obj_t *lr = lv_label_create(s_page_content);
     lv_label_set_text(lr, "R");
     lv_obj_align_to(lr, s_ws2812_slider_r, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
     // G Slider
-    s_ws2812_slider_g = lv_slider_create(lv_scr_act());
+    s_ws2812_slider_g = lv_slider_create(s_page_content);
     lv_slider_set_range(s_ws2812_slider_g, 0, 255);
-    lv_obj_set_size(s_ws2812_slider_g, 200, 15);
-    lv_obj_align(s_ws2812_slider_g, LV_ALIGN_CENTER, 0, 10);
-    lv_obj_t *lg = lv_label_create(lv_scr_act());
+    lv_obj_set_size(s_ws2812_slider_g, 190, 15);
+    lv_obj_align(s_ws2812_slider_g, LV_ALIGN_CENTER, -4, 0);
+    UI_Theme_ApplySlider(s_ws2812_slider_g);
+    lv_obj_t *lg = lv_label_create(s_page_content);
     lv_label_set_text(lg, "G");
     lv_obj_align_to(lg, s_ws2812_slider_g, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
     // B Slider
-    s_ws2812_slider_b = lv_slider_create(lv_scr_act());
+    s_ws2812_slider_b = lv_slider_create(s_page_content);
     lv_slider_set_range(s_ws2812_slider_b, 0, 255);
-    lv_obj_set_size(s_ws2812_slider_b, 200, 15);
-    lv_obj_align(s_ws2812_slider_b, LV_ALIGN_CENTER, 0, 60);
-    lv_obj_t *lb = lv_label_create(lv_scr_act());
+    lv_obj_set_size(s_ws2812_slider_b, 190, 15);
+    lv_obj_align(s_ws2812_slider_b, LV_ALIGN_CENTER, -4, 50);
+    UI_Theme_ApplySlider(s_ws2812_slider_b);
+    lv_obj_t *lb = lv_label_create(s_page_content);
     lv_label_set_text(lb, "B");
     lv_obj_align_to(lb, s_ws2812_slider_b, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
 
@@ -3016,17 +3888,16 @@ static void lvgl_app_show_ws2812_control(void)
     // 显式触发一次 apply，确保 WS2812 显示初始绿色
     lvgl_app_ws2812_apply();
 
-    lv_group_add_obj(s_group, s_ws2812_slider_r);
-    lv_group_add_obj(s_group, s_ws2812_slider_g);
-    lv_group_add_obj(s_group, s_ws2812_slider_b);
+    lvgl_app_group_add_obj(s_ws2812_slider_r);
+    lvgl_app_group_add_obj(s_ws2812_slider_g);
+    lvgl_app_group_add_obj(s_ws2812_slider_b);
 
     lv_group_set_editing(s_group, true);
 
     lv_group_focus_obj(s_ws2812_slider_r);
 
-    s_status_label = lv_label_create(lv_scr_act());
-    lv_label_set_text(s_status_label, "Select to edit, KEY2 to return");
-    lv_obj_align(s_status_label, LV_ALIGN_BOTTOM_MID, 0, -8);
+    lvgl_app_set_status("Select to edit, KEY2 to return");
+    lvgl_app_page_finish();
 }
 
 

@@ -19,6 +19,7 @@
 
 #include "lcd_spi_154.h"
 #include <stdio.h>
+#include <string.h>
 
 extern SPI_HandleTypeDef hspi6;
 
@@ -53,49 +54,47 @@ HAL_StatusTypeDef LCD_SPI_TransmitBuffer (SPI_HandleTypeDef *hspi, uint16_t *pDa
 
 static volatile uint8_t s_lcd_spi_tx_busy = 0U;
 static volatile HAL_StatusTypeDef s_lcd_spi_tx_status = HAL_OK;
+static LCD_TransferCallback_t s_lcd_spi_tx_callback = NULL;
+static void *s_lcd_spi_tx_callback_context = NULL;
 
-static uint8_t LCD_SPI_IsTcmAddress(const void *address)
+/* SPI6 is served by BDMA, which can only access the D3/SRAM4 domain.  Keep
+ * two small chunks there and copy arbitrary source frame buffers into them. */
+#define LCD_BDMA_STAGE_COUNT       2U
+#define LCD_BDMA_STAGE_PIXELS      4096U
+#define LCD_BDMA_SLOT_FREE         0U
+#define LCD_BDMA_SLOT_READY        1U
+#define LCD_BDMA_SLOT_FILLING      2U
+#define LCD_BDMA_NO_ACTIVE_SLOT    0xFFU
+
+static uint16_t s_lcd_bdma_stage[LCD_BDMA_STAGE_COUNT][LCD_BDMA_STAGE_PIXELS]
+	__attribute__((section(".ram_d3_bdma"), aligned(32)));
+static const uint16_t *s_lcd_spi_tx_source = NULL;
+static volatile uint32_t s_lcd_spi_tx_total = 0U;
+static volatile uint32_t s_lcd_spi_tx_source_pos = 0U;
+static volatile uint16_t s_lcd_bdma_slot_pixels[LCD_BDMA_STAGE_COUNT] = {0U, 0U};
+static volatile uint8_t s_lcd_bdma_slot_state[LCD_BDMA_STAGE_COUNT] = {LCD_BDMA_SLOT_FREE, LCD_BDMA_SLOT_FREE};
+static volatile uint8_t s_lcd_bdma_active_slot = LCD_BDMA_NO_ACTIVE_SLOT;
+static volatile uint8_t s_lcd_bdma_hw_busy = 0U;
+static volatile uint8_t s_lcd_spi_needs_finalize = 0U;
+
+static void LCD_SPI_CleanDCacheForBuffer(const void *address, uint32_t bytes)
 {
-	uintptr_t addr = (uintptr_t)address;
-
-	return ((addr >= 0x20000000U) && (addr < 0x20020000U)) ? 1U : 0U;
-}
-
-static uint8_t LCD_SPI_IsCacheableSramAddress(const void *address)
-{
-	uintptr_t addr = (uintptr_t)address;
-
-	if ((addr >= 0x24000000U) && (addr < 0x24080000U))
-	{
-		return 1U;
-	}
-
-	return 0U;
-}
-
-static void LCD_SPI_InvalidateDCacheForBuffer(const uint16_t *pData, uint32_t Size)
-{
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
 	uintptr_t start_addr;
 	uintptr_t end_addr;
-	uintptr_t aligned_start;
-	uintptr_t aligned_end;
 
-	if ((pData == NULL) || (Size == 0U))
+	if ((address == NULL) || (bytes == 0U) || ((SCB->CCR & SCB_CCR_DC_Msk) == 0U))
 	{
 		return;
 	}
 
-	if (LCD_SPI_IsCacheableSramAddress(pData) == 0U)
-	{
-		return;
-	}
-
-	start_addr = (uintptr_t)pData;
-	end_addr = start_addr + ((uintptr_t)Size * (uintptr_t)sizeof(uint16_t));
-	aligned_start = start_addr & ~((uintptr_t)31U);
-	aligned_end = (end_addr + 31U) & ~((uintptr_t)31U);
-
-	SCB_InvalidateDCache_by_Addr((uint32_t *)aligned_start, (int32_t)(aligned_end - aligned_start));
+	start_addr = ((uintptr_t)address) & ~((uintptr_t)31U);
+	end_addr = (((uintptr_t)address + (uintptr_t)bytes + 31U) & ~((uintptr_t)31U));
+	SCB_CleanDCache_by_Addr((uint32_t *)start_addr, (int32_t)(end_addr - start_addr));
+#else
+	(void)address;
+	(void)bytes;
+#endif
 }
 
 static HAL_StatusTypeDef LCD_SPI_SetDataSize(uint32_t data_size)
@@ -110,6 +109,8 @@ static HAL_StatusTypeDef LCD_SPI_SetDataSize(uint32_t data_size)
 }
 
 static HAL_StatusTypeDef LCD_SPI_TransmitBufferAsync(SPI_HandleTypeDef *hspi, const uint16_t *pData, uint32_t Size);
+static HAL_StatusTypeDef LCD_SPI_StartReadyChunk(void);
+static void LCD_SPI_FinalizeTransfer(void);
 
 /****************************************************************************************************************************************
 *	�� �� ��: LCD_WriteCommand
@@ -1304,22 +1305,32 @@ void	LCD_CopyBuffer(uint16_t x, uint16_t y,uint16_t width,uint16_t height,const 
 
 HAL_StatusTypeDef LCD_CopyBufferAsync(uint16_t x, uint16_t y, uint16_t width, uint16_t height, const uint16_t *DataBuff)
 {
+	return LCD_CopyBufferAsyncCallback(x, y, width, height, DataBuff, NULL, NULL);
+}
+
+HAL_StatusTypeDef LCD_CopyBufferAsyncCallback(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+											 const uint16_t *DataBuff,
+											 LCD_TransferCallback_t callback,
+											 void *context)
+{
 	HAL_StatusTypeDef status;
+	uint32_t primask;
+
+	if ((DataBuff == NULL) || (width == 0U) || (height == 0U))
+	{
+		return HAL_ERROR;
+	}
 
 	if (s_lcd_spi_tx_busy != 0U)
 	{
 		return HAL_BUSY;
 	}
 
+	LCD_SPI_FinalizeTransfer();
+
 	LCD_SetAddress(x, y, x + width - 1U, y + height - 1U);
 	LCD_CS_LOW;
 	LCD_DC_Data;
-
-	if (LCD_SPI_IsTcmAddress(DataBuff) != 0U)
-	{
-		LCD_CS_HIGH;
-		return HAL_ERROR;
-	}
 
 	status = LCD_SPI_SetDataSize(SPI_DATASIZE_16BIT);
 	if (status != HAL_OK)
@@ -1328,9 +1339,26 @@ HAL_StatusTypeDef LCD_CopyBufferAsync(uint16_t x, uint16_t y, uint16_t width, ui
 		return status;
 	}
 
+	primask = __get_PRIMASK();
+	__disable_irq();
+	s_lcd_spi_tx_callback = callback;
+	s_lcd_spi_tx_callback_context = context;
+	if (primask == 0U)
+	{
+		__enable_irq();
+	}
+
 	status = LCD_SPI_TransmitBufferAsync(&LCD_SPI, DataBuff, (uint32_t)width * (uint32_t)height);
 	if (status != HAL_OK)
 	{
+		primask = __get_PRIMASK();
+		__disable_irq();
+		s_lcd_spi_tx_callback = NULL;
+		s_lcd_spi_tx_callback_context = NULL;
+		if (primask == 0U)
+		{
+			__enable_irq();
+		}
 		(void)LCD_SPI_SetDataSize(SPI_DATASIZE_8BIT);
 		LCD_CS_HIGH;
 	}
@@ -1346,6 +1374,7 @@ HAL_StatusTypeDef LCD_WaitTransmitDone(uint32_t timeout_ms)
 	tickstart = HAL_GetTick();
 	while (s_lcd_spi_tx_busy != 0U)
 	{
+		LCD_TransferService();
 		if ((timeout_ms != HAL_MAX_DELAY) && ((HAL_GetTick() - tickstart) >= timeout_ms))
 		{
 			s_lcd_spi_tx_status = HAL_TIMEOUT;
@@ -1355,27 +1384,56 @@ HAL_StatusTypeDef LCD_WaitTransmitDone(uint32_t timeout_ms)
 	}
 
 	status = s_lcd_spi_tx_status;
-	(void)LCD_SPI_SetDataSize(SPI_DATASIZE_8BIT);
-	LCD_CS_HIGH;
+	LCD_SPI_FinalizeTransfer();
 
 	return status;
 }
 
+uint8_t LCD_IsTransmitBusy(void)
+{
+	return s_lcd_spi_tx_busy;
+}
+
 void LCD_ResetTransferState(void)
 {
-	if (s_lcd_spi_tx_busy != 0U)
+	uint32_t primask;
+	LCD_TransferCallback_t callback;
+	void *callback_context;
+
+	if (s_lcd_bdma_hw_busy != 0U)
 	{
 		(void)HAL_SPI_Abort(&LCD_SPI);
 	}
 
+	primask = __get_PRIMASK();
+	__disable_irq();
+	callback = s_lcd_spi_tx_callback;
+	callback_context = s_lcd_spi_tx_callback_context;
+	s_lcd_spi_tx_callback = NULL;
+	s_lcd_spi_tx_callback_context = NULL;
 	s_lcd_spi_tx_busy = 0U;
+	s_lcd_bdma_hw_busy = 0U;
+	s_lcd_bdma_active_slot = LCD_BDMA_NO_ACTIVE_SLOT;
+	s_lcd_bdma_slot_state[0] = LCD_BDMA_SLOT_FREE;
+	s_lcd_bdma_slot_state[1] = LCD_BDMA_SLOT_FREE;
+	s_lcd_spi_tx_source = NULL;
+	s_lcd_spi_tx_total = 0U;
+	s_lcd_spi_tx_source_pos = 0U;
 	if (s_lcd_spi_tx_status == HAL_BUSY)
 	{
 		s_lcd_spi_tx_status = HAL_OK;
 	}
+	s_lcd_spi_needs_finalize = 1U;
+	if (primask == 0U)
+	{
+		__enable_irq();
+	}
 
-	(void)LCD_SPI_SetDataSize(SPI_DATASIZE_8BIT);
-	LCD_CS_HIGH;
+	LCD_SPI_FinalizeTransfer();
+	if (callback != NULL)
+	{
+		callback(HAL_ERROR, callback_context);
+	}
 }
 
 /**********************************************************************************************************************************
@@ -1546,6 +1604,8 @@ HAL_StatusTypeDef LCD_SPI_TransmitBuffer (SPI_HandleTypeDef *hspi, uint16_t *pDa
 
 static HAL_StatusTypeDef LCD_SPI_TransmitBufferAsync(SPI_HandleTypeDef *hspi, const uint16_t *pData, uint32_t Size)
 {
+	uint32_t primask;
+
 	if ((pData == NULL) || (Size == 0UL))
 	{
 		return HAL_OK;
@@ -1556,32 +1616,214 @@ static HAL_StatusTypeDef LCD_SPI_TransmitBufferAsync(SPI_HandleTypeDef *hspi, co
 		return HAL_BUSY;
 	}
 
-	if (LCD_SPI_IsTcmAddress(pData) != 0U)
+	if (hspi != &LCD_SPI)
 	{
 		return HAL_ERROR;
 	}
 
-	LCD_SPI_InvalidateDCacheForBuffer(pData, Size);
-
+	primask = __get_PRIMASK();
+	__disable_irq();
+	s_lcd_spi_tx_source = pData;
+	s_lcd_spi_tx_total = Size;
+	s_lcd_spi_tx_source_pos = 0U;
+	s_lcd_bdma_slot_state[0] = LCD_BDMA_SLOT_FREE;
+	s_lcd_bdma_slot_state[1] = LCD_BDMA_SLOT_FREE;
+	s_lcd_bdma_slot_pixels[0] = 0U;
+	s_lcd_bdma_slot_pixels[1] = 0U;
+	s_lcd_bdma_active_slot = LCD_BDMA_NO_ACTIVE_SLOT;
+	s_lcd_bdma_hw_busy = 0U;
 	s_lcd_spi_tx_busy = 1U;
 	s_lcd_spi_tx_status = HAL_BUSY;
-
-	if (HAL_SPI_Transmit_DMA(hspi, (const uint8_t *)pData, (uint16_t)Size) != HAL_OK)
+	s_lcd_spi_needs_finalize = 1U;
+	if (primask == 0U)
 	{
-		s_lcd_spi_tx_busy = 0U;
-		s_lcd_spi_tx_status = HAL_ERROR;
+		__enable_irq();
+	}
+
+	LCD_TransferService();
+	if (s_lcd_spi_tx_status == HAL_ERROR)
+	{
 		return HAL_ERROR;
 	}
 
 	return HAL_OK;
 }
 
+static HAL_StatusTypeDef LCD_SPI_StartReadyChunk(void)
+{
+	uint8_t slot;
+
+	if (s_lcd_bdma_hw_busy != 0U)
+	{
+		return HAL_BUSY;
+	}
+
+	for (slot = 0U; slot < LCD_BDMA_STAGE_COUNT; ++slot)
+	{
+		if (s_lcd_bdma_slot_state[slot] == LCD_BDMA_SLOT_READY)
+		{
+			s_lcd_bdma_active_slot = slot;
+			s_lcd_bdma_hw_busy = 1U;
+			if (HAL_SPI_Transmit_DMA(
+					&LCD_SPI,
+					(const uint8_t *)s_lcd_bdma_stage[slot],
+					s_lcd_bdma_slot_pixels[slot]
+				) != HAL_OK)
+			{
+				s_lcd_bdma_active_slot = LCD_BDMA_NO_ACTIVE_SLOT;
+				s_lcd_bdma_hw_busy = 0U;
+				s_lcd_spi_tx_status = HAL_ERROR;
+				s_lcd_spi_tx_busy = 0U;
+				return HAL_ERROR;
+			}
+
+			return HAL_OK;
+		}
+	}
+
+	return HAL_BUSY;
+}
+
+void LCD_TransferService(void)
+{
+	uint8_t slot;
+
+	if (s_lcd_spi_tx_busy == 0U)
+	{
+		return;
+	}
+
+	for (slot = 0U; slot < LCD_BDMA_STAGE_COUNT; ++slot)
+	{
+		const uint16_t *source;
+		uint32_t source_pos;
+		uint32_t chunk_pixels;
+		uint32_t primask;
+
+		primask = __get_PRIMASK();
+		__disable_irq();
+		if ((s_lcd_bdma_slot_state[slot] != LCD_BDMA_SLOT_FREE) ||
+			(slot == s_lcd_bdma_active_slot) ||
+			(s_lcd_spi_tx_source_pos >= s_lcd_spi_tx_total))
+		{
+			if (primask == 0U)
+			{
+				__enable_irq();
+			}
+			continue;
+		}
+
+		s_lcd_bdma_slot_state[slot] = LCD_BDMA_SLOT_FILLING;
+		source_pos = s_lcd_spi_tx_source_pos;
+		chunk_pixels = s_lcd_spi_tx_total - source_pos;
+		if (chunk_pixels > LCD_BDMA_STAGE_PIXELS)
+		{
+			chunk_pixels = LCD_BDMA_STAGE_PIXELS;
+		}
+		s_lcd_spi_tx_source_pos += chunk_pixels;
+		source = &s_lcd_spi_tx_source[source_pos];
+		if (primask == 0U)
+		{
+			__enable_irq();
+		}
+
+		memcpy(s_lcd_bdma_stage[slot], source, chunk_pixels * sizeof(uint16_t));
+		LCD_SPI_CleanDCacheForBuffer(s_lcd_bdma_stage[slot], chunk_pixels * sizeof(uint16_t));
+		__DMB();
+
+		primask = __get_PRIMASK();
+		__disable_irq();
+		s_lcd_bdma_slot_pixels[slot] = (uint16_t)chunk_pixels;
+		s_lcd_bdma_slot_state[slot] = LCD_BDMA_SLOT_READY;
+		if (primask == 0U)
+		{
+			__enable_irq();
+		}
+	}
+
+	{
+		uint32_t primask = __get_PRIMASK();
+		__disable_irq();
+		(void)LCD_SPI_StartReadyChunk();
+		if (primask == 0U)
+		{
+			__enable_irq();
+		}
+	}
+}
+
+static void LCD_SPI_FinalizeTransfer(void)
+{
+	if ((s_lcd_spi_tx_busy == 0U) && (s_lcd_spi_needs_finalize != 0U))
+	{
+		(void)LCD_SPI_SetDataSize(SPI_DATASIZE_8BIT);
+		LCD_CS_HIGH;
+		s_lcd_spi_needs_finalize = 0U;
+	}
+}
+
 void HAL_SPI_TxCpltCallback(SPI_HandleTypeDef *hspi)
 {
 	if (hspi->Instance == LCD_SPI.Instance)
 	{
-		s_lcd_spi_tx_status = HAL_OK;
-		s_lcd_spi_tx_busy = 0U;
+		uint8_t slot = s_lcd_bdma_active_slot;
+		uint8_t any_pending = 0U;
+		uint8_t index;
+
+		if (slot < LCD_BDMA_STAGE_COUNT)
+		{
+			s_lcd_bdma_slot_state[slot] = LCD_BDMA_SLOT_FREE;
+			s_lcd_bdma_slot_pixels[slot] = 0U;
+		}
+		s_lcd_bdma_active_slot = LCD_BDMA_NO_ACTIVE_SLOT;
+		s_lcd_bdma_hw_busy = 0U;
+
+		{
+			HAL_StatusTypeDef start_status = LCD_SPI_StartReadyChunk();
+
+			if (start_status == HAL_OK)
+			{
+				return;
+			}
+
+			if (start_status == HAL_ERROR)
+			{
+				LCD_TransferCallback_t callback = s_lcd_spi_tx_callback;
+				void *callback_context = s_lcd_spi_tx_callback_context;
+
+				s_lcd_spi_tx_callback = NULL;
+				s_lcd_spi_tx_callback_context = NULL;
+				if (callback != NULL)
+				{
+					callback(HAL_ERROR, callback_context);
+				}
+				return;
+			}
+		}
+
+		for (index = 0U; index < LCD_BDMA_STAGE_COUNT; ++index)
+		{
+			if (s_lcd_bdma_slot_state[index] != LCD_BDMA_SLOT_FREE)
+			{
+				any_pending = 1U;
+				break;
+			}
+		}
+
+		if ((s_lcd_spi_tx_source_pos >= s_lcd_spi_tx_total) && (any_pending == 0U))
+		{
+			LCD_TransferCallback_t callback = s_lcd_spi_tx_callback;
+			void *callback_context = s_lcd_spi_tx_callback_context;
+
+			s_lcd_spi_tx_callback = NULL;
+			s_lcd_spi_tx_callback_context = NULL;
+			s_lcd_spi_tx_status = HAL_OK;
+			s_lcd_spi_tx_busy = 0U;
+			if (callback != NULL)
+			{
+				callback(HAL_OK, callback_context);
+			}
+		}
 	}
 }
 
@@ -1589,13 +1831,23 @@ void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi)
 {
 	if (hspi->Instance == LCD_SPI.Instance)
 	{
+		LCD_TransferCallback_t callback = s_lcd_spi_tx_callback;
+		void *callback_context = s_lcd_spi_tx_callback_context;
+
+		s_lcd_spi_tx_callback = NULL;
+		s_lcd_spi_tx_callback_context = NULL;
+		s_lcd_bdma_hw_busy = 0U;
+		s_lcd_bdma_active_slot = LCD_BDMA_NO_ACTIVE_SLOT;
 		s_lcd_spi_tx_status = HAL_ERROR;
 		s_lcd_spi_tx_busy = 0U;
+		if (callback != NULL)
+		{
+			callback(HAL_ERROR, callback_context);
+		}
 	}
 }
 
 /*****************************************************************************************************************************************************************************************************************************************************************************/
 // ʵ��ƽ̨�� STM32H743���İ�
 //
-
 

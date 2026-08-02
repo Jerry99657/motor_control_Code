@@ -3,39 +3,24 @@
 #include "fatfs.h"
 #include "lcd_spi_154.h"
 #include "main.h"
+#include "media_control.h"
+#include "media_memory.h"
 #include "mjpeg_scheduler.h"
 #include "qspi_start_anim.h"
 #include <stdio.h>
 #include <string.h>
 
 #define SD_START_ANIM_MAX_FRAME_BYTES (LCD_Width * LCD_Height * 2U)
-#define SD_START_ANIM_FRAME_BUFFER_COUNT 1U
 #define SD_START_ANIM_READ_CHUNK_BYTES  (32U * 1024U)
-#define SD_START_ANIM_STAGE_BYTES       4096U
 #define SD_START_ANIM_SEEK_STEP_FRAMES  10U
-#define SD_START_ANIM_SEEK_REPEAT_START 500U
-#define SD_START_ANIM_SEEK_REPEAT_STEP  300U
 /* SD playback can run faster than the source encoding without changing the
  * generated frame rate. Keep this conservative to avoid starving the LCD/SD path. */
 #define SD_START_ANIM_PLAYBACK_SPEED_NUM  8U
 #define SD_START_ANIM_PLAYBACK_SPEED_DEN  1U
 
-typedef enum
-{
-  SD_PLAYBACK_ACTION_NONE = 0,
-  SD_PLAYBACK_ACTION_STOP,
-  SD_PLAYBACK_ACTION_SEEK_BACK,
-  SD_PLAYBACK_ACTION_SEEK_FWD
-} sd_playback_action_t;
-
-static uint8_t s_frame_buffers[SD_START_ANIM_FRAME_BUFFER_COUNT][SD_START_ANIM_MAX_FRAME_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
-static uint8_t s_sd_read_stage[SD_START_ANIM_STAGE_BYTES] __attribute__((aligned(32)));
 static FRESULT s_sd_last_read_fr = FR_OK;
 static UINT s_sd_last_read_len = 0U;
 static UINT s_sd_last_read_req = 0U;
-static sd_playback_action_t s_seek_active_action = SD_PLAYBACK_ACTION_NONE;
-static uint32_t s_seek_press_tick = 0U;
-static uint32_t s_seek_last_repeat_tick = 0U;
 
 static void SD_StartAnim_Log(const char *msg)
 {
@@ -63,75 +48,6 @@ static void SD_StartAnim_LogReadFail(const char *tag)
   }
 }
 
-static uint8_t sd_playback_stop_requested(void)
-{
-  return (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
-}
-
-static void sd_playback_reset_seek_state(void)
-{
-  s_seek_active_action = SD_PLAYBACK_ACTION_NONE;
-  s_seek_press_tick = 0U;
-  s_seek_last_repeat_tick = 0U;
-}
-
-static sd_playback_action_t sd_playback_get_action(void)
-{
-  uint8_t left_pressed;
-  uint8_t right_pressed;
-  sd_playback_action_t active_action;
-  uint32_t now;
-
-  if (sd_playback_stop_requested() != 0U)
-  {
-    return SD_PLAYBACK_ACTION_STOP;
-  }
-
-  left_pressed = (HAL_GPIO_ReadPin(Key_Left_GPIO_Port, Key_Left_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
-  right_pressed = (HAL_GPIO_ReadPin(Key_Right_GPIO_Port, Key_Right_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
-
-  if ((left_pressed == 0U) && (right_pressed == 0U))
-  {
-    sd_playback_reset_seek_state();
-    return SD_PLAYBACK_ACTION_NONE;
-  }
-
-  if ((left_pressed != 0U) && (right_pressed == 0U))
-  {
-    active_action = SD_PLAYBACK_ACTION_SEEK_BACK;
-  }
-  else if ((right_pressed != 0U) && (left_pressed == 0U))
-  {
-    active_action = SD_PLAYBACK_ACTION_SEEK_FWD;
-  }
-  else
-  {
-    return SD_PLAYBACK_ACTION_NONE;
-  }
-
-  now = HAL_GetTick();
-  if (s_seek_active_action != active_action)
-  {
-    s_seek_active_action = active_action;
-    s_seek_press_tick = now;
-    s_seek_last_repeat_tick = now;
-    return active_action;
-  }
-
-  if ((now - s_seek_press_tick) < SD_START_ANIM_SEEK_REPEAT_START)
-  {
-    return SD_PLAYBACK_ACTION_NONE;
-  }
-
-  if ((now - s_seek_last_repeat_tick) >= SD_START_ANIM_SEEK_REPEAT_STEP)
-  {
-    s_seek_last_repeat_tick = now;
-    return active_action;
-  }
-
-  return SD_PLAYBACK_ACTION_NONE;
-}
-
 static int8_t sd_seek_to_frame(FIL *file, const QSPI_StartAnimInfo *info, uint16_t frame_index)
 {
   FRESULT fr;
@@ -152,9 +68,9 @@ static int8_t sd_seek_to_frame(FIL *file, const QSPI_StartAnimInfo *info, uint16
   return SD_START_ANIM_OK;
 }
 
-static int8_t sd_wait_for_playback_action(uint32_t wait_ms, sd_playback_action_t *action)
+static int8_t sd_wait_for_playback_action(uint32_t wait_ms, media_control_action_t *action)
 {
-  sd_playback_action_t current_action;
+  media_control_action_t current_action;
   uint32_t start_ms;
 
   if (action == NULL)
@@ -166,22 +82,31 @@ static int8_t sd_wait_for_playback_action(uint32_t wait_ms, sd_playback_action_t
 
   for (;;)
   {
-    current_action = sd_playback_get_action();
-    if (current_action == SD_PLAYBACK_ACTION_STOP)
+    current_action = MediaControl_Poll();
+    if ((current_action != MEDIA_CONTROL_NONE) ||
+        (MediaControl_IsPaused() != 0U))
     {
+      if (current_action == MEDIA_CONTROL_NONE)
+      {
+        current_action = MEDIA_CONTROL_PAUSE_CHANGED;
+      }
       *action = current_action;
       return SD_START_ANIM_OK;
     }
 
-    if ((current_action == SD_PLAYBACK_ACTION_SEEK_BACK) || (current_action == SD_PLAYBACK_ACTION_SEEK_FWD))
+    if (MediaControl_IsSeekHeld() != 0U)
     {
-      *action = current_action;
-      return SD_START_ANIM_OK;
+      /* Do not let normal playback advance against a held seek key. */
+      (void)MJPEG_Scheduler_ConsumeFrameTick();
+      start_ms = HAL_GetTick();
+      LCD_TransferService();
+      HAL_Delay(1U);
+      continue;
     }
 
     if (MJPEG_Scheduler_ConsumeFrameTick() != 0U)
     {
-      *action = SD_PLAYBACK_ACTION_NONE;
+      *action = MEDIA_CONTROL_NONE;
       return SD_START_ANIM_OK;
     }
 
@@ -190,11 +115,35 @@ static int8_t sd_wait_for_playback_action(uint32_t wait_ms, sd_playback_action_t
       break;
     }
 
+    LCD_TransferService();
     HAL_Delay(1U);
   }
 
-  *action = SD_PLAYBACK_ACTION_NONE;
+  *action = MEDIA_CONTROL_NONE;
   return SD_START_ANIM_OK;
+}
+
+static media_control_action_t sd_wait_while_paused(void)
+{
+  media_control_action_t action;
+
+  MediaControl_ShowPausedHud();
+  while (MediaControl_IsPaused() != 0U)
+  {
+    action = MediaControl_Poll();
+    if ((action == MEDIA_CONTROL_STOP) ||
+        (action == MEDIA_CONTROL_BACK) ||
+        (action == MEDIA_CONTROL_SEEK_BACK) ||
+        (action == MEDIA_CONTROL_SEEK_FORWARD))
+    {
+      return action;
+    }
+
+    LCD_TransferService();
+    HAL_Delay(1U);
+  }
+
+  return MEDIA_CONTROL_PAUSE_CHANGED;
 }
 
 static int8_t sd_read_exact(FIL *file, uint8_t *buffer, uint32_t bytes_to_read)
@@ -211,36 +160,23 @@ static int8_t sd_read_exact(FIL *file, uint8_t *buffer, uint32_t bytes_to_read)
   remain = bytes_to_read;
   while (remain > 0U)
   {
-    uint32_t outer_chunk = (remain > SD_START_ANIM_READ_CHUNK_BYTES) ? SD_START_ANIM_READ_CHUNK_BYTES : remain;
-    uint32_t outer_remain = outer_chunk;
+    UINT chunk = (UINT)((remain > SD_START_ANIM_READ_CHUNK_BYTES) ? SD_START_ANIM_READ_CHUNK_BYTES : remain);
 
-    while (outer_remain > 0U)
+    s_sd_last_read_req = chunk;
+    s_sd_last_read_len = 0U;
+    s_sd_last_read_fr = FR_OK;
+
+    fr = f_read(file, buffer, chunk, &read_len);
+    s_sd_last_read_fr = fr;
+    s_sd_last_read_len = read_len;
+
+    if ((fr != FR_OK) || (read_len != chunk))
     {
-      UINT chunk = (UINT)((outer_remain > SD_START_ANIM_STAGE_BYTES) ? SD_START_ANIM_STAGE_BYTES : outer_remain);
-
-      s_sd_last_read_req = chunk;
-      s_sd_last_read_len = 0U;
-      s_sd_last_read_fr = FR_OK;
-
-      fr = f_read(file, s_sd_read_stage, chunk, &read_len);
-      s_sd_last_read_fr = fr;
-      s_sd_last_read_len = read_len;
-
-      if (fr != FR_OK)
-      {
-        return SD_START_ANIM_ERR_IO;
-      }
-
-      if (read_len != chunk)
-      {
-        return SD_START_ANIM_ERR_IO;
-      }
-
-      memcpy(buffer, s_sd_read_stage, read_len);
-      buffer += read_len;
-      outer_remain -= (uint32_t)read_len;
-      remain -= (uint32_t)read_len;
+      return SD_START_ANIM_ERR_IO;
     }
+
+    buffer += read_len;
+    remain -= (uint32_t)read_len;
   }
 
   return SD_START_ANIM_OK;
@@ -348,10 +284,12 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
   uint16_t x;
   uint16_t y;
   uint16_t frame_index;
-  sd_playback_action_t playback_action;
+  media_control_action_t playback_action;
   uint8_t *current_frame_buffer;
   uint8_t use_async_lcd = 1U;
+  uint8_t lcd_transfer_pending = 0U;
   uint32_t playback_delay_ms;
+  uint32_t media_capacity = 0U;
 
   if ((file_path == NULL) || (file_path[0] == '\0'))
   {
@@ -430,22 +368,39 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
     return SD_START_ANIM_ERR_IO;
   }
 
+  current_frame_buffer = MediaMemory_Acquire(
+    MEDIA_MEMORY_OWNER_SD_ANIM,
+    info.frame_size_bytes,
+    &media_capacity
+  );
+  if ((current_frame_buffer == NULL) || (media_capacity < info.frame_size_bytes))
+  {
+    (void)f_close(&file);
+    (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
+    return SD_START_ANIM_ERR_BUSY;
+  }
+
   x = (uint16_t)((LCD_Width - info.width) / 2U);
   y = (uint16_t)((LCD_Height - info.height) / 2U);
 
   LCD_SetBackColor(LCD_BLACK);
   LCD_Clear();
 
-  current_frame_buffer = s_frame_buffers[0];
   status = SD_START_ANIM_OK;
   frame_index = 0U;
-  sd_playback_reset_seek_state();
+  MediaControl_Init();
 
   while (frame_index < info.frame_count)
   {
-    if (sd_playback_stop_requested() != 0U)
+    playback_action = MediaControl_Poll();
+    if (playback_action == MEDIA_CONTROL_STOP)
     {
       status = SD_START_ANIM_ERR_STOPPED;
+      break;
+    }
+    if (playback_action == MEDIA_CONTROL_BACK)
+    {
+      status = SD_START_ANIM_ERR_BACK;
       break;
     }
 
@@ -472,12 +427,9 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
         use_async_lcd = 0U;
         LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)current_frame_buffer);
       }
-      else if (LCD_WaitTransmitDone(1000U) != HAL_OK)
+      else
       {
-        SD_StartAnim_Log("SDA: lcd async wait fail->sync\r\n");
-        LCD_ResetTransferState();
-        use_async_lcd = 0U;
-        LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)current_frame_buffer);
+        lcd_transfer_pending = 1U;
       }
     }
     else
@@ -485,26 +437,44 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
       LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)current_frame_buffer);
     }
 
-    if (sd_playback_stop_requested() != 0U)
-    {
-      status = SD_START_ANIM_ERR_STOPPED;
-      break;
-    }
-
-    playback_action = SD_PLAYBACK_ACTION_NONE;
+    playback_action = MEDIA_CONTROL_NONE;
     if (sd_wait_for_playback_action(playback_delay_ms, &playback_action) != SD_START_ANIM_OK)
     {
       status = SD_START_ANIM_ERR_IO;
       break;
     }
 
-    if (playback_action == SD_PLAYBACK_ACTION_STOP)
+    if (lcd_transfer_pending != 0U)
+    {
+      if (LCD_WaitTransmitDone(1000U) != HAL_OK)
+      {
+        SD_StartAnim_Log("SDA: lcd async wait fail->sync\r\n");
+        LCD_ResetTransferState();
+        use_async_lcd = 0U;
+        LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)current_frame_buffer);
+      }
+      lcd_transfer_pending = 0U;
+    }
+
+    if ((playback_action == MEDIA_CONTROL_PAUSE_CHANGED) &&
+        (MediaControl_IsPaused() != 0U))
+    {
+      playback_action = sd_wait_while_paused();
+    }
+
+    if (playback_action == MEDIA_CONTROL_STOP)
     {
       status = SD_START_ANIM_ERR_STOPPED;
       break;
     }
 
-    if (playback_action == SD_PLAYBACK_ACTION_SEEK_BACK)
+    if (playback_action == MEDIA_CONTROL_BACK)
+    {
+      status = SD_START_ANIM_ERR_BACK;
+      break;
+    }
+
+    if (playback_action == MEDIA_CONTROL_SEEK_BACK)
     {
       if (frame_index > SD_START_ANIM_SEEK_STEP_FRAMES)
       {
@@ -518,7 +488,7 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
       continue;
     }
 
-    if (playback_action == SD_PLAYBACK_ACTION_SEEK_FWD)
+    if (playback_action == MEDIA_CONTROL_SEEK_FORWARD)
     {
       if ((uint32_t)frame_index + SD_START_ANIM_SEEK_STEP_FRAMES < (uint32_t)info.frame_count)
       {
@@ -543,6 +513,17 @@ int8_t SD_StartAnim_PlayFile(const char *file_path)
   {
     SD_StartAnim_Log("SDA: stop by key2\r\n");
   }
+  else if (status == SD_START_ANIM_ERR_BACK)
+  {
+    SD_StartAnim_Log("SDA: return by key3\r\n");
+  }
+
+  if (lcd_transfer_pending != 0U)
+  {
+    (void)LCD_WaitTransmitDone(1000U);
+  }
+
+  MediaMemory_Release(MEDIA_MEMORY_OWNER_SD_ANIM);
 
   (void)f_close(&file);
   (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);

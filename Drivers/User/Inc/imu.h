@@ -48,6 +48,9 @@ typedef struct{
 
 void imu_init(void);
 eulerian_angles_t imu_get_eulerian_angles(float gx, float gy, float gz, float ax, float ay, float az);
+eulerian_angles_t imu_update_eulerian_angles(float gx, float gy, float gz,
+                                             float ax, float ay, float az,
+                                             float dt_seconds);
 void imu_data_calibration(short *gx, short *gy, short *gz, short *ax, short *ay, short *az);
 
 #endif

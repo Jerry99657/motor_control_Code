@@ -23,7 +23,12 @@ static volatile uint8_t _ws2812_dma_busy = 0;
 void ws2812_update(void)
 {
 	// 数据缓冲，每个LED占用24个半字，共12个LED，前100个半字用于复位信号
-	static uint16_t ws2812_data[RST_PERIOD_NUM + WS2812_NUM * 24];
+	/* Keep reset-low periods at both ends. The DMA completion interrupt fires
+	 * when the last compare value is written, before that PWM period has
+	 * finished on the pin. The trailing reset area guarantees that all 24 data
+	 * bits have been emitted and latched before the timer is stopped. */
+	static uint16_t ws2812_data[(2U * RST_PERIOD_NUM) + (WS2812_NUM * 24U)]
+		__attribute__((section(".ram_d2"), aligned(32)));
 
 	/* 如果上一次 DMA 还在跑，先等它完成或超时后强制终止 */
 	if (_ws2812_dma_busy)
@@ -31,13 +36,14 @@ void ws2812_update(void)
 		ws2812_wait_dma(50);
 		if (_ws2812_dma_busy)
 		{
+			__HAL_TIM_DISABLE_DMA(&htim15, TIM_DMA_UPDATE);
 			HAL_TIM_PWM_Stop_DMA(&htim15, TIM_CHANNEL_2);
 			_ws2812_dma_busy = 0;
 		}
 	}
 
 	// 显式清零复位脉冲区域（防止前次传输残留）
-	memset(ws2812_data, 0, RST_PERIOD_NUM * sizeof(uint16_t));
+	memset(ws2812_data, 0, sizeof(ws2812_data));
 
 	for (uint8_t led_id = 0; led_id < WS2812_NUM; led_id++)
 	{
@@ -53,9 +59,10 @@ void ws2812_update(void)
 		}
 	}
 	// 标记为忙，DMA 传输将在完成回调中清除该标志
+	__HAL_TIM_DISABLE_DMA(&htim15, TIM_DMA_UPDATE);
 	_ws2812_dma_busy = 1;
 	if (HAL_TIM_PWM_Start_DMA(&htim15, TIM_CHANNEL_2, (uint32_t *)ws2812_data,
-							  RST_PERIOD_NUM + WS2812_NUM * 24) != HAL_OK)
+							  (2U * RST_PERIOD_NUM) + (WS2812_NUM * 24U)) != HAL_OK)
 	{
 		/* 启动 DMA 失败，清除忙标志以防死锁 */
 		_ws2812_dma_busy = 0;
@@ -95,6 +102,7 @@ void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim)
 	if (htim == &htim15)
 	{
 		_ws2812_dma_busy = 0;
+		__HAL_TIM_DISABLE_DMA(htim, TIM_DMA_UPDATE);
 		/* 停止 DMA，以便下一次安全启动（HAL 会在回调时已经处理好状态，但显式停止更稳妥�?*/
 		HAL_TIM_PWM_Stop_DMA(htim, TIM_CHANNEL_2);
 	}
@@ -203,6 +211,7 @@ void ws2812_set_all_white(float brightness)
 void ws2812_Init(void)
 {
   /* Stop any ongoing transfer */
+  __HAL_TIM_DISABLE_DMA(&htim15, TIM_DMA_UPDATE);
   HAL_TIM_PWM_Stop_DMA(&htim15, TIM_CHANNEL_2);
   _ws2812_dma_busy = 0;
 

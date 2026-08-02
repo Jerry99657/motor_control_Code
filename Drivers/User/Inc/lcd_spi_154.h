@@ -105,8 +105,15 @@ void 	LCD_DrawImage(uint16_t x,uint16_t y,uint16_t width,uint16_t height,const u
 
 //>>>>>	�������ƺ�����ֱ�ӽ����ݸ��Ƶ���Ļ���Դ�
 void	LCD_CopyBuffer(uint16_t x, uint16_t y,uint16_t width,uint16_t height,const uint16_t *DataBuff);
+typedef void (*LCD_TransferCallback_t)(HAL_StatusTypeDef status, void *context);
 HAL_StatusTypeDef LCD_CopyBufferAsync(uint16_t x, uint16_t y, uint16_t width, uint16_t height, const uint16_t *DataBuff);
+HAL_StatusTypeDef LCD_CopyBufferAsyncCallback(uint16_t x, uint16_t y, uint16_t width, uint16_t height,
+                                             const uint16_t *DataBuff,
+                                             LCD_TransferCallback_t callback,
+                                             void *context);
 HAL_StatusTypeDef LCD_WaitTransmitDone(uint32_t timeout_ms);
+void LCD_TransferService(void);
+uint8_t LCD_IsTransmitBusy(void);
 void LCD_ResetTransferState(void);
 
  /*--------------------------------------------- LCD�������� -----------------------------------------------*/

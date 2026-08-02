@@ -89,10 +89,10 @@
  ***********************************************************************************/
  
 /* Ĭ�ϵ���ʾˢ�����ڡ�LVGLʹ����������ػ��޸Ĺ������� */
-#define LV_DISP_DEF_REFR_PERIOD             4      /*[ms]*/
+#define LV_DISP_DEF_REFR_PERIOD             16     /*[ms]*/
 
 /* �����豸�Ķ�ȡ����(�Ժ���Ϊ��λ) */
-#define LV_INDEV_DEF_READ_PERIOD            4     /*[ms]*/
+#define LV_INDEV_DEF_READ_PERIOD            10    /*[ms]*/
 
 /* ʹ���Զ���tickԴ���Ժ���Ϊ��λ��������ʱ�䡣������Ҫ�ֶ����� `lv_tick_inc()` */
 #define LV_TICK_CUSTOM                      0

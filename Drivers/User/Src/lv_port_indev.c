@@ -5,11 +5,12 @@
 static lv_indev_t *s_keypad = NULL;
 
 #define LV_PORT_LR_REPEAT_START_MS 500U
-#define LV_PORT_LR_REPEAT_STEP_MS  300U
+#define LV_PORT_LR_REPEAT_STEP_MS  250U
 
 static uint32_t s_lr_active_key = 0U;
 static uint32_t s_lr_press_tick = 0U;
 static uint32_t s_lr_last_repeat_tick = 0U;
+static volatile uint8_t s_suppress_exit_keys = 0U;
 
 static uint8_t lv_port_key_is_pressed(GPIO_TypeDef *port, uint16_t pin)
 {
@@ -22,6 +23,17 @@ static uint32_t lv_port_key_get_code(void)
     uint8_t right_pressed;
     uint32_t lr_key;
     uint32_t now;
+
+    if (s_suppress_exit_keys != 0U)
+    {
+        if ((lv_port_key_is_pressed(Key2_GPIO_Port, Key2_Pin) != 0U) ||
+            (lv_port_key_is_pressed(Key3_GPIO_Port, Key3_Pin) != 0U))
+        {
+            return 0U;
+        }
+
+        s_suppress_exit_keys = 0U;
+    }
 
     if (lv_port_key_is_pressed(Key2_GPIO_Port, Key2_Pin) != 0U)
     {
@@ -128,4 +140,18 @@ void lv_port_indev_init(void)
 lv_indev_t *lv_port_indev_get_keypad(void)
 {
     return s_keypad;
+}
+
+void lv_port_indev_suppress_exit_keys_until_release(void)
+{
+    s_suppress_exit_keys = 1U;
+}
+
+void lv_port_indev_suppress_all_keys_until_release(void)
+{
+    s_lr_active_key = 0U;
+    if (s_keypad != NULL)
+    {
+        lv_indev_wait_release(s_keypad);
+    }
 }

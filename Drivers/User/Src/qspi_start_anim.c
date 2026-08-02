@@ -1,26 +1,15 @@
 #include "qspi_start_anim.h"
 
 #include "lcd_spi_154.h"
+#include "media_memory.h"
 #include "mjpeg_scheduler.h"
 #include "qspi_w25q64.h"
 
 #define QSPI_START_ANIM_MAX_FRAME_BYTES (LCD_Width * LCD_Height * 2U)
 
-static uint8_t s_anim_frame_buffer[QSPI_START_ANIM_MAX_FRAME_BYTES];
-
 static void QSPI_StartAnim_Log(const char *msg)
 {
   Boot_DebugStageLog(msg);
-}
-
-uint8_t *QSPI_StartAnim_GetFrameBuffer(uint32_t *buffer_size_bytes)
-{
-  if (buffer_size_bytes != NULL)
-  {
-    *buffer_size_bytes = QSPI_START_ANIM_MAX_FRAME_BYTES;
-  }
-
-  return s_anim_frame_buffer;
 }
 
 static uint16_t read_u16_le(const uint8_t *p)
@@ -59,6 +48,7 @@ static void qspi_wait_frame_pace(uint32_t wait_ms)
       return;
     }
 
+    LCD_TransferService();
     HAL_Delay(1U);
   }
 }
@@ -150,6 +140,10 @@ int8_t QSPI_StartAnim_Play(void)
   uint16_t y;
   uint32_t frame_addr;
   uint32_t target_delay_ms;
+  uint8_t use_async_lcd = 1U;
+  uint8_t lcd_transfer_pending = 0U;
+  uint8_t *frame_buffer;
+  uint32_t media_capacity = 0U;
 
   QSPI_StartAnim_Log("QSA: enter\r\n");
 
@@ -178,19 +172,46 @@ int8_t QSPI_StartAnim_Play(void)
     return QSPI_START_ANIM_ERR_QSPI;
   }
 
+  frame_buffer = MediaMemory_Acquire(
+    MEDIA_MEMORY_OWNER_QSPI_ANIM,
+    info.frame_size_bytes,
+    &media_capacity
+  );
+  if ((frame_buffer == NULL) || (media_capacity < info.frame_size_bytes))
+  {
+    return QSPI_START_ANIM_ERR_BUSY;
+  }
+
   LCD_SetBackColor(LCD_BLACK);
   LCD_Clear();
 
   for (frame_index = 0; frame_index < info.frame_count; )
   {
     frame_addr = QSPI_START_ANIM_BASE_ADDR + info.data_offset_bytes + ((uint32_t)frame_index * info.frame_size_bytes);
-    if (QSPI_W25Qxx_ReadBuffer(s_anim_frame_buffer, frame_addr, info.frame_size_bytes) != QSPI_W25QXX_OK)
+    if (QSPI_W25Qxx_ReadBuffer(frame_buffer, frame_addr, info.frame_size_bytes) != QSPI_W25QXX_OK)
     {
       QSPI_StartAnim_Log("QSA: frame read fail\r\n");
-      return QSPI_START_ANIM_ERR_QSPI;
+      status = QSPI_START_ANIM_ERR_QSPI;
+      goto cleanup;
     }
 
-    LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)s_anim_frame_buffer);
+    if (use_async_lcd != 0U)
+    {
+      if (LCD_CopyBufferAsync(x, y, info.width, info.height, (const uint16_t *)frame_buffer) == HAL_OK)
+      {
+        lcd_transfer_pending = 1U;
+      }
+      else
+      {
+        LCD_ResetTransferState();
+        use_async_lcd = 0U;
+        LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)frame_buffer);
+      }
+    }
+    else
+    {
+      LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)frame_buffer);
+    }
 
     frame_index++;
 
@@ -198,6 +219,26 @@ int8_t QSPI_StartAnim_Play(void)
     {
       qspi_wait_frame_pace(target_delay_ms + 10U);
     }
+
+    if (lcd_transfer_pending != 0U)
+    {
+      if (LCD_WaitTransmitDone(1000U) != HAL_OK)
+      {
+        LCD_ResetTransferState();
+        use_async_lcd = 0U;
+        LCD_CopyBuffer(x, y, info.width, info.height, (const uint16_t *)frame_buffer);
+      }
+      lcd_transfer_pending = 0U;
+    }
+  }
+
+  status = QSPI_START_ANIM_OK;
+
+cleanup:
+  MediaMemory_Release(MEDIA_MEMORY_OWNER_QSPI_ANIM);
+  if (status != QSPI_START_ANIM_OK)
+  {
+    return status;
   }
 
   QSPI_StartAnim_Log("QSA: ok\r\n");

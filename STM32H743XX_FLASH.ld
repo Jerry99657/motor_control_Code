@@ -227,6 +227,15 @@ SECTIONS
   } >DTCMRAM
   PROVIDE( __non_tls_bss_start = ADDR(.bss) );
 
+  /* Full-frame RGB565 storage shared by mutually exclusive media players. */
+  .media_pool (NOLOAD) : ALIGN(32)
+  {
+    . = ALIGN(32);
+    *(.media_pool)
+    *(.media_pool*)
+    . = ALIGN(32);
+  } >RAM
+
   .ram_d2 (NOLOAD) : ALIGN(32)
   {
     . = ALIGN(32);
@@ -234,6 +243,16 @@ SECTIONS
     *(.ram_d2*)
     . = ALIGN(32);
   } >RAM_D2
+
+  /* SPI6 uses BDMA in the D3 domain.  Only buffers placed in SRAM4 are
+     directly reachable by BDMA. */
+  .ram_d3_bdma (NOLOAD) : ALIGN(32)
+  {
+    . = ALIGN(32);
+    *(.ram_d3_bdma)
+    *(.ram_d3_bdma*)
+    . = ALIGN(32);
+  } >RAM_D3
 
   PROVIDE( __bss_start = __tbss_start );
   PROVIDE( __bss_size = __bss_end - __bss_start );

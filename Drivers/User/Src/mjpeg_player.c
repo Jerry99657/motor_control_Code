@@ -3,11 +3,18 @@
 #include "fatfs.h"
 #include "lcd_spi_154.h"
 #include "main.h"
+#include "media_control.h"
+#include "media_memory.h"
 #include "jpeg_utils.h"
 #include "mjpeg_scheduler.h"
+#include "sd_diskio.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
+
+#if (JPEG_RGB_FORMAT != JPEG_RGB565)
+#error "MJPEG player requires jpeg_utils RGB565 output"
+#endif
 
 #define MJPEG_PLAYER_DEFAULT_FRAME_MS     33U
 #define MJPEG_PLAYER_SCAN_CHUNK_SIZE      1024U
@@ -43,6 +50,9 @@
 #define MJPEG_ITER_AVI_STACK_DEPTH 4U
 #define MJPEG_PLAYER_MAX_CONSEC_FRAME_ERRORS 8U
 #define MJPEG_PLAYER_STREAM_EVAL_FRAMES   8U
+#define MJPEG_PLAYER_SEEK_STEP_FRAMES     10U
+#define MJPEG_PLAYER_SEEK_HISTORY_SIZE    32U
+#define MJPEG_PLAYER_FRAME_DEFERRED        1
 
 typedef enum
 {
@@ -67,6 +77,14 @@ typedef struct
   uint8_t has_target_stream;
   uint8_t target_stream_id;
 } mjpeg_avi_iter_t;
+
+typedef struct
+{
+  uint32_t frame_index;
+  uint32_t file_pos;
+  mjpeg_avi_iter_t avi_iter;
+  uint8_t valid;
+} mjpeg_seek_snapshot_t;
 
 typedef struct
 {
@@ -96,7 +114,8 @@ typedef struct
 extern JPEG_HandleTypeDef hjpeg;
 extern DMA2D_HandleTypeDef hdma2d;
 
-static uint8_t s_mjpeg_frame_io_buffer[MJPEG_PLAYER_MAX_FRAME_BYTES] __attribute__((aligned(32)));
+static uint8_t *s_mjpeg_frame_io_buffer = NULL;
+static uint32_t s_mjpeg_frame_io_capacity = 0U;
 static uint8_t s_mjpeg_ycbcr_buffer[MJPEG_PLAYER_MAX_YCBCR_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
 static uint8_t s_mjpeg_dma_stage_buffer[MJPEG_PLAYER_JPEG_STAGE_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
 static uint8_t s_mjpeg_dma_out_chunk[MJPEG_PLAYER_JPEG_OUT_CHUNK_BYTES] __attribute__((section(".ram_d2"), aligned(32)));
@@ -106,6 +125,14 @@ static uint32_t s_mjpeg_dht_inject_log_count = 0U;
 static uint32_t s_mjpeg_aligned_len_log_count = 0U;
 static uint8_t s_mjpeg_jpeg_tables_ready = 0U;
 static mjpeg_dma_decode_ctx_t s_mjpeg_dma_ctx;
+static uint32_t s_mjpeg_pipeline_frame_interval_ms = MJPEG_PLAYER_DEFAULT_FRAME_MS;
+static uint8_t s_mjpeg_pipeline_display_pending = 0U;
+static uint8_t s_mjpeg_pipeline_frame_started = 0U;
+static uint8_t s_mjpeg_pipeline_async_lcd = 1U;
+static uint8_t s_mjpeg_seek_decode_pending = 0U;
+static volatile uint8_t s_mjpeg_last_fs_error = (uint8_t)FR_OK;
+static media_control_action_t s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
+static mjpeg_seek_snapshot_t s_mjpeg_seek_history[MJPEG_PLAYER_SEEK_HISTORY_SIZE];
 
 static void mjpeg_log_value(const char *prefix, int32_t value);
 static void mjpeg_log_hex32(const char *prefix, uint32_t value);
@@ -205,10 +232,33 @@ static uint32_t mjpeg_jpeg_mcu_input_size(const JPEG_ConfTypeDef *info)
   return 192U;
 }
 
+static uint8_t mjpeg_frame_geometry_fits(uint32_t width, uint32_t height)
+{
+  uint32_t row_bytes;
+
+  if ((width == 0U) || (height == 0U) ||
+      (width > LCD_Width) || (height > LCD_Height) ||
+      (s_mjpeg_frame_io_buffer == NULL))
+  {
+    return 0U;
+  }
+
+  row_bytes = width * 2U;
+  if ((row_bytes == 0U) || (height > (s_mjpeg_frame_io_capacity / row_bytes)))
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
 static int8_t mjpeg_flush_dma_stage(void)
 {
   uint32_t consumed_bytes;
+  uint32_t converter_reported_bytes;
   uint32_t converted_blocks;
+  uint32_t requested_blocks;
+  uint32_t remaining_blocks;
 
   if ((s_mjpeg_dma_ctx.convert_ready == 0U) || (s_mjpeg_dma_ctx.convert_func == NULL) || (s_mjpeg_dma_ctx.convert_block_size == 0U))
   {
@@ -221,18 +271,49 @@ static int8_t mjpeg_flush_dma_stage(void)
   }
 
   consumed_bytes = s_mjpeg_dma_ctx.out_len - (s_mjpeg_dma_ctx.out_len % s_mjpeg_dma_ctx.convert_block_size);
+  requested_blocks = consumed_bytes / s_mjpeg_dma_ctx.convert_block_size;
+  if (s_mjpeg_dma_ctx.convert_block_index >= s_mjpeg_dma_ctx.convert_total_mcus)
+  {
+    /* The JPEG peripheral can leave alignment padding after the last MCU. */
+    s_mjpeg_dma_ctx.out_len = 0U;
+    return MJPEG_PLAYER_OK;
+  }
+
+  remaining_blocks = s_mjpeg_dma_ctx.convert_total_mcus - s_mjpeg_dma_ctx.convert_block_index;
+  if (requested_blocks > remaining_blocks)
+  {
+    requested_blocks = remaining_blocks;
+    consumed_bytes = requested_blocks * s_mjpeg_dma_ctx.convert_block_size;
+  }
+
+  if ((requested_blocks == 0U) || (consumed_bytes == 0U))
+  {
+    s_mjpeg_dma_ctx.error = 1U;
+    return MJPEG_PLAYER_ERR_DECODE;
+  }
+
+  converter_reported_bytes = 0U;
   converted_blocks = s_mjpeg_dma_ctx.convert_func(
     s_mjpeg_dma_ctx.out_ptr,
     s_mjpeg_frame_io_buffer,
     s_mjpeg_dma_ctx.convert_block_index,
     consumed_bytes,
-    &consumed_bytes
+    &converter_reported_bytes
   );
 
-  if ((converted_blocks == 0U) || (consumed_bytes == 0U) || (consumed_bytes > s_mjpeg_dma_ctx.out_len))
+  /* Some STM32 jpeg_utils revisions report zero here because their decoder
+     uses an encoder-only BlockSize field.  The number of converted MCUs is
+     authoritative; derive the consumed byte count from the known MCU size. */
+  if ((converted_blocks == 0U) || (converted_blocks > requested_blocks))
   {
     s_mjpeg_dma_ctx.error = 1U;
-    (void)HAL_JPEG_Abort(&hjpeg);
+    return MJPEG_PLAYER_ERR_DECODE;
+  }
+
+  consumed_bytes = converted_blocks * s_mjpeg_dma_ctx.convert_block_size;
+  if (consumed_bytes > s_mjpeg_dma_ctx.out_len)
+  {
+    s_mjpeg_dma_ctx.error = 1U;
     return MJPEG_PLAYER_ERR_DECODE;
   }
 
@@ -298,11 +379,16 @@ void HAL_JPEG_InfoReadyCallback(JPEG_HandleTypeDef *h, JPEG_ConfTypeDef *pInfo)
   s_mjpeg_dma_ctx.convert_block_index = 0U;
   s_mjpeg_dma_ctx.convert_block_size = 0U;
 
+  if (mjpeg_frame_geometry_fits(pInfo->ImageWidth, pInfo->ImageHeight) == 0U)
+  {
+    s_mjpeg_dma_ctx.error = 1U;
+    return;
+  }
+
   block_size = mjpeg_jpeg_mcu_input_size(pInfo);
   if (block_size == 0U)
   {
     s_mjpeg_dma_ctx.error = 1U;
-    (void)HAL_JPEG_Abort(h);
     return;
   }
 
@@ -310,7 +396,6 @@ void HAL_JPEG_InfoReadyCallback(JPEG_HandleTypeDef *h, JPEG_ConfTypeDef *pInfo)
   if ((status != HAL_OK) || (s_mjpeg_dma_ctx.convert_func == NULL))
   {
     s_mjpeg_dma_ctx.error = 1U;
-    (void)HAL_JPEG_Abort(h);
     return;
   }
 
@@ -339,7 +424,6 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *h, uint8_t *pDataOut, uint32
   {
     s_mjpeg_dma_ctx.out_overflow = 1U;
     s_mjpeg_dma_ctx.error = 1U;
-    (void)HAL_JPEG_Abort(h);
     return;
   }
 
@@ -424,7 +508,7 @@ static int8_t mjpeg_decode_frame_via_dma(uint8_t *jpeg_data, uint32_t decode_len
   s_mjpeg_dma_ctx.in_pos = first_chunk;
 
   mjpeg_cache_clean_range(jpeg_data, decode_len);
-  mjpeg_cache_clean_range(s_mjpeg_frame_io_buffer, sizeof(s_mjpeg_frame_io_buffer));
+  mjpeg_cache_clean_range(s_mjpeg_frame_io_buffer, s_mjpeg_frame_io_capacity);
   mjpeg_cache_clean_range(s_mjpeg_dma_stage_buffer, sizeof(s_mjpeg_dma_stage_buffer));
   mjpeg_cache_invalidate_range(s_mjpeg_dma_out_chunk, sizeof(s_mjpeg_dma_out_chunk));
 
@@ -553,9 +637,26 @@ static uint8_t mjpeg_is_ext(const char *name, const char *ext)
   return 1U;
 }
 
-static uint8_t mjpeg_stop_requested(void)
+static int8_t mjpeg_stop_status(void)
 {
-  return (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET) ? 1U : 0U;
+  media_control_action_t action = MediaControl_Poll();
+
+  if (action == MEDIA_CONTROL_STOP)
+  {
+    return MJPEG_PLAYER_ERR_STOPPED;
+  }
+
+  if (action == MEDIA_CONTROL_BACK)
+  {
+    return MJPEG_PLAYER_ERR_BACK;
+  }
+
+  if (action != MEDIA_CONTROL_NONE)
+  {
+    s_mjpeg_pending_control = action;
+  }
+
+  return MJPEG_PLAYER_OK;
 }
 
 static void mjpeg_log(const char *msg)
@@ -974,9 +1075,31 @@ static int8_t mjpeg_wait_next_frame_tick(uint32_t wait_ms)
 
   for (;;)
   {
-    if (mjpeg_stop_requested() != 0U)
+    int8_t stop_status = mjpeg_stop_status();
+
+    if (stop_status != MJPEG_PLAYER_OK)
     {
-      return MJPEG_PLAYER_ERR_STOPPED;
+      return stop_status;
+    }
+
+    if ((s_mjpeg_pending_control != MEDIA_CONTROL_NONE) ||
+        (MediaControl_IsPaused() != 0U))
+    {
+      if ((s_mjpeg_pending_control == MEDIA_CONTROL_NONE) &&
+          (MediaControl_IsPaused() != 0U))
+      {
+        s_mjpeg_pending_control = MEDIA_CONTROL_PAUSE_CHANGED;
+      }
+      return MJPEG_PLAYER_OK;
+    }
+
+    if (MediaControl_IsSeekHeld() != 0U)
+    {
+      /* A held seek key owns the timeline until it is released. */
+      (void)MJPEG_Scheduler_ConsumeFrameTick();
+      start_ms = HAL_GetTick();
+      HAL_Delay(1U);
+      continue;
     }
 
     if (MJPEG_Scheduler_ConsumeFrameTick() != 0U)
@@ -991,6 +1114,96 @@ static int8_t mjpeg_wait_next_frame_tick(uint32_t wait_ms)
 
     HAL_Delay(1U);
   }
+}
+
+static int8_t mjpeg_pipeline_wait_before_decode(void)
+{
+  int8_t wait_status;
+
+  if (s_mjpeg_pipeline_display_pending != 0U)
+  {
+    if (LCD_WaitTransmitDone(MJPEG_PLAYER_JPEG_TIMEOUT_MS) != HAL_OK)
+    {
+      mjpeg_log("MJPEG: LCD pipeline wait failed, use polling\r\n");
+      LCD_ResetTransferState();
+      s_mjpeg_pipeline_async_lcd = 0U;
+    }
+    s_mjpeg_pipeline_display_pending = 0U;
+  }
+
+  if ((s_mjpeg_pipeline_frame_started != 0U) &&
+      (s_mjpeg_seek_decode_pending == 0U))
+  {
+    wait_status = mjpeg_wait_next_frame_tick(s_mjpeg_pipeline_frame_interval_ms);
+    if (wait_status != MJPEG_PLAYER_OK)
+    {
+      return wait_status;
+    }
+  }
+
+  return MJPEG_PLAYER_OK;
+}
+
+static int8_t mjpeg_wait_while_paused(void)
+{
+  media_control_action_t action;
+
+  if (s_mjpeg_pipeline_display_pending != 0U)
+  {
+    if (LCD_WaitTransmitDone(MJPEG_PLAYER_JPEG_TIMEOUT_MS) != HAL_OK)
+    {
+      LCD_ResetTransferState();
+      s_mjpeg_pipeline_async_lcd = 0U;
+    }
+    s_mjpeg_pipeline_display_pending = 0U;
+  }
+
+  MediaControl_ShowPausedHud();
+  while (MediaControl_IsPaused() != 0U)
+  {
+    action = MediaControl_Poll();
+    if (action == MEDIA_CONTROL_STOP)
+    {
+      return MJPEG_PLAYER_ERR_STOPPED;
+    }
+    if (action == MEDIA_CONTROL_BACK)
+    {
+      return MJPEG_PLAYER_ERR_BACK;
+    }
+    if ((action == MEDIA_CONTROL_SEEK_BACK) ||
+        (action == MEDIA_CONTROL_SEEK_FORWARD))
+    {
+      s_mjpeg_pending_control = action;
+      return MJPEG_PLAYER_OK;
+    }
+
+    LCD_TransferService();
+    HAL_Delay(1U);
+  }
+
+  s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
+  return MJPEG_PLAYER_OK;
+}
+
+static int8_t mjpeg_pipeline_show_frame(uint16_t x, uint16_t y, uint16_t width, uint16_t height)
+{
+  if (s_mjpeg_pipeline_async_lcd != 0U)
+  {
+    if (LCD_CopyBufferAsync(x, y, width, height, (const uint16_t *)s_mjpeg_frame_io_buffer) == HAL_OK)
+    {
+      s_mjpeg_pipeline_display_pending = 1U;
+      s_mjpeg_pipeline_frame_started = 1U;
+      return MJPEG_PLAYER_OK;
+    }
+
+    mjpeg_log("MJPEG: LCD pipeline start failed, use polling\r\n");
+    LCD_ResetTransferState();
+    s_mjpeg_pipeline_async_lcd = 0U;
+  }
+
+  LCD_CopyBuffer(x, y, width, height, (const uint16_t *)s_mjpeg_frame_io_buffer);
+  s_mjpeg_pipeline_frame_started = 1U;
+  return MJPEG_PLAYER_OK;
 }
 
 static int8_t mjpeg_dma2d_convert_and_show(const JPEG_ConfTypeDef *jpeg_info)
@@ -1137,10 +1350,32 @@ static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len, uint
   int8_t prepare_status;
   int8_t dma_status;
   int8_t header_status;
+  int8_t pipeline_status;
 
   if ((jpeg_data == NULL) || (jpeg_len == 0U))
   {
     return MJPEG_PLAYER_ERR_PARAM;
+  }
+
+  /* The compressed frame is already in D2 SRAM at this point.  Waiting here
+     lets its SD read overlap the previous LCD transfer, while still protecting
+     the single RGB output buffer from being overwritten too early. */
+  pipeline_status = mjpeg_pipeline_wait_before_decode();
+  if (pipeline_status != MJPEG_PLAYER_OK)
+  {
+    return pipeline_status;
+  }
+
+  if (s_mjpeg_seek_decode_pending != 0U)
+  {
+    /* One seek event is allowed to decode exactly one target frame while the
+       key remains held. The next loop freezes again until another repeat. */
+    s_mjpeg_seek_decode_pending = 0U;
+  }
+  else if ((s_mjpeg_pending_control != MEDIA_CONTROL_NONE) ||
+           (MediaControl_IsPaused() != 0U))
+  {
+    return MJPEG_PLAYER_FRAME_DEFERRED;
   }
 
   mjpeg_log_value("MJPEG: decode enter len=", (int32_t)jpeg_len);
@@ -1173,6 +1408,12 @@ static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len, uint
 
   if (header_status == MJPEG_PLAYER_OK)
   {
+    if (mjpeg_frame_geometry_fits(header_info.width, header_info.height) == 0U)
+    {
+      mjpeg_log_info("MJPEG: frame too large", header_info.width, header_info.height);
+      return MJPEG_PLAYER_ERR_UNSUPPORTED;
+    }
+
     if (header_info.components == 3U)
     {
       if (!((header_info.luma_sampling_h == 2U) && (header_info.luma_sampling_v == 2U)) &&
@@ -1287,16 +1528,12 @@ static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len, uint
     return MJPEG_PLAYER_ERR_UNSUPPORTED;
   }
 
-  mjpeg_cache_clean_range(s_mjpeg_frame_io_buffer, (uint32_t)info.ImageWidth * (uint32_t)info.ImageHeight * 2U);
-  LCD_CopyBuffer(
+  return mjpeg_pipeline_show_frame(
     (uint16_t)((LCD_Width - info.ImageWidth) / 2U),
     (uint16_t)((LCD_Height - info.ImageHeight) / 2U),
     (uint16_t)info.ImageWidth,
-    (uint16_t)info.ImageHeight,
-    (const uint16_t *)s_mjpeg_frame_io_buffer
+    (uint16_t)info.ImageHeight
   );
-
-  return MJPEG_PLAYER_OK;
 }
 
 static mjpeg_read_status_t mjpeg_read_exact(FIL *file, uint8_t *buf, uint32_t bytes)
@@ -1310,9 +1547,15 @@ static mjpeg_read_status_t mjpeg_read_exact(FIL *file, uint8_t *buf, uint32_t by
   }
 
   fr = f_read(file, buf, (UINT)bytes, &read_len);
-  if ((fr != FR_OK) || (read_len != (UINT)bytes))
+  if (fr != FR_OK)
   {
+    s_mjpeg_last_fs_error = (uint8_t)fr;
     return MJPEG_READ_STATUS_IO_ERR;
+  }
+
+  if (read_len != (UINT)bytes)
+  {
+    return MJPEG_READ_STATUS_EOF;
   }
 
   return MJPEG_READ_STATUS_OK;
@@ -1927,7 +2170,7 @@ static mjpeg_read_status_t mjpeg_avi_read_next_frame(
     uint32_t pos = (uint32_t)f_tell(file);
     uint32_t container_end = iter->end_pos_stack[iter->depth];
 
-    if (pos >= container_end)
+    if ((pos >= container_end) || ((container_end - pos) < sizeof(chunk_hdr)))
     {
       if (iter->depth == 0U)
       {
@@ -1948,9 +2191,16 @@ static mjpeg_read_status_t mjpeg_avi_read_next_frame(
       continue;
     }
 
-    if (mjpeg_read_exact(file, chunk_hdr, sizeof(chunk_hdr)) != MJPEG_READ_STATUS_OK)
     {
-      return MJPEG_READ_STATUS_IO_ERR;
+      mjpeg_read_status_t read_status = mjpeg_read_exact(file, chunk_hdr, sizeof(chunk_hdr));
+      if (read_status == MJPEG_READ_STATUS_EOF)
+      {
+        return MJPEG_READ_STATUS_EOF;
+      }
+      if (read_status != MJPEG_READ_STATUS_OK)
+      {
+        return MJPEG_READ_STATUS_IO_ERR;
+      }
     }
 
     {
@@ -2037,9 +2287,16 @@ static mjpeg_read_status_t mjpeg_avi_read_next_frame(
           return MJPEG_READ_STATUS_FRAME_TOO_LARGE;
         }
 
-        if (mjpeg_read_exact(file, out_buf, chunk_size) != MJPEG_READ_STATUS_OK)
         {
-          return MJPEG_READ_STATUS_IO_ERR;
+          mjpeg_read_status_t read_status = mjpeg_read_exact(file, out_buf, chunk_size);
+          if (read_status == MJPEG_READ_STATUS_EOF)
+          {
+            return MJPEG_READ_STATUS_EOF;
+          }
+          if (read_status != MJPEG_READ_STATUS_OK)
+          {
+            return MJPEG_READ_STATUS_IO_ERR;
+          }
         }
 
         if (f_lseek(file, (FSIZE_t)chunk_next) != FR_OK)
@@ -2069,6 +2326,182 @@ static mjpeg_read_status_t mjpeg_avi_read_next_frame(
       }
     }
   }
+}
+
+static void mjpeg_seek_history_reset(void)
+{
+  memset(s_mjpeg_seek_history, 0, sizeof(s_mjpeg_seek_history));
+}
+
+static void mjpeg_seek_history_store(
+  FIL *file,
+  const mjpeg_avi_iter_t *avi_iter,
+  uint32_t frame_index
+)
+{
+  mjpeg_seek_snapshot_t *snapshot;
+
+  if (file == NULL)
+  {
+    return;
+  }
+
+  snapshot = &s_mjpeg_seek_history[frame_index % MJPEG_PLAYER_SEEK_HISTORY_SIZE];
+  snapshot->frame_index = frame_index;
+  snapshot->file_pos = (uint32_t)f_tell(file);
+  if (avi_iter != NULL)
+  {
+    snapshot->avi_iter = *avi_iter;
+  }
+  else
+  {
+    memset(&snapshot->avi_iter, 0, sizeof(snapshot->avi_iter));
+  }
+  snapshot->valid = 1U;
+}
+
+static uint8_t mjpeg_seek_history_restore(
+  FIL *file,
+  mjpeg_avi_iter_t *avi_iter,
+  uint32_t frame_index
+)
+{
+  mjpeg_seek_snapshot_t *snapshot;
+
+  if (file == NULL)
+  {
+    return 0U;
+  }
+
+  snapshot = &s_mjpeg_seek_history[frame_index % MJPEG_PLAYER_SEEK_HISTORY_SIZE];
+  if ((snapshot->valid == 0U) || (snapshot->frame_index != frame_index))
+  {
+    return 0U;
+  }
+
+  if (f_lseek(file, (FSIZE_t)snapshot->file_pos) != FR_OK)
+  {
+    return 0U;
+  }
+
+  if (avi_iter != NULL)
+  {
+    *avi_iter = snapshot->avi_iter;
+  }
+  return 1U;
+}
+
+static mjpeg_read_status_t mjpeg_seek_read_next(
+  FIL *file,
+  mjpeg_container_type_t container_type,
+  mjpeg_avi_iter_t *avi_iter,
+  uint32_t *frame_len
+)
+{
+  if (container_type == MJPEG_CONTAINER_AVI)
+  {
+    return mjpeg_avi_read_next_frame(
+      file,
+      avi_iter,
+      s_mjpeg_ycbcr_buffer,
+      sizeof(s_mjpeg_ycbcr_buffer),
+      frame_len
+    );
+  }
+
+  return mjpeg_raw_read_next_frame(
+    file,
+    s_mjpeg_ycbcr_buffer,
+    sizeof(s_mjpeg_ycbcr_buffer),
+    frame_len
+  );
+}
+
+static mjpeg_read_status_t mjpeg_apply_seek(
+  FIL *file,
+  mjpeg_container_type_t container_type,
+  mjpeg_avi_iter_t *avi_iter,
+  uint32_t container_start,
+  uint32_t container_end,
+  uint8_t video_stream_id,
+  media_control_action_t action,
+  uint32_t *frame_cursor,
+  uint32_t *frame_len
+)
+{
+  uint32_t target_frame;
+  uint32_t i;
+  mjpeg_read_status_t read_status;
+
+  if ((file == NULL) || (frame_cursor == NULL) || (frame_len == NULL))
+  {
+    return MJPEG_READ_STATUS_IO_ERR;
+  }
+
+  if (action == MEDIA_CONTROL_SEEK_BACK)
+  {
+    target_frame = (*frame_cursor > MJPEG_PLAYER_SEEK_STEP_FRAMES) ?
+                   (*frame_cursor - MJPEG_PLAYER_SEEK_STEP_FRAMES) : 0U;
+
+    if (mjpeg_seek_history_restore(
+          file,
+          (container_type == MJPEG_CONTAINER_AVI) ? avi_iter : NULL,
+          target_frame) != 0U)
+    {
+      *frame_cursor = target_frame;
+      return MJPEG_READ_STATUS_OK;
+    }
+
+    if (f_lseek(file, (FSIZE_t)container_start) != FR_OK)
+    {
+      return MJPEG_READ_STATUS_IO_ERR;
+    }
+    if (container_type == MJPEG_CONTAINER_AVI)
+    {
+      mjpeg_avi_iter_init(avi_iter, container_end, video_stream_id);
+    }
+    mjpeg_seek_history_reset();
+    *frame_cursor = 0U;
+
+    while (*frame_cursor < target_frame)
+    {
+      mjpeg_seek_history_store(
+        file,
+        (container_type == MJPEG_CONTAINER_AVI) ? avi_iter : NULL,
+        *frame_cursor
+      );
+      read_status = mjpeg_seek_read_next(file, container_type, avi_iter, frame_len);
+      if (read_status != MJPEG_READ_STATUS_OK)
+      {
+        return read_status;
+      }
+      (*frame_cursor)++;
+    }
+
+    return MJPEG_READ_STATUS_OK;
+  }
+
+  if (action != MEDIA_CONTROL_SEEK_FORWARD)
+  {
+    return MJPEG_READ_STATUS_OK;
+  }
+
+  for (i = 0U; i < MJPEG_PLAYER_SEEK_STEP_FRAMES; ++i)
+  {
+    mjpeg_seek_history_store(
+      file,
+      (container_type == MJPEG_CONTAINER_AVI) ? avi_iter : NULL,
+      *frame_cursor
+    );
+    read_status = mjpeg_seek_read_next(file, container_type, avi_iter, frame_len);
+    if (read_status != MJPEG_READ_STATUS_OK)
+    {
+      return read_status;
+    }
+    (*frame_cursor)++;
+  }
+
+  return MJPEG_READ_STATUS_OK;
 }
 
 static mjpeg_read_status_t mjpeg_avi_read_next_frame_by_tag(
@@ -2248,23 +2681,16 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
   mjpeg_container_type_t container_type;
   uint32_t frame_interval_ms;
   uint32_t frame_len;
+  uint32_t decoded_frame_count;
+  uint32_t frame_cursor;
   int8_t status;
-  uint8_t stream_hdr[8];
-  uint8_t next_stream_hdr[8];
-  uint16_t stream_id;
-  uint32_t stream_size;
-  uint8_t stream_no;
+  mjpeg_avi_iter_t avi_iter;
 
   uint32_t avi_movi_start = 0U;
   uint32_t avi_movi_end = 0U;
   uint16_t avi_width = 0U;
   uint16_t avi_height = 0U;
   uint8_t avi_video_stream_id = 0xFFU;
-  uint8_t avi_video_stream_primary = 0xFFU;
-  uint32_t stream_filter_skip_log_count = 0U;
-  uint16_t stream_eval_seen = 0U;
-  uint16_t stream_eval_ok = 0U;
-  uint8_t stream_auto_switch_done = 0U;
 
   if (s_mjpeg_jpeg_tables_ready == 0U)
   {
@@ -2277,22 +2703,46 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
     return MJPEG_PLAYER_ERR_PARAM;
   }
 
+  s_mjpeg_last_fs_error = (uint8_t)FR_OK;
+  SD_SetReadPollingMode(1U);
   fr = f_mount(&SDFatFS, (TCHAR const *)SDPath, 1U);
   if (fr != FR_OK)
   {
+    s_mjpeg_last_fs_error = (uint8_t)fr;
+    SD_SetReadPollingMode(0U);
     return MJPEG_PLAYER_ERR_MOUNT;
   }
 
   fr = f_open(&file, file_path, FA_READ);
   if (fr != FR_OK)
   {
+    s_mjpeg_last_fs_error = (uint8_t)fr;
     (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
+    SD_SetReadPollingMode(0U);
     return MJPEG_PLAYER_ERR_FILE;
+  }
+
+  s_mjpeg_frame_io_buffer = MediaMemory_Acquire(
+    MEDIA_MEMORY_OWNER_MJPEG,
+    MJPEG_PLAYER_MAX_FRAME_BYTES,
+    &s_mjpeg_frame_io_capacity
+  );
+  if (s_mjpeg_frame_io_buffer == NULL)
+  {
+    (void)f_close(&file);
+    (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
+    SD_SetReadPollingMode(0U);
+    return MJPEG_PLAYER_ERR_BUSY;
   }
 
   frame_interval_ms = MJPEG_PLAYER_DEFAULT_FRAME_MS;
   status = MJPEG_PLAYER_OK;
   frame_len = 0U;
+  decoded_frame_count = 0U;
+  frame_cursor = 0U;
+  s_mjpeg_skip_log_count = 0U;
+  s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
+  mjpeg_seek_history_reset();
 
   if (mjpeg_read_exact(&file, probe_hdr, sizeof(probe_hdr)) != MJPEG_READ_STATUS_OK)
   {
@@ -2345,21 +2795,9 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
     if (avi_video_stream_id != 0xFFU)
     {
       mjpeg_log_value("MJPEG: AVI stream=", (int32_t)avi_video_stream_id);
-      avi_video_stream_primary = avi_video_stream_id;
     }
 
-    if (mjpeg_read_exact(&file, stream_hdr, sizeof(stream_hdr)) != MJPEG_READ_STATUS_OK)
-    {
-      status = MJPEG_PLAYER_ERR_IO;
-      goto cleanup;
-    }
-
-    status = mjpeg_avi_get_streaminfo(stream_hdr, &stream_id, &stream_size, &stream_no);
-    if (status != MJPEG_PLAYER_OK)
-    {
-      status = MJPEG_PLAYER_ERR_FORMAT;
-      goto cleanup;
-    }
+    mjpeg_avi_iter_init(&avi_iter, avi_movi_end, avi_video_stream_id);
   }
   else
   {
@@ -2381,19 +2819,189 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
     goto cleanup;
   }
 
+  s_mjpeg_pipeline_frame_interval_ms = frame_interval_ms;
+  s_mjpeg_pipeline_display_pending = 0U;
+  s_mjpeg_pipeline_frame_started = 0U;
+  s_mjpeg_pipeline_async_lcd = 1U;
+  s_mjpeg_seek_decode_pending = 0U;
+  MediaControl_Init();
+
   LCD_SetBackColor(LCD_BLACK);
   LCD_Clear();
 
   while (status == MJPEG_PLAYER_OK)
   {
-    if (mjpeg_stop_requested() != 0U)
+    int8_t stop_status = mjpeg_stop_status();
+    uint8_t seek_applied = 0U;
+
+    if (stop_status != MJPEG_PLAYER_OK)
     {
-      status = MJPEG_PLAYER_ERR_STOPPED;
+      status = stop_status;
       break;
+    }
+
+    if ((MediaControl_IsPaused() != 0U) &&
+        (s_mjpeg_pending_control == MEDIA_CONTROL_NONE))
+    {
+      s_mjpeg_pending_control = MEDIA_CONTROL_PAUSE_CHANGED;
+    }
+
+    if (s_mjpeg_pending_control == MEDIA_CONTROL_PAUSE_CHANGED)
+    {
+      if (MediaControl_IsPaused() != 0U)
+      {
+        status = mjpeg_wait_while_paused();
+        if (status != MJPEG_PLAYER_OK)
+        {
+          break;
+        }
+      }
+      else
+      {
+        s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
+      }
+    }
+
+    if ((s_mjpeg_pending_control == MEDIA_CONTROL_SEEK_BACK) ||
+        (s_mjpeg_pending_control == MEDIA_CONTROL_SEEK_FORWARD))
+    {
+      media_control_action_t seek_action = s_mjpeg_pending_control;
+      mjpeg_read_status_t seek_status;
+
+      s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
+      seek_status = mjpeg_apply_seek(
+        &file,
+        container_type,
+        &avi_iter,
+        (container_type == MJPEG_CONTAINER_AVI) ? avi_movi_start : 0U,
+        (container_type == MJPEG_CONTAINER_AVI) ? avi_movi_end : (uint32_t)f_size(&file),
+        avi_video_stream_id,
+        seek_action,
+        &frame_cursor,
+        &frame_len
+      );
+
+      if (seek_status == MJPEG_READ_STATUS_EOF)
+      {
+        status = (decoded_frame_count > 0U) ? MJPEG_PLAYER_OK : MJPEG_PLAYER_ERR_FORMAT;
+        break;
+      }
+      if (seek_status == MJPEG_READ_STATUS_FRAME_TOO_LARGE)
+      {
+        status = MJPEG_PLAYER_ERR_FRAME_TOO_LARGE;
+        break;
+      }
+      if (seek_status == MJPEG_READ_STATUS_FORMAT_ERR)
+      {
+        status = MJPEG_PLAYER_ERR_FORMAT;
+        break;
+      }
+      if (seek_status != MJPEG_READ_STATUS_OK)
+      {
+        status = MJPEG_PLAYER_ERR_IO;
+        break;
+      }
+
+      seek_applied = 1U;
+
+      if (MediaControl_IsPaused() != 0U)
+      {
+        continue;
+      }
+
+      s_mjpeg_seek_decode_pending = 1U;
+    }
+
+    if ((seek_applied == 0U) && (MediaControl_IsSeekHeld() != 0U))
+    {
+      /* Wait for the repeat event or release instead of decoding forward. */
+      (void)MJPEG_Scheduler_ConsumeFrameTick();
+      HAL_Delay(1U);
+      continue;
     }
 
     if (container_type == MJPEG_CONTAINER_AVI)
     {
+      int8_t frame_status;
+      mjpeg_read_status_t read_status;
+
+      mjpeg_seek_history_store(&file, &avi_iter, frame_cursor);
+      read_status = mjpeg_avi_read_next_frame(
+        &file,
+        &avi_iter,
+        s_mjpeg_ycbcr_buffer,
+        sizeof(s_mjpeg_ycbcr_buffer),
+        &frame_len
+      );
+
+      if (read_status == MJPEG_READ_STATUS_EOF)
+      {
+        status = (decoded_frame_count > 0U) ? MJPEG_PLAYER_OK : MJPEG_PLAYER_ERR_FORMAT;
+        break;
+      }
+      if (read_status == MJPEG_READ_STATUS_FRAME_TOO_LARGE)
+      {
+        status = MJPEG_PLAYER_ERR_FRAME_TOO_LARGE;
+        break;
+      }
+      if (read_status == MJPEG_READ_STATUS_FORMAT_ERR)
+      {
+        status = MJPEG_PLAYER_ERR_FORMAT;
+        break;
+      }
+      if (read_status != MJPEG_READ_STATUS_OK)
+      {
+        status = MJPEG_PLAYER_ERR_IO;
+        break;
+      }
+      frame_cursor++;
+
+      frame_status = mjpeg_decode_one_frame(
+        s_mjpeg_ycbcr_buffer,
+        frame_len,
+        avi_width,
+        avi_height
+      );
+
+      if (frame_status == MJPEG_PLAYER_FRAME_DEFERRED)
+      {
+        if (frame_cursor > 0U)
+        {
+          frame_cursor--;
+          (void)mjpeg_seek_history_restore(&file, &avi_iter, frame_cursor);
+        }
+        continue;
+      }
+      if (frame_status == MJPEG_PLAYER_OK)
+      {
+        decoded_frame_count++;
+        s_mjpeg_skip_log_count = 0U;
+      }
+      else if (frame_status == MJPEG_PLAYER_ERR_UNSUPPORTED)
+      {
+        status = frame_status;
+        break;
+      }
+      else if ((frame_status == MJPEG_PLAYER_ERR_DECODE) ||
+               (frame_status == MJPEG_PLAYER_ERR_FORMAT))
+      {
+        s_mjpeg_skip_log_count++;
+        mjpeg_log_value("MJPEG: frame skipped err=", (int32_t)frame_status);
+        if (s_mjpeg_skip_log_count >= MJPEG_PLAYER_MAX_CONSEC_FRAME_ERRORS)
+        {
+          status = frame_status;
+          break;
+        }
+      }
+      else
+      {
+        status = frame_status;
+        break;
+      }
+
+      continue;
+
+#if 0 /* Replaced by the bounded LIST/rec-aware AVI iterator above. */
       uint32_t cur_pos;
       uint32_t frame_payload_plus_header;
 
@@ -2422,14 +3030,14 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
           break;
         }
 
-        if (mjpeg_read_exact(&file, s_mjpeg_frame_io_buffer, frame_payload_plus_header) != MJPEG_READ_STATUS_OK)
+        if (mjpeg_read_exact(&file, s_mjpeg_ycbcr_buffer, frame_payload_plus_header) != MJPEG_READ_STATUS_OK)
         {
           mjpeg_log("MJPEG: avi frame read fail\r\n");
           status = MJPEG_PLAYER_ERR_IO;
           break;
         }
 
-        memcpy(next_stream_hdr, &s_mjpeg_frame_io_buffer[stream_size], sizeof(next_stream_hdr));
+        memcpy(next_stream_hdr, &s_mjpeg_ycbcr_buffer[stream_size], sizeof(next_stream_hdr));
 
         if ((avi_video_stream_id != 0xFFU) && (stream_no != 0xFFU) && (stream_no != avi_video_stream_id))
         {
@@ -2461,7 +3069,6 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
         }
 
         frame_len = stream_size;
-        memcpy(s_mjpeg_ycbcr_buffer, s_mjpeg_frame_io_buffer, frame_len);
         frame_status = mjpeg_decode_one_frame(
           s_mjpeg_ycbcr_buffer,
           frame_len,
@@ -2519,21 +3126,20 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
           break;
         }
 
-        status = mjpeg_wait_next_frame_tick(frame_interval_ms);
         continue;
       }
       else if (stream_id == AVI_AUDS_FLAG)
       {
         if (frame_payload_plus_header <= (uint32_t)sizeof(s_mjpeg_ycbcr_buffer))
         {
-          if (mjpeg_read_exact(&file, s_mjpeg_frame_io_buffer, frame_payload_plus_header) != MJPEG_READ_STATUS_OK)
+          if (mjpeg_read_exact(&file, s_mjpeg_ycbcr_buffer, frame_payload_plus_header) != MJPEG_READ_STATUS_OK)
           {
             mjpeg_log("MJPEG: avi frame read fail\r\n");
             status = MJPEG_PLAYER_ERR_IO;
             break;
           }
 
-          memcpy(next_stream_hdr, &s_mjpeg_frame_io_buffer[stream_size], sizeof(next_stream_hdr));
+          memcpy(next_stream_hdr, &s_mjpeg_ycbcr_buffer[stream_size], sizeof(next_stream_hdr));
 
 
           status = mjpeg_avi_get_streaminfo(next_stream_hdr, &stream_id, &stream_size, &stream_no);
@@ -2571,22 +3177,24 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
 
       status = MJPEG_PLAYER_ERR_FORMAT;
       break;
+#endif
     }
     else
     {
       int8_t frame_status;
       mjpeg_read_status_t read_status;
 
+      mjpeg_seek_history_store(&file, NULL, frame_cursor);
       read_status = mjpeg_raw_read_next_frame(
         &file,
-        s_mjpeg_frame_io_buffer,
-        sizeof(s_mjpeg_frame_io_buffer),
+        s_mjpeg_ycbcr_buffer,
+        sizeof(s_mjpeg_ycbcr_buffer),
         &frame_len
       );
 
       if (read_status == MJPEG_READ_STATUS_EOF)
       {
-        status = MJPEG_PLAYER_OK;
+        status = (decoded_frame_count > 0U) ? MJPEG_PLAYER_OK : MJPEG_PLAYER_ERR_FORMAT;
         break;
       }
 
@@ -2607,8 +3215,8 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
         status = MJPEG_PLAYER_ERR_IO;
         break;
       }
+      frame_cursor++;
 
-      memcpy(s_mjpeg_ycbcr_buffer, s_mjpeg_frame_io_buffer, frame_len);
       frame_status = mjpeg_decode_one_frame(
         s_mjpeg_ycbcr_buffer,
         frame_len,
@@ -2616,18 +3224,37 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
         avi_height
       );
 
+      if (frame_status == MJPEG_PLAYER_FRAME_DEFERRED)
+      {
+        if (frame_cursor > 0U)
+        {
+          frame_cursor--;
+          (void)mjpeg_seek_history_restore(&file, NULL, frame_cursor);
+        }
+        continue;
+      }
       if (frame_status == MJPEG_PLAYER_OK)
       {
+        decoded_frame_count++;
         s_mjpeg_skip_log_count = 0U;
       }
+      else if (frame_status == MJPEG_PLAYER_ERR_UNSUPPORTED)
+      {
+        status = frame_status;
+        break;
+      }
       else if ((frame_status == MJPEG_PLAYER_ERR_DECODE) ||
-               (frame_status == MJPEG_PLAYER_ERR_UNSUPPORTED) ||
                (frame_status == MJPEG_PLAYER_ERR_FORMAT))
       {
         s_mjpeg_skip_log_count++;
         if ((s_mjpeg_skip_log_count <= 6U) || ((s_mjpeg_skip_log_count & 0x7U) == 0U))
         {
           mjpeg_log_value("MJPEG: frame skipped err=", (int32_t)frame_status);
+        }
+        if (s_mjpeg_skip_log_count >= MJPEG_PLAYER_MAX_CONSEC_FRAME_ERRORS)
+        {
+          status = frame_status;
+          break;
         }
       }
       else
@@ -2636,12 +3263,32 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
         break;
       }
 
-      status = mjpeg_wait_next_frame_tick(frame_interval_ms);
     }
   }
 
 cleanup:
+  s_mjpeg_seek_decode_pending = 0U;
+  if ((status == MJPEG_PLAYER_ERR_IO) &&
+      (s_mjpeg_last_fs_error == (uint8_t)FR_OK) &&
+      (file.err != (uint8_t)FR_OK))
+  {
+    s_mjpeg_last_fs_error = file.err;
+  }
+  if (s_mjpeg_pipeline_display_pending != 0U)
+  {
+    (void)LCD_WaitTransmitDone(MJPEG_PLAYER_JPEG_TIMEOUT_MS);
+    s_mjpeg_pipeline_display_pending = 0U;
+  }
+  MediaMemory_Release(MEDIA_MEMORY_OWNER_MJPEG);
+  s_mjpeg_frame_io_buffer = NULL;
+  s_mjpeg_frame_io_capacity = 0U;
   (void)f_close(&file);
   (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
+  SD_SetReadPollingMode(0U);
   return status;
+}
+
+uint8_t MJPEG_Player_GetLastFsError(void)
+{
+  return s_mjpeg_last_fs_error;
 }

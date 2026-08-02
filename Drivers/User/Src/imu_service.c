@@ -7,6 +7,7 @@ static ImuServiceSnapshot_t s_snapshots[2];
 static volatile uint8_t s_published_index = 0U;
 static volatile uint8_t s_has_snapshot = 0U;
 static uint32_t s_last_attempt_tick = 0U;
+static uint32_t s_last_sample_tick = 0U;
 static uint32_t s_sequence = 0U;
 static uint32_t s_failure_count = 0U;
 
@@ -17,6 +18,7 @@ void IMU_Service_Init(void)
     s_published_index = 0U;
     s_has_snapshot = 0U;
     s_last_attempt_tick = HAL_GetTick() - IMU_SERVICE_PERIOD_MS;
+    s_last_sample_tick = 0U;
     s_sequence = 0U;
     s_failure_count = 0U;
 }
@@ -25,6 +27,7 @@ void IMU_Service_Process(void)
 {
     ImuServiceSnapshot_t sample;
     uint32_t now = HAL_GetTick();
+    float dt_seconds;
     uint8_t next_index;
 
     if ((uint32_t)(now - s_last_attempt_tick) < IMU_SERVICE_PERIOD_MS)
@@ -42,9 +45,14 @@ void IMU_Service_Process(void)
 
     imu_data_calibration(&sample.gx, &sample.gy, &sample.gz,
                          &sample.ax, &sample.ay, &sample.az);
-    sample.angles = imu_get_eulerian_angles((float)sample.gx, (float)sample.gy, (float)sample.gz,
-                                             (float)sample.ax, (float)sample.ay, (float)sample.az);
     sample.sample_tick = HAL_GetTick();
+    dt_seconds = (s_last_sample_tick == 0U)
+                   ? ((float)IMU_SERVICE_PERIOD_MS * 0.001f)
+                   : ((float)((uint32_t)(sample.sample_tick - s_last_sample_tick)) * 0.001f);
+    s_last_sample_tick = sample.sample_tick;
+    sample.angles = imu_update_eulerian_angles((float)sample.gx, (float)sample.gy, (float)sample.gz,
+                                                (float)sample.ax, (float)sample.ay, (float)sample.az,
+                                                dt_seconds);
     sample.sequence = ++s_sequence;
 
     next_index = (uint8_t)(s_published_index ^ 1U);

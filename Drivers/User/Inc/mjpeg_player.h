@@ -17,8 +17,11 @@ extern "C" {
 #define MJPEG_PLAYER_ERR_STOPPED         -7
 #define MJPEG_PLAYER_ERR_UNSUPPORTED     -8
 #define MJPEG_PLAYER_ERR_FRAME_TOO_LARGE -9
+#define MJPEG_PLAYER_ERR_BUSY            -10
+#define MJPEG_PLAYER_ERR_BACK            -11
 
 int8_t MJPEG_Player_PlayFile(const char *file_path);
+uint8_t MJPEG_Player_GetLastFsError(void);
 
 #ifdef __cplusplus
 }
