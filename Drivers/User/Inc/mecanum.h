@@ -39,6 +39,10 @@
 /* 自旋系数 K = (轴距 L + 轮距 W) / 2 */
 #define MECANUM_K_ROTATION_COEFF_MM     ((MECANUM_WHEEL_BASE_MM + MECANUM_TRACK_WIDTH_MM) / 2.0f)
 #define MECANUM_RAD_PER_DEG             (3.14159265f / 180.0f)
+#define MECANUM_GYRO_BASE_SPIN_DPS      (200.0f)
+
+#define MECANUM_GYRO_DIRECTION_CCW      (-1)
+#define MECANUM_GYRO_DIRECTION_CW       1
 
 /* 电机 ID 定义 */
 typedef enum {
@@ -67,6 +71,12 @@ void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd, float dx_dis
 void Mecanum_CancelControl(void);
 void Mecanum_EmergencyStop(void);
 uint8_t Mecanum_IsMotionActive(void);
+uint8_t Mecanum_GyroEnable(int8_t direction, uint8_t speed_percent);
+void Mecanum_GyroDisable(void);
+uint8_t Mecanum_IsGyroModeEnabled(void);
+int8_t Mecanum_GetGyroDirection(void);
+uint8_t Mecanum_GetGyroSpeedPercent(void);
+float Mecanum_GetGyroSpinDps(void);
 
 void Mecanum_Tick10ms(void);
 

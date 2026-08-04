@@ -15,6 +15,9 @@ extern TIM_HandleTypeDef htim5;
 #define DC_MOTOR_OUTPUT_LIMIT               100.0f
 #define DC_MOTOR_SPEED_LPF_ALPHA            0.4f
 #define DC_MOTOR_FF_SCALE                   1.05f
+#define DC_MOTOR_ENCODER_LEARN_MIN_DUTY     3
+#define DC_MOTOR_ENCODER_LEARN_MIN_DELTA    1L
+#define DC_MOTOR_ENCODER_LEARN_CYCLES       3U
 
 #define DC_MOTOR_POS_KP                     0.5f
 #define DC_MOTOR_POS_KI                     0.0f
@@ -72,6 +75,11 @@ static float s_pos_pid_prev_error[DC_MOTOR_COUNT] = {0.0f, 0.0f, 0.0f, 0.0f};
 static int16_t s_pending_speed_percent[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static volatile uint8_t s_pending_speed_mask = 0U;
 static volatile uint8_t s_pending_stop_all = 0U;
+/* Encoder A/B phase can be mirrored by wiring or mechanical installation.
+ * 0 means unknown; +1/-1 maps the raw timer count to motor command direction. */
+static int8_t s_encoder_polarity[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static int8_t s_encoder_polarity_candidate[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static uint8_t s_encoder_polarity_confidence[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 
 static int16_t dc_motor_clamp_speed(int16_t speed)
 {
@@ -259,6 +267,57 @@ static int32_t dc_motor_calc_delta(uint32_t curr, uint32_t prev, uint32_t arr)
     return (int32_t)(curr - prev);
 }
 
+static int32_t dc_motor_normalize_encoder_delta(uint8_t index, int32_t raw_delta)
+{
+    int16_t applied_duty = s_applied_duty_percent[index];
+    int8_t candidate;
+    int32_t abs_delta;
+
+    if (s_encoder_polarity[index] != 0)
+    {
+        return raw_delta * (int32_t)s_encoder_polarity[index];
+    }
+
+    if ((raw_delta == 0) ||
+        ((applied_duty > -DC_MOTOR_ENCODER_LEARN_MIN_DUTY) &&
+         (applied_duty < DC_MOTOR_ENCODER_LEARN_MIN_DUTY)))
+    {
+        return raw_delta;
+    }
+
+    abs_delta = (raw_delta < 0) ? -raw_delta : raw_delta;
+    if (abs_delta < DC_MOTOR_ENCODER_LEARN_MIN_DELTA)
+    {
+        return raw_delta;
+    }
+
+    candidate = (((raw_delta > 0) && (applied_duty > 0)) ||
+                 ((raw_delta < 0) && (applied_duty < 0))) ? 1 : -1;
+
+    if (candidate == s_encoder_polarity_candidate[index])
+    {
+        if (s_encoder_polarity_confidence[index] < DC_MOTOR_ENCODER_LEARN_CYCLES)
+        {
+            s_encoder_polarity_confidence[index]++;
+        }
+    }
+    else
+    {
+        s_encoder_polarity_candidate[index] = candidate;
+        s_encoder_polarity_confidence[index] = 1U;
+    }
+
+    if (s_encoder_polarity_confidence[index] >= DC_MOTOR_ENCODER_LEARN_CYCLES)
+    {
+        s_encoder_polarity[index] = candidate;
+    }
+
+    /* During learning, use the measured magnitude in the commanded direction.
+     * This prevents a reversed encoder from saturating the speed PID during its
+     * first samples. Once learned, direction comes exclusively from the encoder. */
+    return (applied_duty > 0) ? abs_delta : -abs_delta;
+}
+
 HAL_StatusTypeDef DCMotor_OL_Init(void)
 {
     uint8_t i;
@@ -288,6 +347,9 @@ HAL_StatusTypeDef DCMotor_OL_Init(void)
         s_pid_prev_measured[i] = 0.0f;
         s_measured_pulses[i] = 0;
         s_target_pulses[i] = 0;
+        s_encoder_polarity[i] = 0;
+        s_encoder_polarity_candidate[i] = 0;
+        s_encoder_polarity_confidence[i] = 0U;
         s_pos_pid_integral[i] = 0.0f;
         s_pos_pid_prev_error[i] = 0.0f;
         s_control_mode[i] = DCMOTOR_CONTROL_MODE_SPEED;
@@ -471,6 +533,7 @@ void DCMotor_OL_Tick10ms(void)
 
         delta = dc_motor_calc_delta(curr, prev, arr);
         s_encoder_prev_cnt[i] = curr;
+        delta = dc_motor_normalize_encoder_delta(i, delta);
         s_measured_pulses[i] += delta;
 
         measured_rpm = dc_motor_counts_to_rpm(delta);
@@ -569,4 +632,14 @@ int16_t DCMotor_OL_GetDutyPercent(uint8_t motor_index)
     }
 
     return s_applied_duty_percent[motor_index - 1U];
+}
+
+int8_t DCMotor_OL_GetEncoderPolarity(uint8_t motor_index)
+{
+    if ((motor_index == 0U) || (motor_index > DC_MOTOR_COUNT))
+    {
+        return 0;
+    }
+
+    return s_encoder_polarity[motor_index - 1U];
 }

@@ -61,6 +61,9 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_SPEED_MIN           (-100)
 #define LVGL_APP_SPEED_MAX           100
 #define LVGL_APP_SPEED_STEP          10
+#define LVGL_APP_MECANUM_SPEED_MIN   (-100)
+#define LVGL_APP_MECANUM_SPEED_MAX   100
+#define LVGL_APP_MECANUM_SPEED_STEP  10
 #define LVGL_APP_SERVO_MIN           0
 #define LVGL_APP_SERVO_MAX           270
 #define LVGL_APP_SERVO_STEP          10
@@ -1008,6 +1011,8 @@ static int8_t s_joy_lx = 0;
 static int8_t s_joy_ly = 0;
 static int8_t s_joy_rx = 0;
 static int8_t s_joy_ry = 0;
+static uint8_t s_command_gyro_enabled = 0U;
+static int8_t s_command_gyro_signed_speed = 0;
 
 uint8_t LVGL_App_IsCommandControlActive(void)
 {
@@ -1054,7 +1059,10 @@ void LVGL_App_CommandStopMotors(void)
     s_joy_ly = 0;
     s_joy_rx = 0;
     s_joy_ry = 0;
+    s_command_gyro_enabled = 0U;
+    s_command_gyro_signed_speed = 0;
 
+    Mecanum_GyroDisable();
     Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     DCMotor_OL_RequestStopAll();
     s_ctrl_last_actual_refresh_tick = 0U;
@@ -1073,18 +1081,23 @@ static void lvgl_app_control_refresh_rows(void)
         if (s_cmd_ctrl_label != NULL)
         {
             char big_buf[256];
+            s_command_gyro_enabled = Mecanum_IsGyroModeEnabled();
+            int gyro_dps = (int)s_command_gyro_signed_speed * 2;
             snprintf(big_buf, sizeof(big_buf),
                      "M1 Set: %+4d, Act: %+5ld\n"
                      "M2 Set: %+4d, Act: %+5ld\n"
                      "M3 Set: %+4d, Act: %+5ld\n"
                      "M4 Set: %+4d, Act: %+5ld\n"
                      "Sv Set: %3d, %3d\n"
+                     "Gyro: %s  Spin:%+4d%% %+4ddps\n"
                      "Joy: L(%+3d,%+3d) R(%+3d,%+3d)",
                      s_command_motor_speed_setpoint[0], s_motor_speed_display[0],
                      s_command_motor_speed_setpoint[1], s_motor_speed_display[1],
                      s_command_motor_speed_setpoint[2], s_motor_speed_display[2],
                      s_command_motor_speed_setpoint[3], s_motor_speed_display[3],
                      s_servo_angle_preset[0], s_servo_angle_preset[1],
+                     (s_command_gyro_enabled != 0U) ? "ON " : "OFF",
+                     (int)s_command_gyro_signed_speed, gyro_dps,
                      s_joy_lx, s_joy_ly, s_joy_rx, s_joy_ry);
             (void)UI_LabelSetTextIfChanged(s_cmd_ctrl_label, big_buf);
         }
@@ -1262,6 +1275,15 @@ static void mecanum_start_timer_cb(lv_timer_t *timer)
     s_mecanum_timer = NULL;
     if (s_mecanum_executing)
     {
+        /* Keep the execution path protected as well as the editor. This also
+         * sanitises values retained from firmware versions without an upper limit. */
+        if (s_mec_speed_x < LVGL_APP_MECANUM_SPEED_MIN) s_mec_speed_x = LVGL_APP_MECANUM_SPEED_MIN;
+        if (s_mec_speed_x > LVGL_APP_MECANUM_SPEED_MAX) s_mec_speed_x = LVGL_APP_MECANUM_SPEED_MAX;
+        if (s_mec_speed_y < LVGL_APP_MECANUM_SPEED_MIN) s_mec_speed_y = LVGL_APP_MECANUM_SPEED_MIN;
+        if (s_mec_speed_y > LVGL_APP_MECANUM_SPEED_MAX) s_mec_speed_y = LVGL_APP_MECANUM_SPEED_MAX;
+        if (s_mec_speed_z < LVGL_APP_MECANUM_SPEED_MIN) s_mec_speed_z = LVGL_APP_MECANUM_SPEED_MIN;
+        if (s_mec_speed_z > LVGL_APP_MECANUM_SPEED_MAX) s_mec_speed_z = LVGL_APP_MECANUM_SPEED_MAX;
+
         lvgl_app_set_status("Mecanum EXECUTING");
         lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Mecanum executing");
         
@@ -1492,20 +1514,23 @@ static void lvgl_app_control_adjust_selected(int8_t direction)
         }
         else if (s_ctrl_selected_row == 3)
         {
-            value = s_mec_speed_x + direction * 10;
-            if (value < 0) value = 0;
+            value = s_mec_speed_x + direction * LVGL_APP_MECANUM_SPEED_STEP;
+            if (value < LVGL_APP_MECANUM_SPEED_MIN) value = LVGL_APP_MECANUM_SPEED_MIN;
+            if (value > LVGL_APP_MECANUM_SPEED_MAX) value = LVGL_APP_MECANUM_SPEED_MAX;
             s_mec_speed_x = value;
         }
         else if (s_ctrl_selected_row == 4)
         {
-            value = s_mec_speed_y + direction * 10;
-            if (value < 0) value = 0;
+            value = s_mec_speed_y + direction * LVGL_APP_MECANUM_SPEED_STEP;
+            if (value < LVGL_APP_MECANUM_SPEED_MIN) value = LVGL_APP_MECANUM_SPEED_MIN;
+            if (value > LVGL_APP_MECANUM_SPEED_MAX) value = LVGL_APP_MECANUM_SPEED_MAX;
             s_mec_speed_y = value;
         }
         else if (s_ctrl_selected_row == 5)
         {
-            value = s_mec_speed_z + direction * 10;
-            if (value < 0) value = 0;
+            value = s_mec_speed_z + direction * LVGL_APP_MECANUM_SPEED_STEP;
+            if (value < LVGL_APP_MECANUM_SPEED_MIN) value = LVGL_APP_MECANUM_SPEED_MIN;
+            if (value > LVGL_APP_MECANUM_SPEED_MAX) value = LVGL_APP_MECANUM_SPEED_MAX;
             s_mec_speed_z = value;
         }
     }
@@ -2962,6 +2987,135 @@ static void lvgl_app_show_main_menu(void)
 
 static uint8_t s_cmd_rx_buf[2][64];
 static uint16_t s_cmd_rx_idx[2] = {0U, 0U};
+static char s_cmd_text_rx_buf[2][64];
+static uint16_t s_cmd_text_rx_idx[2] = {0U, 0U};
+
+static void lvgl_app_cmd_send_text(uint8_t channel, const char *text)
+{
+    uint16_t length;
+
+    if (text == NULL)
+    {
+        return;
+    }
+
+    length = (uint16_t)strlen(text);
+    if (channel == 0U)
+    {
+        (void)CommService_UartSend((const uint8_t *)text, length);
+    }
+    else
+    {
+        (void)CDC_Transmit_FS((uint8_t *)text, length);
+    }
+}
+
+static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
+{
+    char command[8] = {0};
+    char action[8] = {0};
+    char direction_text[8] = {0};
+    char extra[8] = {0};
+    int speed_percent = 0;
+    int fields;
+    uint16_t i;
+    int8_t direction;
+
+    if ((line == NULL) || (LVGL_App_IsCommandControlActive() == 0U))
+    {
+        return;
+    }
+
+    for (i = 0U; line[i] != '\0'; ++i)
+    {
+        line[i] = (char)toupper((unsigned char)line[i]);
+    }
+
+    fields = sscanf(line, "%7s %7s %7s %d %7s",
+                    command, action, direction_text, &speed_percent, extra);
+    if (strcmp(command, "GYRO") != 0)
+    {
+        return;
+    }
+
+    if ((fields == 2) && (strcmp(action, "OFF") == 0))
+    {
+        Mecanum_GyroDisable();
+        Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        s_command_gyro_enabled = 0U;
+        s_command_gyro_signed_speed = 0;
+        lvgl_app_cmd_send_text(channel, "GYRO OFF OK\r\n");
+    }
+    else if ((fields == 4) && (strcmp(action, "ON") == 0) &&
+             (speed_percent >= 0) && (speed_percent <= 100))
+    {
+        if (strcmp(direction_text, "CW") == 0)
+        {
+            direction = MECANUM_GYRO_DIRECTION_CW;
+        }
+        else if (strcmp(direction_text, "CCW") == 0)
+        {
+            direction = MECANUM_GYRO_DIRECTION_CCW;
+        }
+        else
+        {
+            lvgl_app_cmd_send_text(channel, "ERR GYRO DIR CW|CCW\r\n");
+            return;
+        }
+
+        if (Mecanum_GyroEnable(direction, (uint8_t)speed_percent) != 0U)
+        {
+            s_command_gyro_enabled = 1U;
+            s_command_gyro_signed_speed =
+                (int8_t)((direction == MECANUM_GYRO_DIRECTION_CCW) ?
+                         -speed_percent : speed_percent);
+            lvgl_app_cmd_send_text(channel, "GYRO ON OK\r\n");
+        }
+        else
+        {
+            lvgl_app_cmd_send_text(channel, "ERR GYRO RANGE 0-100\r\n");
+        }
+    }
+    else
+    {
+        lvgl_app_cmd_send_text(channel,
+                               "ERR USE: GYRO ON CW|CCW 0-100 / GYRO OFF\r\n");
+    }
+
+    s_ctrl_last_actual_refresh_tick = 0U;
+}
+
+static void lvgl_app_cmd_text_rx_byte(uint8_t channel, uint8_t byte)
+{
+    uint16_t *index = &s_cmd_text_rx_idx[channel];
+    char *text_buf = s_cmd_text_rx_buf[channel];
+
+    if ((byte == '\r') || (byte == '\n'))
+    {
+        if (*index != 0U)
+        {
+            text_buf[*index] = '\0';
+            lvgl_app_cmd_parse_text(channel, text_buf);
+            *index = 0U;
+        }
+        return;
+    }
+
+    if ((byte < 0x20U) || (byte > 0x7EU))
+    {
+        *index = 0U;
+        return;
+    }
+
+    if (*index < (sizeof(s_cmd_text_rx_buf[channel]) - 1U))
+    {
+        text_buf[(*index)++] = (char)byte;
+    }
+    else
+    {
+        *index = 0U;
+    }
+}
 
 static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
 {
@@ -3022,6 +3176,43 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
             } else {
                 // SPEED mode
                 Mecanum_MixedControl((float)vx_in, (float)vy_in, (float)wz_in, 0.0f, 0.0f, 0.0f);
+            }
+        }
+        else if (dev_id == 0x0D && len >= 0x09) // Gyro mode control
+        {
+            uint8_t enable = frame[5];
+            int8_t direction = (int8_t)frame[6];
+            uint8_t speed_percent = frame[7];
+
+            /* Latched event command: only this explicit frame may change gyro
+             * mode. Missing/repeated joystick frames never imply GYRO OFF. */
+            if ((enable <= 1U) &&
+                (speed_percent <= 100U) &&
+                ((direction == MECANUM_GYRO_DIRECTION_CW) ||
+                 (direction == MECANUM_GYRO_DIRECTION_CCW)))
+            {
+                int8_t signed_speed =
+                    (int8_t)((direction == MECANUM_GYRO_DIRECTION_CCW) ?
+                             -(int16_t)speed_percent : (int16_t)speed_percent);
+
+                if (enable == 0U)
+                {
+                    uint8_t was_enabled = Mecanum_IsGyroModeEnabled();
+                    Mecanum_GyroDisable();
+                    if (was_enabled != 0U)
+                    {
+                        Mecanum_MixedControl(0.0f, 0.0f, 0.0f,
+                                            0.0f, 0.0f, 0.0f);
+                    }
+                    s_command_gyro_enabled = 0U;
+                    /* Preserve the ESP32 slider preset while gyro mode is OFF. */
+                    s_command_gyro_signed_speed = signed_speed;
+                }
+                else if (Mecanum_GyroEnable(direction, speed_percent) != 0U)
+                {
+                    s_command_gyro_enabled = 1U;
+                    s_command_gyro_signed_speed = signed_speed;
+                }
             }
         }
         else if (dev_id == 0x05 && len >= 0x09) // PWM Servo
@@ -3106,12 +3297,15 @@ void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
     if (LVGL_App_IsCommandControlActive() == 0U)
     {
         s_cmd_rx_idx[channel] = 0U;
+        s_cmd_text_rx_idx[channel] = 0U;
         return;
     }
     rx_buf = s_cmd_rx_buf[channel];
     rx_idx = &s_cmd_rx_idx[channel];
 
     for (i = 0; i < len; i++) {
+        lvgl_app_cmd_text_rx_byte(channel, buf[i]);
+
         if (*rx_idx < sizeof(s_cmd_rx_buf[channel])) {
             rx_buf[(*rx_idx)++] = buf[i];
         }
@@ -3167,6 +3361,8 @@ static void lvgl_app_command_exit_event_cb(lv_event_t *e)
     LVGL_App_CommandStopMotors();
     s_cmd_rx_idx[0] = 0U;
     s_cmd_rx_idx[1] = 0U;
+    s_cmd_text_rx_idx[0] = 0U;
+    s_cmd_text_rx_idx[1] = 0U;
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     lv_port_indev_suppress_all_keys_until_release();
     lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
@@ -3187,6 +3383,8 @@ static void lvgl_app_show_command_control(void)
     LVGL_App_CommandStopMotors();
     s_cmd_rx_idx[0] = 0U;
     s_cmd_rx_idx[1] = 0U;
+    s_cmd_text_rx_idx[0] = 0U;
+    s_cmd_text_rx_idx[1] = 0U;
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;

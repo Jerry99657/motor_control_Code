@@ -1,50 +1,66 @@
-# STM32H743ZIT6_KIT 工程说明
+# STM32H743ZIT6_KIT
 
-## 1. 项目概述
-本工程基于 STM32H743ZIT6，使用 STM32CubeMX + HAL + CMake 构建，围绕以下核心能力实现：
+基于 **STM32H743ZIT6** 的麦克纳姆轮机器人控制与 LVGL 人机交互工程。工程使用 STM32CubeMX 生成 HAL 外设初始化，采用 CMake/Ninja 构建，集成四路直流电机闭环控制、麦轮运动学、MPU6500 姿态采集、USB/UART5 通信、SD 卡媒体播放、WS2812 灯带和 LVGL 图形界面。
 
-- LVGL 人机交互（按键导航 + 菜单页面）
-- 四路直流电机闭环控制（速度环 + 位置环串级）
-- 麦克纳姆底盘运动控制（平移/旋转/混合轨迹）
-- MPU6500 姿态数据采集与航向角参与控制
-- WS2812 灯带控制（定时器 PWM + DMA）
-- SD 文件浏览与媒体相关功能
-- VOFA+ 实时数据显示（速度、占空比）
-- USB CDC 与 UART5 指令通道
+## 1. 项目功能总览
 
----
+- 四路直流电机速度闭环和位置闭环，支持 `-100~100%` 速度设定。
+- 麦克纳姆底盘 X/Y 平移、Z 轴旋转以及“速度 + 距离”混合轨迹控制。
+- MPU6500 六轴数据采集与姿态融合，提供平面航向角和航向角速度。
+- 小陀螺模式：车体连续自转，同时通过航向补偿保持世界坐标方向运动。
+- LVGL 菜单、固定页面骨架、页面过渡、焦点反馈、数值惯性和 UI 性能诊断。
+- SD 卡目录浏览，播放 `.bin` 动画、`.avi` MJPEG 视频和 `.gif` 动画。
+- 媒体播放暂停/继续、前后跳帧、停止和返回目录。
+- WS2812 RGB 控制及上电状态提示。
+- USB CDC、UART5 文本/二进制控制协议和 ESP32-C3 虚拟摇杆。
+- VOFA+ 50 Hz JustFloat 实时上传电机转速和占空比。
 
-## 2. 软件架构与主要模块
+## 2. 代码结构
 
-### 2.1 控制层级
+```text
+Core/Src/main.c                 系统初始化、主循环、定时器回调、USB/UART 分发
+Drivers/User/Src/lvgl_app.c    LVGL 页面、按键逻辑、命令解析
+Drivers/User/Src/mecanum.c     麦轮逆解、距离轨迹、小陀螺航向补偿
+Drivers/User/Src/dc_motor_ol.c 电机测速、速度环、位置环、PWM 输出
+Drivers/User/Src/imu.c         MPU6500 采样和姿态融合
+Drivers/User/Src/imu_service.c 平面航向快照、航向角速度和安装方向处理
+Drivers/User/Src/media_control.c 媒体按键、暂停、跳帧和返回状态机
+Drivers/User/Src/mjpeg_player.c AVI/MJPEG 解码与播放调度
+Drivers/User/Src/sd_diskio.c   SD 读写、DMA、Cache 维护
+Drivers/User/Src/ui_*.c        Theme、页面骨架、过渡、反馈、动画和性能诊断
+Drivers/User/Src/ws2812*.c     WS2812 定时器 DMA 驱动
+```
 
-- 底层执行层：`dc_motor_ol.c`
-  - 负责编码器读取、速度测量、PWM 输出
-  - 实现速度 PID、位置 PID（外环）以及串级控制
-- 底盘运动层：`mecanum.c`
-  - 将车体速度/位移指令解算为四轮目标
-  - 提供航向角闭环（角度环）与混合模式（速度 + 距离）
-- UI 与协议层：`lvgl_app.c`
-  - 一级菜单、页面逻辑、键盘导航
-  - 命令帧解析、页面联动控制
-- 系统调度层：`main.c`
-  - 初始化全部外设与模块
-  - 周期任务调度（TIM6/TIM7/TIM13/TIM16）
+### 定时任务
 
-### 2.2 定时任务分工
+`HAL_TIM_PeriodElapsedCallback()` 中的任务分工如下：
 
-`HAL_TIM_PeriodElapsedCallback()` 中的任务分配：
+| 定时器 | 周期 | 任务 |
+| --- | ---: | --- |
+| TIM6 | 1 ms | `lv_tick_inc(1)`，LVGL 时基 |
+| TIM7 | 由配置决定 | MJPEG 播放调度 |
+| TIM13 | 10 ms | 安全检查、`Mecanum_Tick10ms()`、`DCMotor_OL_Tick10ms()` |
+| TIM16 | 由配置决定 | ADC 采样和电源数据更新 |
 
-- TIM6：`lv_tick_inc(1)`，LVGL 1ms 系统时基
-- TIM7：`MJPEG_Scheduler_OnTim7Tick()`，媒体播放调度
-- TIM13：`DCMotor_OL_Tick10ms()` + `Mecanum_Tick10ms()`，10ms 控制周期
-- TIM16：ADC 采样与电压计算
+主循环执行通信处理、IMU 服务、ADC 服务、LVGL 任务和 VOFA 上传；10 ms 电机/底盘控制放在定时器回调中，避免被 UI 或 SD 卡操作长期阻塞。
 
----
+## 3. 按键和页面通用操作
 
-## 3. LVGL 一级菜单功能（Main Menu）
+LVGL 当前使用以下逻辑按键：
 
-一级菜单位于 `lvgl_app_show_main_menu()`，共 6 项：
+| 按键 | 作用 |
+| --- | --- |
+| Up/Down | 上移/下移焦点；编辑数值时改变数值 |
+| Left/Right | 进入/退出子页面；编辑数值时减小/增大；媒体页后退/快进 |
+| OK | 进入编辑、确认设置；媒体页暂停/播放 |
+| KEY2 | 全局停止/退出保护键；媒体播放中停止播放 |
+| KEY3 | 媒体播放中停止当前媒体并返回 SD 文件目录；普通 LVGL 页面作为返回键 |
+
+页面采用统一的“标题栏 + 内容区 + 状态栏”骨架。通常使用 Right/OK 进入，Left/KEY3 返回，KEY2 负责停止当前运动或媒体。进入 Command Control、Mecanum Control 或媒体播放前后，工程都会清理上一页面遗留的控制状态。
+
+## 4. 主页面和各功能页面
+
+主菜单共 7 项：
 
 1. `Motor Control`
 2. `Command Control`
@@ -52,496 +68,261 @@
 4. `Mecanum Control`
 5. `MPU6500 Data`
 6. `WS2812 Control`
-
-对应核心函数如下：
-
-- 主菜单构建：`lvgl_app_show_main_menu()`
-- 一级菜单事件分发：`lvgl_app_menu_event_cb()`
-- 二级页面入口：
-  - `lvgl_app_show_motor_control_menu()`
-  - `lvgl_app_show_command_control()`
-  - `lvgl_app_show_sd_browser()`
-  - `lvgl_app_show_mecanum_control()`
-  - `lvgl_app_show_mpu6500_data()`
-  - `lvgl_app_show_ws2812_control()`
-
----
-
-## 4. 一级页面功能说明
+7. `UI Diagnostics`
 
 ### 4.1 Motor Control
 
-包含两个子功能：
+进入后先显示二级菜单：`Motor Speed`、`Servo Angle`、`Back`。
 
-- `Motor Speed`：四路电机速度百分比设定与回读
-- `Servo Angle`：舵机角度控制
-
-核心函数：
-
-- `lvgl_app_show_motor_control_menu()`
-- `lvgl_app_show_motor_speed_control()`
-- `lvgl_app_motor_speed_send_cmd()`
-- `lvgl_app_motor_speed_sync_actual()`
+- `Motor Speed`：选择 M1~M4，按 OK 进入编辑，Left/Right 每次改变 10%，范围 `-100~100%`；再次 OK 发送设定，KEY3/ESC 取消编辑。
+- `Servo Angle`：选择舵机通道，角度范围 `0~270°`，步进 10°，操作流程与电机速度相同。
+- 页面同时刷新 Set（设定值）和 Act（实际值），便于观察闭环响应。
+- KEY2 可立即停止所有电机并退出当前编辑。
 
 ### 4.2 Command Control
 
-用于接收并解析命令帧，转发到电机/底盘/舵机控制。
+该页面是 USB/UART5 远程控制的安全门。**只有当前页面为 Command Control 时，USB/UART5 的电机、麦轮、舵机和小陀螺控制指令才会执行**；进入页面会先停止并清空上一轮指令，离开页面也会停止电机和小陀螺。
 
-核心函数：
+页面显示：
 
-- `lvgl_app_show_command_control()`
-- `lvgl_app_com_rx_cb()`
-- `lvgl_app_cmd_parse()`
+- M1~M4：`Set` 设定速度和 `Act` 实际速度。
+- Servo：当前舵机设定值。
+- `Gyro: ON/OFF`、旋转方向、速度百分比和角速度（deg/s）。
+- 虚拟摇杆的 LX/LY/RX/RY 原始值。
+
+OK 可以在页面内直接编辑电机或舵机行；Left/Right 修改数值，OK 确认。KEY2 为全局停止，KEY3/ESC 返回主菜单。
 
 ### 4.3 SD Card Files
 
-用于浏览 SD 卡目录并进入媒体相关功能。
+进入页面后扫描 SD 卡当前目录：
 
-核心函数：
+- Down/Up 选择文件或文件夹。
+- Right/OK 进入文件夹或开始播放媒体。
+- Left/KEY3 返回上一级目录；在根目录再次返回主菜单。
+- KEY2 停止正在播放的媒体。
 
-- `lvgl_app_show_sd_browser()`
-- `lvgl_app_sd_scan_current_path()`
-- `lvgl_app_sd_file_event_cb()`
+当前识别的媒体包括 `.bin`、`.avi` 和 `.gif`。AVI 文件既可按扩展名识别，也可通过 RIFF/AVI 文件头识别，播放返回后会重新扫描当前目录。
 
 ### 4.4 Mecanum Control
 
-用于设置底盘 X/Y/旋转速度与位移参数，并执行或停止麦轮混合控制。
+页面有 7 行：
 
-核心函数：
+1. `X Dist(cm)`：X 方向距离
+2. `Y Dist(cm)`：Y 方向距离
+3. `Z Rot(deg)`：原地旋转角度
+4. `X Speed`：X 方向速度
+5. `Y Speed`：Y 方向速度
+6. `Z Speed`：Z 方向角速度
+7. `EXECUTE` / `STOP ACTIVE`
 
-- `lvgl_app_show_mecanum_control()`
-- `lvgl_app_control_confirm_selected()`
-- `Mecanum_MixedControl()`
+距离按 10 cm 修改，速度范围为 `-100~100`，按 OK 进入编辑。执行后，带距离的轴使用 10 ms 轨迹控制逐步推进；四轮到位后自动停止，不会留下某个轮子继续转动。执行期间第 7 行变为 `STOP ACTIVE`，再次 OK 或 KEY2 可停止。
+
+速度换算关系：X/Y 的界面值乘以 10 转换为 mm/s，Z 角速度保持 deg/s；距离 cm 转换为 mm。麦轮逆运动学使用四轮速度组合：
+
+```text
+V1 = Vx + Vy + W
+V2 = -Vx + Vy + W
+V3 = -Vx - Vy + W
+V4 = Vx - Vy + W
+```
+
+输出会按最大轮速统一缩放，保持运动方向比例。
 
 ### 4.5 MPU6500 Data
 
-实时显示 MPU6500 采样与姿态相关信息。
-
-核心函数：
-
-- `lvgl_app_show_mpu6500_data()`
-- `mpu6500_timer_cb()`
+显示加速度、角速度、姿态角、平面航向角和航向角速度等实时数据。该页用于确认传感器方向、零偏和数据刷新是否正常；没有磁力计时，航向角只能作为相对角度使用，长期会产生漂移。
 
 ### 4.6 WS2812 Control
 
-用于 RGB 实时调节与灯带验证显示。
+通过 RGB 三个滑块调节灯带颜色，并实时发送到 WS2812。上电初始化时短暂显示绿色提示，初始化完成后应自动熄灭；若持续亮起，优先检查初始化流程和 DMA 更新完成状态。
 
-核心函数：
+### 4.7 UI Diagnostics
 
-- `lvgl_app_show_ws2812_control()`
-- `lvgl_app_ws2812_key_cb()`
-- `lvgl_app_ws2812_slider_cb()`
-- `ws2812_update()`
+UI Diagnostics 分为 Overview、Display、Memory 三个视图，使用 Left/Right 切换，KEY2/KEY3/ESC 返回。页面只显示关键指标：LVGL FPS、刷新耗时、脏区刷新次数、媒体/显示状态和内存池使用情况，避免一次性显示过多信息影响诊断本身。
 
----
+## 5. 媒体播放操作
 
-## 5. VOFA+ 显示与通信链路
+媒体播放由 `media_control.c` 统一处理按键，播放器本身负责解码和帧调度。
 
-### 5.1 VOFA+ 数据上传
+| 操作 | `.bin` | `.avi` MJPEG | `.gif` |
+| --- | --- | --- | --- |
+| OK 短按 | 暂停/播放 | 暂停/播放 | 暂停/播放 |
+| Left 短按 | 后退 10 帧 | 后退 10 帧 | 后退 10 帧 |
+| Right 短按 | 前进 10 帧 | 前进 10 帧 | 前进 10 帧 |
+| Left/Right 长按 | 每 250 ms 重复跳帧 | 每 250 ms 重复跳帧 | 每 250 ms 重复跳帧 |
+| KEY2 | 停止并退出播放 | 停止并退出播放 | 停止并退出播放 |
+| KEY3 | 停止并返回 SD 目录 | 停止并返回 SD 目录 | 停止并返回 SD 目录 |
 
-`VOFA_Task_Process()` 每 20ms（50Hz）发送一帧 JustFloat 数据：
+短按和长按采用独立的边沿/重复计时，跳帧后会更新播放基准，避免出现“回退一帧又被正常播放立即推进”的来回抖动。AVI 播放使用 TIM7 调度，SD DMA 缓冲区需位于 DMA 可访问内存，并在 Cache 开启时执行对应的 Clean/Invalidate。
 
-- `speed[4]`：四个电机的实时转速 RPM
-- `duty[4]`：四个电机的实际 PWM 占空比百分比
-- 帧尾：`0x00 0x00 0x80 0x7f`
+常见错误码定义在 `mjpeg_player.h`，包括挂载失败、文件失败、格式失败、I/O 失败、解码失败、停止和缓冲区过大等。看到 `failed(-5)` 时优先检查 SD 读错误、DMA 完成状态、Cache 维护和缓冲区越界；看到 `failed(-6)` 时优先检查 MJPEG 帧头、JPEG 解码和帧缓冲区大小。
 
-数据源函数：
+## 6. 小陀螺模式实现逻辑
 
-- `DCMotor_OL_GetSpeedRpm()`
-- `DCMotor_OL_GetDutyPercent()`
+### 6.1 目标
 
-发送接口：
+小陀螺模式让车体绕自身中心旋转，同时保持用户指定的世界坐标运动方向。例如开启后让车体顺时针自转，摇杆向前仍然沿开启瞬间的“世界前方”移动，而不是随着车头转动改变方向。
 
-- `CDC_Transmit_FS()`
+### 6.2 传感器和坐标处理
 
-### 5.2 下行命令输入
+MPU6500 没有磁力计，因此工程不能得到绝对地磁北向。`imu_service.c` 对校准后的 Z 轴陀螺数据积分得到相对平面航向角：
 
-- USB CDC：`CDC_Receive_FS()` 中分发给
-  - `lvgl_app_com_rx_cb()`
-  - `vofa_usb_rx_cb()`
-- UART5：中断接收回调 `HAL_UART_RxCpltCallback()` 中分发给
-  - `lvgl_app_com_rx_cb()`
+```text
+yaw(k) = wrap(yaw(k-1) + gyro_z_dps * dt)
+```
 
-简易调速命令（VOFA 输入）示例：
+启动时根据传感器初始安装方向自动确定 Z 轴正负；航向角被限制在 `[-180°, 180°]`。进入小陀螺模式的瞬间保存参考角 `yaw_ref`，该参考角就是本次运动的世界坐标零点。由于没有磁力计，长时间运行仍会有陀螺漂移。
 
-- `M1:50`：1号电机 50%
-- `STOP`：四电机停止
+### 6.3 指令和执行
 
----
+小陀螺参数为：
 
-## 6. 电机控制算法详解
+- `ON/OFF`：是否启用。
+- 方向：CW 顺时针或 CCW 逆时针。
+- 速度：`0~100%`。
+- 基准角速度：200 deg/s，实际角速度为 `speed_percent × 200 / 100`。
 
-控制算法核心文件：`dc_motor_ol.c`。
+启用后每 10 ms 执行：
 
-### 6.1 速度环（内环）
+1. 读取当前平面航向，并按采样延迟做短时外推。
+2. 计算车体当前角度相对 `yaw_ref` 的差值。
+3. 把用户的世界坐标速度 `(Vx_world, Vy_world)` 旋转到车体坐标：
 
-#### 6.1.1 采样与测速
-每 10ms 从编码器计数差计算实际转速：
+   ```text
+   Vx_body = cos(theta) * Vx_world + sin(theta) * Vy_world
+   Vy_body = -sin(theta) * Vx_world + cos(theta) * Vy_world
+   ```
 
-$$
-\omega_{meas\_rpm} = \frac{\Delta count \times 60000}{N_{enc} \times T_s}
-$$
+4. 将平移速度和限幅后的旋转速度一起送入麦轮逆解。
+5. 角速度使用约 400 deg/s² 的斜坡变化，反向时先经过零速，减少机械冲击。
 
-其中：
+小陀螺模式会在以下情况关闭或停止：收到显式 `GYRO OFF`、离开 Command Control、KEY2 全局停止、底盘停止或 IMU 安全故障。当前通信设计不再对小陀螺命令单独设置 300 ms 超时；ESP32 只在 ON/OFF 状态变化时发送模式命令，摇杆超时只将平移/旋转摇杆归零，不会伪造 `GYRO OFF`。
 
-- $N_{enc}=1000$（每圈脉冲数）
-- $T_s=10ms$
+## 7. 通信协议
 
-#### 6.1.2 目标转速换算
+### 7.1 文本命令
 
-$$
-\omega_{ref\_rpm} = \frac{speed_{\%} \times RPM_{max\_target}}{100}
-$$
+文本命令以 `\r` 或 `\n` 结束：
 
-#### 6.1.3 前馈 + PID
-代码使用了前馈项 + PID：
+```text
+M1:50                 设置 M1 为 +50%
+M3:-30                设置 M3 为 -30%
+STOP                  停止全部电机
+GYRO ON CW 60         顺时针 60%
+GYRO ON CCW 40        逆时针 40%
+GYRO OFF              关闭小陀螺
+```
 
-$$
-u_{ff} = \frac{\omega_{ref\_rpm} \times 100}{RPM_{no\_load}}
-$$
+`GYRO ...` 可由 USB CDC 或 UART5 接收，但只在 Command Control 页面生效。`M1:xx`/`STOP` 的快速调试入口位于 USB CDC 的 VOFA 接收路径。
 
-$$
-e = \omega_{ref\_rpm} - \omega_{meas\_rpm}
-$$
+### 7.2 二进制帧
 
-$$
-u = u_{ff} + K_p e + K_i \sum e + K_d(e - e_{k-1})
-$$
+通用格式为：
 
-并进行：
+```text
+77 68 LEN DEV_ID CMD PAYLOAD ... 0A
+```
 
-- 输出限幅：$u \in [-100,100]$
-- 积分限幅：$I \in [-8000,8000]$
-- 抗积分饱和：当输出饱和且误差继续推动饱和时暂停积分
+`LEN` 为整帧长度，当前接受 `0x04~0x10`，尾字节必须为 `0x0A`。普通写命令使用 `CMD=0x02`：
 
-当前参数：
+| DEV_ID | 用途 | 主要负载 |
+| --- | --- | --- |
+| `0x01` | 四电机速度 | Byte5~8 为 M1~M4 的 int8 速度 |
+| `0x02` | 单电机速度 | Byte5 电机号，Byte6 int8 速度 |
+| `0x03` | 麦轮混合控制 | mode、Vx、Vy、Wz；mode=0 速度，mode=1 距离 |
+| `0x05` | 舵机角度 | 舵机端口和角度 |
+| `0x0D` | 小陀螺 | Byte5 使能，Byte6 方向，Byte7 速度百分比 |
 
-- `Kp = 0.08`
-- `Ki = 0.015`
-- `Kd = 0.0`
+小陀螺 60% 顺时针示例：
 
----
+```text
+77 68 09 0D 02 01 01 3C 0A
+```
 
-### 6.2 位置环（外环）
+`DEV_ID=0x0C、LEN=0x0A` 为 ESP32 虚拟摇杆帧，Byte4~7 依次是 `LX、LY、RX、RY`（int8）：
 
-位置环输出不是 PWM，而是“目标转速”，再交给速度环跟踪（典型串级控制）。
+```text
+wz = LX * 2
+vy = RX * 10
+vx = RY * 10
+```
 
-#### 6.2.1 误差与输出
+读命令回包当前固定从 UART5 发送；即使请求来自 USB CDC，也需要监听 UART5 才能收到回复。
 
-$$
-e_p = p_{ref} - p_{meas}
-$$
+### 7.3 ESP32-C3 虚拟手柄
 
-$$
-\omega_{ref\_rpm} = K_{p,p}e_p + K_{i,p}\sum e_p + K_{d,p}(e_p - e_{p,k-1})
-$$
+配套程序位于：
 
-并加入速度上限约束（`speed_limit_percent`）：
+`D:\STM32\ESP32\ESP32_controller\ESP32_connect_XboxController\ESP32_connect_Xbox`
 
-$$
-\omega_{ref\_rpm} \in [-\omega_{limit},\omega_{limit}]
-$$
+浏览器页面提供左右摇杆、小陀螺 ON/OFF 按钮和 `-100~100` 的方向/速度滑条。当前发送策略为：
 
-其中：
+- 摇杆以约 50 Hz 发送，使用最新值，不排队发送旧帧。
+- WebSocket 缓冲区超过阈值时丢弃本次旧帧，避免网络拥塞造成延迟累积。
+- 摇杆停止或连接超时时只清零摇杆值。
+- 小陀螺 ON/OFF 为状态事件，不会因摇杆刷新超时自动关闭。
 
-$$
-\omega_{limit} = \frac{speed\_limit_{\%} \times RPM_{max\_target}}{100}
-$$
+手机端连接不稳定时，先确认手机已连接 ESP32 热点，再刷新网页；若数据延迟持续增大，优先检查浏览器页面是否为最新版本、WebSocket 缓冲区和热点信道干扰。
 
-#### 6.2.2 到位策略
+## 8. 安全策略
 
-- 位置误差死区：`|error| < 15 pulses` 直接输出 0，防止到位抖动
+- Command Control 是远程控制的页面级权限门，离开页面立即停止。
+- Mecanum Control 执行距离轨迹时，所有受限轴到位后统一清零。
+- TIM13 每 10 ms 执行安全控制；运动过程中 IMU 数据超过约 30 ms 未更新会触发 `SAFETY_FAULT_IMU_STALE` 并急停。
+- KEY2 是最高优先级的本地停止输入；媒体播放中先处理 KEY2，再处理暂停和跳帧。
+- 电机目标速度和麦轮速度统一限制在 `-100~100`，避免上层输入溢出。
 
-当前参数：
+## 9. 构建和调试
 
-- `Kp = 0.5`
-- `Ki = 0.0`
-- `Kd = 0.0`
+### STM32
 
----
+```powershell
+cmake --preset Debug
+cmake --build --preset Debug
+```
 
-## 7. 角度环（航向环）算法详解
+烧录后检查：USB CDC 是否枚举、UART5 波特率和引脚是否正确、TIM13 是否稳定 10 ms、编码器方向是否正确、SD 卡是否能正常挂载。
 
-角度环位于底盘层 `mecanum.c` 的速度模式分支中，作用是维持车体航向或按设定角速度旋转。
+### ESP32-C3
 
-### 7.1 目标角更新
-当用户给出旋转速度命令 `wz_raw` 时，积分生成目标角：
+在虚拟手柄目录执行：
 
-$$
-\theta_{ref}(k) = \theta_{ref}(k-1) + wz_{cmd} \cdot T_s
-$$
+```powershell
+pio run
+pio run -t upload
+```
 
-并做 $[-180,180]$ 回绕。
+刷写后重新打开手机网页，确认浏览器控制台没有 WebSocket 连接错误。
 
-### 7.2 角误差与 PI
+### 常见排查顺序
 
-$$
-e_\theta = \theta_{ref} - \theta_{meas}
-$$
+1. 电机不动：确认当前是否在 Command Control，检查 KEY2 是否处于按下状态以及 IMU 安全故障标志。
+2. 麦轮方向错误：单独测试 X/Y/Z，核对四轮编号、编码器方向和电机正负号。
+3. AVI 卡顿或退出：检查 SD DMA 缓冲区位置、Cache Clean/Invalidate、文件连续读取和 JPEG 帧长度。
+4. 手机摇杆延迟：观察 WebSocket 连接、浏览器页面是否持续产生旧帧积压；重新连接热点后再测试。
+5. 小陀螺方向不对：在 MPU6500 Data 页面确认 Z 轴角速度符号，再分别发送 CW/CCW 小速度命令。
 
-对误差做最短角距离回绕后，计算：
+## 10. 已知限制
 
-$$
-wz_{corr} = K_{p,\theta} e_\theta + K_{i,\theta} \int e_\theta dt
-$$
+- MPU6500 无磁力计，小陀螺的“世界坐标”是进入模式瞬间建立的相对坐标，不是绝对地理坐标；长时间运行会有航向漂移。
+- SD 卡、JPEG 解码和显示刷新仍受外部存储器时序、Cache 一致性和帧缓冲区大小影响。
+- USB/UART5 二进制控制命令必须遵守帧头、长度和尾字节格式；读回包默认走 UART5。
+- 媒体播放期间 UI 主循环工作量较大，建议使用合理分辨率、帧率和 JPEG 压缩质量。
 
-工程实现中包含以下实用策略：
+## 11. 主要入口函数
 
-- 小误差死区：`|error| < 1.5°` 输出置零
-- 积分限幅：`[-50,50]`
-- 破静摩擦补偿：非零小输出拉到 `±12`
-- 输出限幅：`[-100,100]`
+```text
+LVGL_App_Init() / LVGL_App_Process()
+lvgl_app_show_main_menu()
+lvgl_app_show_command_control()
+lvgl_app_cmd_parse()
+Mecanum_MixedControl() / Mecanum_Tick10ms()
+Mecanum_GyroEnable() / Mecanum_GyroDisable()
+DCMotor_OL_Tick10ms()
+IMU_Service_Process()
+MJPEG_Player_PlayFile()
+SD_StartAnim_PlayFile()
+VOFA_Task_Process()
+```
 
-当前参数：
-
-- `Kp = 3.0`
-- `Ki = 0.15`
-
----
-
-## 8. 麦轮控制算法详解
-
-控制核心：`Mecanum_MixedControl()` + `Mecanum_Tick10ms()`。
-
-### 8.1 运动学逆解
-先将旋转角速度换算为线速度补偿：
-
-$$
-V_w = \omega_{z,rad} \cdot K,\quad K = \frac{L+W}{2}
-$$
-
-四轮线速度：
-
-$$
-\begin{aligned}
-V_1 &= V_x + V_y + V_w\\
-V_2 &= -V_x + V_y + V_w\\
-V_3 &= -V_x - V_y + V_w\\
-V_4 &= V_x - V_y + V_w
-\end{aligned}
-$$
-
-再通过 `Mecanum_HW_SetSpeed()` 转换为电机百分比命令。
-
-### 8.2 混合模式（速度 + 距离）
-当输入包含 `dx/dy/dw` 任一非零时，进入混合轨迹模式：
-
-- 有距离约束的轴：按剩余距离积分推进，步进量受 `dt=10ms` 与当前速度限制
-- 无距离约束的轴：保留本次速度偏移
-- 每周期更新四轮目标脉冲：`DCMotor_OL_SetTargetPosition()`
-- 所有有界轴到达后，自动清零并切回速度模式，避免残余自转
-
----
-
-## 9. 关键函数速查（按用途）
-
-### 系统与调度
-
-- `main()`：模块初始化与主循环
-- `HAL_TIM_PeriodElapsedCallback()`：控制任务调度
-- `VOFA_Task_Process()`：VOFA+ 数据帧上传
-
-### 电机与底盘
-
-- `DCMotor_OL_Init()`
-- `DCMotor_OL_Tick10ms()`
-- `DCMotor_OL_SetSpeed()`
-- `DCMotor_OL_SetTargetPosition()`
-- `Mecanum_MixedControl()`
-- `Mecanum_Tick10ms()`
-
-### 界面与命令
-
-- `LVGL_App_Init()`
-- `LVGL_App_Process()`
-- `lvgl_app_show_main_menu()`
-- `lvgl_app_menu_event_cb()`
-- `lvgl_app_com_rx_cb()`
-- `lvgl_app_cmd_parse()`
-
-### 灯带
-
-- `ws2812_Init()`
-- `ws2812_update()`
-- `ws2812_set_all()`
-
----
-
-## 10. 构建与运行
-
-### 10.1 构建
-建议使用 CMake 方式：
-
-- 生成并进入构建目录（如 `build/Debug`）
-- 执行 Ninja 构建
-
-### 10.2 运行前检查
-
-- TIM13 中断正常（10ms 控制周期）
-- 编码器计数方向与电机方向一致
-- USB CDC 已枚举（VOFA+ 才能接收数据）
-- WS2812 使用 TIM15 CH2 + DMA，初始化后应可见测试灯
-
----
-
-## 11. 后续可优化项（建议）
-
-- 给速度环加入转速前馈线性标定表，改善低速一致性
-- 角度环增加 D 项或观测器，进一步降低动态超调
-- 麦轮混合模式支持 S 曲线速度规划，减少冲击
-- VOFA+ 增加航向角、位置误差、控制输出通道，提升调参效率
-
----
-
-## 12. 串口/CDC 指令全集（本工程当前实现）
-
-本工程存在两套下行命令协议：
-
-- 文本协议（主要用于 VOFA+ 串口助手快速控制）
-- 二进制帧协议（`0x77 0x68` 帧头）
-
-### 12.1 命令入口与通道
-
-#### 12.1.1 文本协议入口
-
-- 入口函数：`vofa_usb_rx_cb()`（`Core/Src/main.c`）
-- 数据来源：`CDC_Receive_FS()`（USB CDC）
-- 说明：当前仅在 USB CDC 路径调用，不走 UART5。
-
-#### 12.1.2 二进制帧协议入口
-
-- 入口函数：`lvgl_app_com_rx_cb()` -> `lvgl_app_cmd_parse()`（`Drivers/User/Src/lvgl_app.c`）
-- 数据来源：
-  - USB CDC：`CDC_Receive_FS()` 中调用 `lvgl_app_com_rx_cb()`
-  - UART5：`HAL_UART_RxCpltCallback()` 中调用 `lvgl_app_com_rx_cb()`
-- 重要限制：仅当当前页面是 `Command Control` 时生效（`s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND`）。
-
-### 12.2 文本协议指令
-
-#### 12.2.1 单电机速度设置
-
-- 格式：`M<电机号>:<速度百分比>`
-- 范围：
-  - 电机号：`1~4`
-  - 速度：`-100~100`（超出自动截断）
-- 示例：
-  - `M1:50` -> 1号电机 +50%
-  - `M3:-30` -> 3号电机 -30%
-
-#### 12.2.2 全部停止
-
-- 指令：`STOP`
-- 行为：调用 `DCMotor_OL_StopAll()`。
-
-### 12.3 二进制帧协议通用格式
-
-通用帧结构（按当前实现）：
-
-- `Byte0`：`0x77`
-- `Byte1`：`0x68`
-- `Byte2`：`LEN`（整帧长度，包含头尾）
-- `Byte3`：`DEV_ID`
-- `Byte4`：`CMD`
-- `Byte5..`：负载
-- `Byte(LEN-1)`：`0x0A`
-
-解析规则：
-
-- `LEN` 允许范围：`0x04~0x10`
-- 尾字节必须是 `0x0A`
-- 若帧头不对或长度异常，接收缓冲会移位丢弃并继续找同步。
-
-### 12.4 二进制写命令（`CMD=0x02`）
-
-#### 12.4.1 四电机同时写入
-
-- 识别条件：`DEV_ID=0x01` 且 `LEN=0x0A`
-- 负载：
-  - `Byte5~Byte8`：4 路电机速度（`int8`，对应 M1~M4）
-- 示例：
-  - `77 68 0A 01 02 0A F6 14 00 0A`
-  - 含义：M1=+10, M2=-10, M3=+20, M4=0
-
-#### 12.4.2 单电机写入
-
-- 识别条件：`DEV_ID=0x02` 且 `LEN>=0x08`
-- 负载：
-  - `Byte5`：端口号（1~4）
-  - `Byte6`：速度（`int8`）
-- 示例：
-  - `77 68 08 02 02 01 32 0A`
-  - 含义：1号电机 +50%
-
-#### 12.4.3 麦轮混合控制写入
-
-- 识别条件：`DEV_ID=0x03` 且 `LEN>=0x0D`
-- 负载：
-  - `Byte5`：模式 `mode`
-    - `0`：速度模式
-    - `1`：距离模式
-  - `Byte6~7`：`Vx`（`int16`, little-endian）
-  - `Byte8~9`：`Vy`（`int16`, little-endian）
-  - `Byte10~11`：`Wz`（`int16`, little-endian）
-- 行为：
-  - `mode=0`：`Mecanum_MixedControl(Vx,Vy,Wz,0,0,0)`
-  - `mode=1`：`Mecanum_MixedControl(100,100,100,Vx,Vy,Wz)`（以固定默认速度执行距离）
-- 示例（速度模式）：
-  - `77 68 0D 03 02 00 64 00 00 00 14 00 0A`
-  - 含义：Vx=100, Vy=0, Wz=20
-
-#### 12.4.4 舵机角度写入
-
-- 识别条件：`DEV_ID=0x05` 且 `LEN>=0x09`
-- 负载：
-  - `Byte5`：舵机端口（当前有效 1~2）
-  - `Byte7`：角度（0~180）
-- 行为：内部映射到 0~270：`target_angle = angle * 3 / 2`
-- 示例：
-  - `77 68 09 05 02 01 00 5A 0A`
-  - 含义：1号舵机设为 90°（内部映射为 135）
-
-### 12.5 二进制读命令（`CMD=0x01`）
-
-在处理读命令前，系统会先刷新一次电机实际转速：`lvgl_app_motor_speed_sync_actual()`。
-
-#### 12.5.1 四路编码器/速度读取
-
-- 请求条件：`DEV_ID=0x03`
-- 回复格式（长度 `0x0A`）：
-  - `77 68 0A 03 01 s1 s2 s3 s4 0A`
-  - 其中 `s1~s4` 为 4 路实际速度（按 `uint8` 打包）。
-
-#### 12.5.2 单路编码器/速度读取
-
-- 请求条件：`DEV_ID=0x04`
-- 请求负载：`Byte5=port(1~4)`
-- 回复格式（长度 `0x08`）：
-  - `77 68 08 04 01 port speed 0A`
-
-#### 12.5.3 回复发送通道注意事项
-
-当前实现中，读命令回包固定使用 `HAL_UART_Transmit(&huart5, ...)`，即通过 UART5 发出。
-
-这意味着：
-
-- 即使请求来自 USB CDC，回包也不会经 CDC 返回，而是走 UART5。
-- 如果上位机通过 USB CDC 发读命令却没接 UART5，会看到“无回包”。
-
-### 12.6 虚拟摇杆帧（特殊分支）
-
-存在一个特殊分支：当 `DEV_ID=0x0C` 且 `LEN=0x0A` 时，按虚拟摇杆解释：
-
-- `Byte4~Byte7`：`LX, LY, RX, RY`（`int8`）
-- 映射关系：
-  - `wz = LX * 2.0`
-  - `vy = RX * 10.0`
-  - `vx = RY * 10.0`
-- 执行：`Mecanum_MixedControl(vx, vy, wz, 0, 0, 0)`
-
-注意：该分支优先于 `CMD=0x02/0x01` 的普通解析逻辑。
-
-### 12.7 使用建议
-
-- 需要二进制协议生效时，先进入 LVGL 的 `Command Control` 页面。
-- 需要读命令回包时，请连接并监听 UART5。
-- 文本协议（`M1:50`/`STOP`）优先用于快速调试，不依赖 Command 页面。
+如需继续扩展，建议优先在现有页面骨架、`media_control` 状态机和 `Mecanum_MixedControl` 接口上增加功能，避免在 LVGL 事件回调中直接执行长时间 SD/电机操作。

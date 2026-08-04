@@ -1,0 +1,804 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <WebSocketsServer.h>
+#include <esp_system.h>
+#include <esp_wifi.h>
+
+// WiFi AP Setup
+const char* ssid = "ESP32_JoyStick";
+const char* password = "12345678"; // At least 8 characters
+
+WebServer server(80);
+WebSocketsServer webSocket(81);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+unsigned long lastSendTime = 0;
+const int sendIntervalMs = 20; // 50 Hz UART update rate
+/* Mobile browsers can briefly defer JavaScript timers while processing touch
+ * and layout work. Keep a live-control watchdog, but tolerate short stalls. */
+const uint32_t JOYSTICK_TIMEOUT_MS = 1000;
+const uint32_t AP_RETRY_INTERVAL_MS = 2000;
+const uint32_t STATUS_INTERVAL_MS = 5000;
+const uint32_t AP_HEALTH_INTERVAL_MS = 3000;
+const int8_t AP_TX_POWER_QDBM = 80; // 20 dBm, API unit is 0.25 dBm
+
+uint32_t lastJoystickUpdateMs = 0;
+uint32_t lastApRetryMs = 0;
+uint32_t lastStatusMs = 0;
+uint32_t lastApHealthMs = 0;
+bool joystickActive = false;
+bool gyroEnabled = false;
+bool gyroCommandDirty = true;
+int8_t gyroSignedSpeed = 0;
+volatile bool apRunning = false;
+uint8_t selectedApChannel = 6;
+uint8_t apHealthFailures = 0;
+uint8_t activeWebSocketClient = 0xFF;
+volatile bool apClientDisconnected = false;
+volatile bool apStopped = false;
+
+// Joystick values (-100 ~ 100)
+int lx = 0, ly = 0, rx = 0, ry = 0;
+
+// Protocol parameters
+const uint8_t HEADER_1 = 0x77;
+const uint8_t HEADER_2 = 0x68;
+const uint8_t FRAME_END = 0x0A;
+
+// HTML/JS Frontend - Highly visible, Captive Portal compatible
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+  <title>ESP32 Xbox Web Controller</title>
+  <style>
+    :root { --gyro-color:#4b5563; --gyro-glow:rgba(75,85,99,.35); }
+    body { margin:0; padding:0; min-height:100vh; background:radial-gradient(circle at 50% 0%,#1f2937 0%,#111 52%,#090b10 100%); color:#fff; overflow:hidden; touch-action:none; font-family:Arial,sans-serif; }
+    .title { text-align: center; margin-top: 10px; font-size: 16px; font-weight: bold; pointer-events: none; color: #00ffcc;}
+    #debug { position: absolute; top: 35px; width: 100%; text-align: center; font-size: 14px; color: #fff; pointer-events: none; text-shadow: 0px 0px 5px #000; z-index: 10;}
+    .gyro-panel { box-sizing:border-box; width:min(620px,calc(100% - 28px)); height:76px; margin:42px auto 0; padding:10px 14px; display:grid; grid-template-columns:104px 1fr; gap:16px; align-items:center; border:1px solid rgba(255,255,255,.12); border-radius:18px; background:linear-gradient(145deg,rgba(36,45,61,.94),rgba(18,23,32,.94)); box-shadow:0 12px 30px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.08); }
+    #gyroToggle { height:46px; border:1px solid rgba(255,255,255,.16); border-radius:14px; background:linear-gradient(180deg,#374151,#202734); color:#d1d5db; font-size:13px; font-weight:800; letter-spacing:.7px; touch-action:manipulation; transition:transform .16s cubic-bezier(.2,1.7,.4,1),box-shadow .2s,background .2s,color .2s; }
+    #gyroToggle:active { transform:scale(.92); }
+    #gyroToggle.on { color:#08111d; background:linear-gradient(135deg,#67e8f9,#22d3ee 48%,#60a5fa); box-shadow:0 0 22px rgba(34,211,238,.42),inset 0 1px 0 rgba(255,255,255,.65); transform:scale(1.035); }
+    .gyro-slider-wrap { min-width:0; }
+    .gyro-readout { display:flex; align-items:center; justify-content:space-between; margin:0 2px 7px; color:#cbd5e1; font-size:12px; font-weight:700; }
+    #gyroValue { min-width:96px; text-align:right; color:var(--gyro-color); text-shadow:0 0 12px var(--gyro-glow); transition:color .15s,text-shadow .15s,transform .15s cubic-bezier(.2,1.7,.4,1); }
+    #gyroValue.pulse { transform:scale(1.12); }
+    #gyroSlider { appearance:none; -webkit-appearance:none; width:100%; height:12px; margin:0; border-radius:999px; outline:none; background:linear-gradient(90deg,#f59e0b 0%,#2a303b 50%,#2a303b 100%); box-shadow:inset 0 2px 5px rgba(0,0,0,.5),0 0 14px var(--gyro-glow); touch-action:pan-x; }
+    #gyroSlider::-webkit-slider-thumb { -webkit-appearance:none; width:28px; height:28px; border-radius:50%; border:3px solid #f8fafc; background:var(--gyro-color); box-shadow:0 0 0 5px rgba(255,255,255,.08),0 0 18px var(--gyro-glow); transition:transform .12s cubic-bezier(.2,1.8,.4,1),background .15s; }
+    #gyroSlider:active::-webkit-slider-thumb { transform:scale(1.2); }
+    #gyroSlider::-moz-range-thumb { width:22px; height:22px; border-radius:50%; border:3px solid #f8fafc; background:var(--gyro-color); box-shadow:0 0 18px var(--gyro-glow); }
+    .gyro-scale { display:flex; justify-content:space-between; margin-top:5px; color:#64748b; font-size:10px; font-weight:700; letter-spacing:.4px; }
+    .container { display:flex; height:calc(100vh - 145px); min-height:190px; width:100%; align-items:center; justify-content:space-around; pointer-events:none; transform:translateY(8px); }
+    .joy-wrap { text-align: center; pointer-events: auto; }
+    /* Making Canvas Highly Visible */
+    canvas { 
+      background: radial-gradient(circle, #444 0%, #222 100%); 
+      border-radius: 50%; 
+      border: 3px solid #555;
+      box-shadow: 0 0 20px rgba(0,0,0,0.8) inset, 0 0 10px rgba(255,255,255,0.1); 
+      touch-action: none; 
+    }
+    .label { margin-top: 10px; color: #aaa; font-size: 14px; pointer-events: none; font-weight: bold;}
+    @media (max-height:430px) {
+      .title { margin-top:4px; }
+      #debug { top:25px; font-size:12px; }
+      .gyro-panel { height:62px; margin-top:30px; padding:7px 12px; }
+      #gyroToggle { height:40px; }
+      .gyro-readout { margin-bottom:4px; }
+      .container { height:calc(100vh - 104px); transform:translateY(4px); }
+      .label { margin-top:4px; font-size:12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="title">ESP32 Web Joystick Controller</div>
+  <div id="debug">L: (0,0) | R: (0,0)</div>
+  <div class="gyro-panel">
+    <button id="gyroToggle" type="button" aria-pressed="false">GYRO OFF</button>
+    <div class="gyro-slider-wrap">
+      <div class="gyro-readout"><span>Spin control</span><span id="gyroValue">IDLE 0%</span></div>
+      <input id="gyroSlider" type="range" min="-100" max="100" value="0" step="1" aria-label="Gyro direction and speed">
+      <div class="gyro-scale"><span>CCW -100</span><span>0</span><span>CW +100</span></div>
+    </div>
+  </div>
+  <div class="container">
+    <div class="joy-wrap">
+       <canvas id="joyL" width="160" height="160"></canvas>
+       <div class="label">Left Stick</div>
+    </div>
+    <div class="joy-wrap">
+       <canvas id="joyR" width="160" height="160"></canvas>
+       <div class="label">Right Stick</div>
+    </div>
+  </div>
+
+  <script>
+    let clx=0, cly=0, crx=0, cry=0;
+    let gyroEnabled=false, gyroSignedSpeed=0, gyroDirty=true;
+    let axesDirty=true, lastAxesSendMs=0, debugUpdatePending=false;
+    const AXES_MIN_SEND_MS=20, AXES_KEEPALIVE_MS=100, WS_MAX_BUFFERED_BYTES=128;
+    const debug = document.getElementById('debug');
+    const gyroToggle = document.getElementById('gyroToggle');
+    const gyroSlider = document.getElementById('gyroSlider');
+    const gyroValue = document.getElementById('gyroValue');
+
+    function updateGyroUI(animate=false) {
+      const value = gyroSignedSpeed;
+      const center = 50;
+      const position = center + value * 0.5;
+      let color = '#94a3b8';
+      let glow = 'rgba(148,163,184,.32)';
+      let background;
+
+      if(value > 0) {
+        color = '#38bdf8';
+        glow = 'rgba(56,189,248,.48)';
+        background = `linear-gradient(90deg,#2a303b 0%,#2a303b 50%,#38bdf8 50%,#2563eb ${position}%,#2a303b ${position}%,#2a303b 100%)`;
+        gyroValue.textContent = `CW +${value}%`;
+      } else if(value < 0) {
+        color = '#f59e0b';
+        glow = 'rgba(245,158,11,.48)';
+        background = `linear-gradient(90deg,#2a303b 0%,#2a303b ${position}%,#f97316 ${position}%,#f59e0b 50%,#2a303b 50%,#2a303b 100%)`;
+        gyroValue.textContent = `CCW ${value}%`;
+      } else {
+        background = 'linear-gradient(90deg,#2a303b 0%,#2a303b 48%,#94a3b8 48%,#94a3b8 52%,#2a303b 52%,#2a303b 100%)';
+        gyroValue.textContent = 'IDLE 0%';
+      }
+
+      document.documentElement.style.setProperty('--gyro-color', color);
+      document.documentElement.style.setProperty('--gyro-glow', glow);
+      gyroSlider.style.background = background;
+      gyroToggle.classList.toggle('on', gyroEnabled);
+      gyroToggle.textContent = gyroEnabled ? 'GYRO ON' : 'GYRO OFF';
+      gyroToggle.setAttribute('aria-pressed', gyroEnabled ? 'true' : 'false');
+      if(animate) {
+        gyroValue.classList.remove('pulse');
+        void gyroValue.offsetWidth;
+        gyroValue.classList.add('pulse');
+        setTimeout(() => gyroValue.classList.remove('pulse'), 150);
+      }
+      updateDebug();
+    }
+
+    function queueGyroState() {
+      gyroDirty = true;
+      sendLatest();
+      sendGyroState();
+    }
+
+    gyroToggle.addEventListener('click', () => {
+      gyroEnabled = !gyroEnabled;
+      updateGyroUI(true);
+      queueGyroState();
+    });
+
+    gyroSlider.addEventListener('input', () => {
+      gyroSignedSpeed = Math.max(-100, Math.min(100, Number(gyroSlider.value) || 0));
+      updateGyroUI(true);
+      queueGyroState();
+    });
+    
+    function initJoy(canvasId, isLeft) {
+      const canvas = document.getElementById(canvasId);
+      const ctx = canvas.getContext('2d');
+      const radius = canvas.width / 2;
+      const maxDist = radius - 30; // knob radius
+      
+      let cx = radius, cy = radius;
+      let kx = cx, ky = cy;
+      let active = false;
+      let touchId = null;
+
+      function draw() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        // Draw center crosshair
+        ctx.beginPath();
+        ctx.moveTo(cx - 10, cy); ctx.lineTo(cx + 10, cy);
+        ctx.moveTo(cx, cy - 10); ctx.lineTo(cx, cy + 10);
+        ctx.strokeStyle = 'rgba(255,255,255,0.3)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // Draw boundary
+        ctx.beginPath();
+        ctx.arc(cx, cy, maxDist, 0, Math.PI*2);
+        ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        // Draw knob
+        ctx.beginPath();
+        ctx.arc(kx, ky, 30, 0, Math.PI*2);
+        ctx.fillStyle = isLeft ? '#00a8ff' : '#e84118';
+        ctx.fill();
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#fff';
+        ctx.stroke();
+        ctx.closePath();
+      }
+
+      function updatePos(e) {
+        let touch = null;
+        for(let i=0; i<e.changedTouches.length; i++){
+          if(e.changedTouches[i].identifier === touchId){
+            touch = e.changedTouches[i];
+            break;
+          }
+        }
+        if(!touch && e.clientX === undefined) return;
+
+        const rect = canvas.getBoundingClientRect();
+        let tx = (touch ? touch.clientX : e.clientX) - rect.left;
+        let ty = (touch ? touch.clientY : e.clientY) - rect.top;
+
+        let dx = tx - cx;
+        let dy = ty - cy;
+        let dist = Math.sqrt(dx*dx + dy*dy);
+
+        if (dist > maxDist) {
+          kx = cx + (dx / dist) * maxDist;
+          ky = cy + (dy / dist) * maxDist;
+        } else {
+          kx = tx;
+          ky = ty;
+        }
+
+        let outX = Math.round(((kx - cx) / maxDist) * 100);
+        let outY = Math.round(((ky - cy) / maxDist) * -100); // Inverse Y
+        
+        if(isLeft) { clx = outX; cly = outY; }
+        else { crx = outX; cry = outY; }
+        axesDirty = true;
+        draw();
+        updateDebug();
+        sendLatest();
+      }
+
+      canvas.addEventListener('touchstart', e => {
+        e.preventDefault();
+        active = true;
+        touchId = e.changedTouches[0].identifier;
+        updatePos(e);
+      }, {passive:false});
+
+      canvas.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if(active) updatePos(e);
+      }, {passive:false});
+
+      const end = (e) => {
+        e.preventDefault();
+        active = false;
+        touchId = null;
+        kx = cx; ky = cy;
+        if(isLeft) { clx = 0; cly = 0; }
+        else { crx = 0; cry = 0; }
+        axesDirty = true;
+        draw();
+        updateDebug();
+        sendLatest(true);
+      };
+
+      canvas.addEventListener('touchend', end);
+      canvas.addEventListener('touchcancel', end);
+      
+      canvas.addEventListener('mousedown', e => { active = true; updatePos(e); });
+      canvas.addEventListener('mousemove', e => { if(active) updatePos(e); });
+      canvas.addEventListener('mouseup', end);
+      canvas.addEventListener('mouseleave', end);
+      
+      draw();
+    }
+
+    // Force initialization after page fully paints
+    setTimeout(() => {
+        initJoy('joyL', true);
+        initJoy('joyR', false);
+    }, 100);
+
+    let socket = null;
+    let reconnectTimer = null;
+
+    function socketReady() {
+      return socket && socket.readyState === WebSocket.OPEN;
+    }
+
+    function updateDebug() {
+      if(debugUpdatePending) return;
+      debugUpdatePending = true;
+      requestAnimationFrame(() => {
+        debugUpdatePending = false;
+        const state = socketReady() ? 'LINK' : 'WAIT';
+        const gyroState = gyroEnabled ? `G:${gyroSignedSpeed}` : 'G:OFF';
+        debug.innerText = `${state} | ${gyroState} | L: (${clx}, ${cly}) | R: (${crx}, ${cry})`;
+      });
+    }
+
+    function sendLatest(force=false) {
+      if(!socketReady()) return;
+
+      const now = performance.now();
+      if(!force && (now - lastAxesSendMs < AXES_MIN_SEND_MS)) return;
+      if(!axesDirty && (now - lastAxesSendMs < AXES_KEEPALIVE_MS)) return;
+
+      // Permit a few tiny frames in flight. The previous exact-zero test
+      // dropped nearly every update on phones whose WiFi stack drains slowly.
+      if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
+
+      const axes = new Int8Array([clx, cly, crx, cry]);
+      socket.send(axes.buffer);
+      axesDirty = false;
+      lastAxesSendMs = now;
+    }
+
+    function sendGyroState() {
+      if(!gyroDirty || !socketReady()) return;
+      if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
+
+      // This low-rate latched command is queued behind the joystick frame.
+      const gyro = new Int8Array([0x47, gyroEnabled ? 1 : 0, gyroSignedSpeed]);
+      socket.send(gyro.buffer);
+      gyroDirty = false;
+    }
+
+    function scheduleReconnect() {
+      if(reconnectTimer !== null) return;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connectSocket();
+      }, 500);
+    }
+
+    function connectSocket() {
+      if(socket && (socket.readyState === WebSocket.OPEN ||
+                    socket.readyState === WebSocket.CONNECTING)) return;
+
+      try {
+        socket = new WebSocket('ws://192.168.4.1:81/');
+        socket.binaryType = 'arraybuffer';
+        socket.onopen = () => {
+          gyroDirty = true;
+          updateDebug();
+          sendLatest();
+          sendGyroState();
+        };
+        socket.onclose = () => {
+          socket = null;
+          updateDebug();
+          scheduleReconnect();
+        };
+        socket.onerror = () => {
+          if(socket) socket.close();
+        };
+      } catch(e) {
+        socket = null;
+        scheduleReconnect();
+      }
+      updateDebug();
+    }
+
+    // Dirty axes are sent at up to 50 Hz; unchanged state is kept alive at
+    // 10 Hz. Touch handlers also request an immediate latest-value send.
+    setInterval(() => {
+      sendLatest();
+      sendGyroState();
+    }, 20);
+    connectSocket();
+    updateGyroUI(false);
+    updateDebug();
+  </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+  server.send(200, "text/html", index_html);
+}
+
+void setJoystickValues(int newLx, int newLy, int newRx, int newRy) {
+  lx = constrain(newLx, -100, 100);
+  ly = constrain(newLy, -100, 100);
+  rx = constrain(newRx, -100, 100);
+  ry = constrain(newRy, -100, 100);
+}
+
+void setGyroControl(bool enabled, int signedSpeed) {
+  const int8_t clampedSpeed = (int8_t)constrain(signedSpeed, -100, 100);
+
+  if((gyroEnabled != enabled) || (gyroSignedSpeed != clampedSpeed)) {
+    gyroEnabled = enabled;
+    gyroSignedSpeed = clampedSpeed;
+    gyroCommandDirty = true;
+    Serial.printf("[Gyro] %s value=%d\n", gyroEnabled ? "ON" : "OFF", gyroSignedSpeed);
+  }
+}
+
+void sendGyroCommand() {
+  const int8_t direction = (gyroSignedSpeed < 0) ? -1 : 1;
+  const uint8_t speedPercent = (uint8_t)abs((int)gyroSignedSpeed);
+  const uint8_t txBuf[] = {
+    HEADER_1, HEADER_2, 0x09, 0x0D, 0x02,
+    gyroEnabled ? (uint8_t)1U : (uint8_t)0U,
+    (uint8_t)direction, speedPercent, FRAME_END
+  };
+
+  Serial1.write(txBuf, sizeof(txBuf));
+  gyroCommandDirty = false;
+}
+
+void stopJoystick(const char* reason) {
+  const bool wasMoving = (lx != 0 || ly != 0 || rx != 0 || ry != 0);
+
+  setJoystickValues(0, 0, 0, 0);
+  joystickActive = false;
+  activeWebSocketClient = 0xFF;
+  /* Gyro is a latched command. A joystick heartbeat timeout only zeros the
+   * translation command; it must never synthesize a GYRO OFF frame. */
+  if(wasMoving) {
+    Serial.printf("[Safety] joystick zeroed: %s\n", reason);
+  }
+}
+
+void handleUpdate() {
+  if (server.hasArg("lx")) lx = server.arg("lx").toInt();
+  if (server.hasArg("ly")) ly = server.arg("ly").toInt();
+  if (server.hasArg("rx")) rx = server.arg("rx").toInt();
+  if (server.hasArg("ry")) ry = server.arg("ry").toInt();
+
+  setJoystickValues(lx, ly, rx, ry);
+  lastJoystickUpdateMs = millis();
+  joystickActive = true;
+
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "text/plain", "OK");
+}
+
+void handleNotFound() {
+  // Captive Portal Redirect Handler
+  server.sendHeader("Location", "http://192.168.4.1/", true);
+  server.send(302, "text/plain", "");
+}
+
+void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t length) {
+  switch(type) {
+    case WStype_CONNECTED:
+      Serial.printf("[WS] client %u connected\n", client);
+      break;
+
+    case WStype_DISCONNECTED:
+      Serial.printf("[WS] client %u disconnected\n", client);
+      if(client == activeWebSocketClient) {
+        stopJoystick("websocket disconnected");
+      }
+      break;
+
+    case WStype_BIN:
+      if(length == 4U) {
+        setJoystickValues((int8_t)payload[0], (int8_t)payload[1],
+                          (int8_t)payload[2], (int8_t)payload[3]);
+        activeWebSocketClient = client;
+        lastJoystickUpdateMs = millis();
+        joystickActive = true;
+      } else if((length == 3U) && (payload[0] == 0x47U)) {
+        setGyroControl(payload[1] != 0U, (int8_t)payload[2]);
+        activeWebSocketClient = client;
+        lastJoystickUpdateMs = millis();
+        joystickActive = true;
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+void wifiEvent(WiFiEvent_t event) {
+  if(event == ARDUINO_EVENT_WIFI_AP_START) {
+    apRunning = true;
+    Serial.println("[WiFi] SoftAP started");
+  } else if(event == ARDUINO_EVENT_WIFI_AP_STOP) {
+    apStopped = true;
+  } else if(event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+    Serial.println("[WiFi] phone associated");
+  } else if(event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+    apClientDisconnected = true;
+  } else if(event == ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED) {
+    Serial.println("[WiFi] phone received an IP address");
+  }
+}
+
+uint8_t chooseBestApChannel() {
+  static const uint8_t candidates[] = {1, 6, 11};
+  uint16_t score[3] = {0, 0, 0};
+  uint8_t best = 1; // Keep channel 6 when the scan is empty or tied.
+
+  Serial.println("[WiFi] scanning channels before SoftAP start");
+  WiFi.mode(WIFI_STA);
+  delay(100);
+
+  const int16_t count = WiFi.scanNetworks(false, true, false, 120);
+  if(count > 0) {
+    for(int16_t network = 0; network < count; ++network) {
+      const int32_t channel = WiFi.channel(network);
+      const int32_t rssi = WiFi.RSSI(network);
+      uint8_t strength;
+
+      if(rssi > -50) strength = 10;
+      else if(rssi > -60) strength = 8;
+      else if(rssi > -70) strength = 5;
+      else if(rssi > -80) strength = 3;
+      else strength = 1;
+
+      for(uint8_t i = 0; i < 3; ++i) {
+        const int32_t separation = abs(channel - candidates[i]);
+        if(separation < 5) {
+          score[i] += (uint16_t)(strength * (5 - separation));
+        }
+      }
+    }
+
+    for(uint8_t i = 0; i < 3; ++i) {
+      if(score[i] < score[best]) {
+        best = i;
+      }
+    }
+  }
+
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  Serial.printf("[WiFi] channel scores 1=%u 6=%u 11=%u, selected=%u\n",
+                score[0], score[1], score[2], candidates[best]);
+  return candidates[best];
+}
+
+bool configureAccessPointRadio() {
+  bool ok = true;
+  wifi_config_t apConfig = {};
+  esp_err_t countryResult;
+  esp_err_t protocolResult;
+  esp_err_t bandwidthResult;
+  esp_err_t powerSaveResult;
+  esp_err_t powerResult;
+  esp_err_t getConfigResult;
+  esp_err_t setConfigResult = ESP_FAIL;
+  int8_t actualPower = 0;
+
+  countryResult = esp_wifi_set_country_code("CN", true);
+  protocolResult = esp_wifi_set_protocol(
+      WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+  bandwidthResult = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
+  powerSaveResult = esp_wifi_set_ps(WIFI_PS_NONE);
+  powerResult = esp_wifi_set_max_tx_power(AP_TX_POWER_QDBM);
+
+  getConfigResult = esp_wifi_get_config(WIFI_IF_AP, &apConfig);
+  if(getConfigResult == ESP_OK) {
+    apConfig.ap.channel = selectedApChannel;
+    apConfig.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    apConfig.ap.pairwise_cipher = WIFI_CIPHER_TYPE_CCMP;
+    apConfig.ap.ssid_hidden = 0;
+    apConfig.ap.max_connection = 4;
+    apConfig.ap.beacon_interval = 100;
+    setConfigResult = esp_wifi_set_config(WIFI_IF_AP, &apConfig);
+  }
+
+  (void)esp_wifi_get_max_tx_power(&actualPower);
+  if((countryResult != ESP_OK) || (protocolResult != ESP_OK) ||
+     (bandwidthResult != ESP_OK) || (powerSaveResult != ESP_OK) ||
+     (powerResult != ESP_OK) || (getConfigResult != ESP_OK) ||
+     (setConfigResult != ESP_OK)) {
+    ok = false;
+  }
+
+  Serial.printf("[WiFi] radio country=%d protocol=%d bw=%d ps=%d power=%d "
+                "config=%d/%d actualTx=%.2f dBm\n",
+                countryResult, protocolResult, bandwidthResult,
+                powerSaveResult, powerResult, getConfigResult,
+                setConfigResult, (float)actualPower * 0.25f);
+  return ok;
+}
+
+bool accessPointHealthy() {
+  wifi_config_t apConfig = {};
+  const wifi_mode_t mode = WiFi.getMode();
+  const IPAddress ip = WiFi.softAPIP();
+
+  if((mode != WIFI_AP) && (mode != WIFI_AP_STA)) return false;
+  if((ip[0] != 192) || (ip[1] != 168) || (ip[2] != 4) || (ip[3] != 1)) {
+    return false;
+  }
+  if(esp_wifi_get_config(WIFI_IF_AP, &apConfig) != ESP_OK) return false;
+  if((apConfig.ap.channel != selectedApChannel) ||
+     (apConfig.ap.ssid_hidden != 0) ||
+     (apConfig.ap.beacon_interval != 100)) {
+    return false;
+  }
+  return true;
+}
+
+bool startAccessPoint() {
+  const IPAddress localIp(192, 168, 4, 1);
+  const IPAddress gateway(192, 168, 4, 1);
+  const IPAddress subnet(255, 255, 255, 0);
+
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false);
+
+  const bool configOk = WiFi.softAPConfig(localIp, gateway, subnet);
+  const bool apOk = WiFi.softAP(ssid, password, selectedApChannel, 0, 4);
+  const bool radioOk = apOk ? configureAccessPointRadio() : false;
+
+  apRunning = configOk && apOk;
+  apHealthFailures = 0;
+  Serial.printf("[WiFi] config=%s ap=%s radio=%s channel=%u ip=%s\n",
+                configOk ? "OK" : "FAIL",
+                apOk ? "OK" : "FAIL",
+                radioOk ? "OK" : "WARN",
+                selectedApChannel,
+                WiFi.softAPIP().toString().c_str());
+  return apRunning;
+}
+
+#if 0
+void setup_legacy() {
+  Serial.begin(115200); // 用于CDC调试(若需要保留)
+  Serial1.begin(115200, SERIAL_8N1, 3, 4); // 配置硬件UART1: RX=IO3, TX=IO4
+  
+  // Re-configure WiFi
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.mode(WIFI_AP);
+  WiFi.setSleep(false); // Prevents C3 dropping clients
+  
+  IPAddress local_ip(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(local_ip, gateway, subnet);
+  
+  // Start AP
+  WiFi.softAP(ssid, password, 6, 0, 4); // Channel 6 is often more stable
+  
+  // Set up DNS Server for Captive Portal (Redirect all domains to 192.168.4.1)
+  dnsServer.start(DNS_PORT, "*", local_ip);
+  
+  // Standard routes
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/update", HTTP_GET, handleUpdate);
+  
+  // Anything else redirects to Home (Captive Portal)
+  server.onNotFound(handleNotFound);
+  
+  server.begin();
+}
+#endif
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, 3, 4);
+  delay(200);
+
+  Serial.printf("\n[Boot] reset reason=%d\n", (int)esp_reset_reason());
+  WiFi.persistent(false);
+  WiFi.onEvent(wifiEvent);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  selectedApChannel = chooseBestApChannel();
+  (void)startAccessPoint();
+
+  dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/update", HTTP_GET, handleUpdate);
+  server.onNotFound(handleNotFound);
+  server.begin();
+
+  webSocket.begin();
+  webSocket.onEvent(webSocketEvent);
+  /* Avoid disconnecting mobile browsers during brief UI/network scheduling
+   * stalls. Joystick freshness is handled separately by its data watchdog. */
+  webSocket.enableHeartbeat(5000, 5000, 3);
+  Serial.println("[HTTP] http://192.168.4.1  [WS] port 81");
+}
+
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+  webSocket.loop();
+  delay(1);
+
+  if(apStopped) {
+    apStopped = false;
+    apRunning = false;
+    stopJoystick("SoftAP stopped");
+    Serial.println("[WiFi] SoftAP stopped");
+  }
+
+  if(apClientDisconnected) {
+    apClientDisconnected = false;
+    /* WebSocket disconnect identifies the controlling client precisely. An
+     * AP station event can also belong to a probing/secondary station. */
+    if(WiFi.softAPgetStationNum() == 0U) {
+      stopJoystick("phone disconnected");
+    }
+    Serial.println("[WiFi] station disconnected");
+  }
+
+  const uint32_t now = millis();
+  if(joystickActive && (now - lastJoystickUpdateMs >= JOYSTICK_TIMEOUT_MS)) {
+    stopJoystick("control heartbeat timeout");
+  }
+
+  if(!apRunning && (now - lastApRetryMs >= AP_RETRY_INTERVAL_MS)) {
+    lastApRetryMs = now;
+    Serial.println("[WiFi] retrying SoftAP start");
+    (void)startAccessPoint();
+  }
+
+  if(apRunning && (now - lastApHealthMs >= AP_HEALTH_INTERVAL_MS)) {
+    lastApHealthMs = now;
+    if(accessPointHealthy()) {
+      apHealthFailures = 0;
+    } else {
+      if(apHealthFailures < 0xFF) apHealthFailures++;
+      Serial.printf("[WiFi] AP health check failed (%u/2)\n", apHealthFailures);
+      if(apHealthFailures >= 2) {
+        stopJoystick("SoftAP health failure");
+        apRunning = false;
+        (void)WiFi.softAPdisconnect(true);
+        lastApRetryMs = now;
+      }
+    }
+  }
+
+  if(now - lastStatusMs >= STATUS_INTERVAL_MS) {
+    lastStatusMs = now;
+    Serial.printf("[Status] AP=%u clients=%u heap=%u axes=%d,%d,%d,%d gyro=%u/%d\n",
+                  apRunning ? 1U : 0U,
+                  WiFi.softAPgetStationNum(),
+                  ESP.getFreeHeap(), lx, ly, rx, ry,
+                  gyroEnabled ? 1U : 0U, gyroSignedSpeed);
+  }
+
+  if (now - lastSendTime >= sendIntervalMs) {
+    lastSendTime = now;
+    
+    uint8_t frameLen = 0x0A;
+    uint8_t m1_val = (uint8_t)(int8_t)lx;
+    uint8_t m2_val = (uint8_t)(int8_t)ly;
+    uint8_t m3_val = (uint8_t)(int8_t)rx;
+    uint8_t m4_val = (uint8_t)(int8_t)ry;
+
+    const uint8_t CMD_BYTE = 0x0C;
+    uint8_t checksum = 0; 
+    
+    uint8_t tx_buf[] = {
+      HEADER_1, 
+      HEADER_2, 
+      frameLen, 
+      CMD_BYTE,
+      m1_val,
+      m2_val,
+      m3_val,
+      m4_val,
+      checksum,
+      FRAME_END
+    };
+
+    Serial1.write(tx_buf, sizeof(tx_buf)); // 发送到硬件UART
+  }
+
+  /* ON/OFF is event driven and latched by STM32. No periodic gyro heartbeat:
+   * if no new command arrives, neither side changes the current mode. */
+  if(gyroCommandDirty) {
+    sendGyroCommand();
+  }
+}

@@ -4,10 +4,10 @@
 #include "safety_manager.h"
 
 #define MECANUM_IMU_STALE_TIMEOUT_MS          30U
-#define MECANUM_POSITION_TOLERANCE_PULSES     20LL
-#define MECANUM_SETTLE_SPEED_RPM              12L
-#define MECANUM_SETTLE_REQUIRED_CYCLES        5U
 #define MECANUM_TRAJECTORY_SPEED_EPSILON      0.001f
+#define MECANUM_GYRO_SPIN_SLEW_DPS_PER_TICK   4.0f
+#define MECANUM_MAX_WHEEL_SPEED_MM_S          \
+    (((float)DCMOTOR_OL_MAX_TARGET_RPM * MECANUM_WHEEL_CIRCUMFERENCE_MM) / 60.0f)
 
 typedef struct
 {
@@ -32,6 +32,16 @@ static uint8_t s_angle_closed_loop_en = 1;
 static float s_target_yaw = 0.0f;
 static float s_yaw_integral = 0.0f;
 
+/* Gyro mode keeps Vx/Vy in the field frame established at enable time while
+ * the chassis continuously rotates. Requested fields are written outside the
+ * 10 ms ISR and consumed atomically by that ISR. */
+static volatile uint8_t s_gyro_requested_enabled = 0U;
+static volatile int8_t s_gyro_requested_direction = MECANUM_GYRO_DIRECTION_CW;
+static volatile uint8_t s_gyro_requested_speed_percent = 0U;
+static uint8_t s_gyro_active = 0U;
+static float s_gyro_reference_yaw = 0.0f;
+static float s_gyro_spin_dps = 0.0f;
+
 /* Hybrid Trajectory Mode State */
 static uint8_t s_hybrid_active = 0;
 static uint8_t s_hybrid_bound_x = 0;
@@ -44,30 +54,55 @@ static float s_hybrid_tgt_vx = 0.0f;
 static float s_hybrid_tgt_vy = 0.0f;
 static float s_hybrid_tgt_wz = 0.0f;
 static uint8_t s_hybrid_profile_complete = 0U;
-static uint8_t s_hybrid_settle_count = 0U;
-static int64_t s_hybrid_start_pulses[4] = {0, 0, 0, 0};
-static float s_hybrid_wheel_offset_pulses[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-static int64_t s_hybrid_target_pulses[4] = {0, 0, 0, 0};
 
-static int64_t mecanum_round_pulses(float pulses)
+static void mecanum_clear_gyro_state(void)
 {
-    return (pulses >= 0.0f) ? (int64_t)(pulses + 0.5f) : (int64_t)(pulses - 0.5f);
+    s_gyro_requested_enabled = 0U;
+    s_gyro_requested_speed_percent = 0U;
+    s_gyro_active = 0U;
+    s_gyro_reference_yaw = 0.0f;
+    s_gyro_spin_dps = 0.0f;
 }
 
-static int64_t mecanum_abs_i64(int64_t value)
+static float mecanum_wrap_degrees(float angle)
 {
-    return (value < 0) ? -value : value;
+    while (angle > 180.0f)
+    {
+        angle -= 360.0f;
+    }
+    while (angle < -180.0f)
+    {
+        angle += 360.0f;
+    }
+    return angle;
 }
 
-static int32_t mecanum_abs_i32(int32_t value)
+static float mecanum_get_planar_heading(const ImuServiceSnapshot_t *snapshot)
 {
-    return (value < 0) ? -value : value;
+    uint32_t age_ms;
+    float heading;
+
+    if (snapshot == NULL)
+    {
+        return 0.0f;
+    }
+
+    age_ms = (uint32_t)(HAL_GetTick() - snapshot->sample_tick);
+    if (age_ms > MECANUM_IMU_STALE_TIMEOUT_MS)
+    {
+        age_ms = MECANUM_IMU_STALE_TIMEOUT_MS;
+    }
+
+    /* Extrapolate the last sample to the current 10 ms control instant. At
+     * 200 dps, one stale sample would otherwise add about two degrees of
+     * field-coordinate phase lag. */
+    heading = snapshot->planar_yaw +
+              snapshot->planar_yaw_rate_dps * ((float)age_ms * 0.001f);
+    return mecanum_wrap_degrees(heading);
 }
 
 static void mecanum_reset_hybrid_state(void)
 {
-    uint8_t i;
-
     s_hybrid_active = 0U;
     s_hybrid_bound_x = 0U;
     s_hybrid_bound_y = 0U;
@@ -79,47 +114,52 @@ static void mecanum_reset_hybrid_state(void)
     s_hybrid_tgt_vy = 0.0f;
     s_hybrid_tgt_wz = 0.0f;
     s_hybrid_profile_complete = 0U;
-    s_hybrid_settle_count = 0U;
-
-    for (i = 0U; i < 4U; ++i)
-    {
-        s_hybrid_start_pulses[i] = 0;
-        s_hybrid_wheel_offset_pulses[i] = 0.0f;
-        s_hybrid_target_pulses[i] = 0;
-    }
 }
 
-static void mecanum_submit_hybrid_targets(void)
+static void mecanum_body_to_wheels(float *vx, float *vy, float *wz, float wheel_speed[4])
 {
+    float wz_comp_spd = (*wz) * MECANUM_RAD_PER_DEG * MECANUM_K_ROTATION_COEFF_MM;
+    float max_abs_speed = 0.0f;
+    float scale = 1.0f;
     uint8_t i;
+
+    wheel_speed[0] =  *vx + *vy + wz_comp_spd;
+    wheel_speed[1] = -*vx + *vy + wz_comp_spd;
+    wheel_speed[2] = -*vx - *vy + wz_comp_spd;
+    wheel_speed[3] =  *vx - *vy + wz_comp_spd;
 
     for (i = 0U; i < 4U; ++i)
     {
-        s_hybrid_target_pulses[i] =
-            s_hybrid_start_pulses[i] + mecanum_round_pulses(s_hybrid_wheel_offset_pulses[i]);
-        DCMotor_OL_SetTargetPosition((uint8_t)(i + 1U), s_hybrid_target_pulses[i], 100);
-    }
-}
-
-static uint8_t mecanum_hybrid_wheels_settled(void)
-{
-    uint8_t i;
-
-    for (i = 0U; i < 4U; ++i)
-    {
-        int64_t position_error = s_hybrid_target_pulses[i] -
-                                 DCMotor_OL_GetPositionPulses((uint8_t)(i + 1U));
-        int32_t actual_rpm = DCMotor_OL_GetSpeedRpm((uint8_t)(i + 1U));
-
-        if ((mecanum_abs_i64(position_error) > MECANUM_POSITION_TOLERANCE_PULSES) ||
-            (mecanum_abs_i32(actual_rpm) > MECANUM_SETTLE_SPEED_RPM))
+        float abs_speed = fabsf(wheel_speed[i]);
+        if (abs_speed > max_abs_speed)
         {
-            return 0U;
+            max_abs_speed = abs_speed;
         }
     }
 
-    return 1U;
+    /* Preserve the kinematic ratio. Per-wheel clipping changes the requested
+     * direction whenever translation and rotation are combined. */
+    if (max_abs_speed > MECANUM_MAX_WHEEL_SPEED_MM_S)
+    {
+        scale = MECANUM_MAX_WHEEL_SPEED_MM_S / max_abs_speed;
+        *vx *= scale;
+        *vy *= scale;
+        *wz *= scale;
+        for (i = 0U; i < 4U; ++i)
+        {
+            wheel_speed[i] *= scale;
+        }
+    }
 }
+
+static void mecanum_apply_wheel_speeds(const float wheel_speed[4])
+{
+    Mecanum_HW_SetSpeed(MECANUM_MOTOR_FL, wheel_speed[0]);
+    Mecanum_HW_SetSpeed(MECANUM_MOTOR_FR, wheel_speed[1]);
+    Mecanum_HW_SetSpeed(MECANUM_MOTOR_RR, wheel_speed[2]);
+    Mecanum_HW_SetSpeed(MECANUM_MOTOR_RL, wheel_speed[3]);
+}
+
 
 /* 
  * 纭欢鍥炶皟瀹炵幇
@@ -199,10 +239,10 @@ static void mecanum_apply_command(float vx_spd, float vy_spd, float wz_spd,
         s_hybrid_active = 0;
     } else {
         // Hybrid trajectory generation mode
+        mecanum_clear_gyro_state();
         s_is_speed_mode = 0;
         s_hybrid_active = 1;
         s_hybrid_profile_complete = 0U;
-        s_hybrid_settle_count = 0U;
         
         // Save bounds for axes with non-zero distance commands
         s_hybrid_bound_x = (dx_dist != 0.0f);
@@ -232,13 +272,6 @@ static void mecanum_apply_command(float vx_spd, float vy_spd, float wz_spd,
             return;
         }
 
-        // Keep absolute encoder counts in int64 and integrate only relative float offsets.
-        for (uint8_t i = 0U; i < 4U; ++i)
-        {
-            s_hybrid_start_pulses[i] = DCMotor_OL_GetPositionPulses((uint8_t)(i + 1U));
-            s_hybrid_wheel_offset_pulses[i] = 0.0f;
-            s_hybrid_target_pulses[i] = s_hybrid_start_pulses[i];
-        }
     }
 }
 
@@ -261,6 +294,67 @@ void Mecanum_MixedControl(float vx_spd, float vy_spd, float wz_spd,
     }
 }
 
+uint8_t Mecanum_GyroEnable(int8_t direction, uint8_t speed_percent)
+{
+    uint32_t primask;
+
+    if (((direction != MECANUM_GYRO_DIRECTION_CW) &&
+         (direction != MECANUM_GYRO_DIRECTION_CCW)) ||
+        (speed_percent > 100U))
+    {
+        return 0U;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    s_gyro_requested_direction = direction;
+    s_gyro_requested_speed_percent = speed_percent;
+    __DMB();
+    s_gyro_requested_enabled = 1U;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+
+    return 1U;
+}
+
+void Mecanum_GyroDisable(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+    s_gyro_requested_enabled = 0U;
+    s_gyro_requested_speed_percent = 0U;
+    __DMB();
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+}
+
+uint8_t Mecanum_IsGyroModeEnabled(void)
+{
+    return s_gyro_requested_enabled;
+}
+
+int8_t Mecanum_GetGyroDirection(void)
+{
+    return s_gyro_requested_direction;
+}
+
+uint8_t Mecanum_GetGyroSpeedPercent(void)
+{
+    return s_gyro_requested_speed_percent;
+}
+
+float Mecanum_GetGyroSpinDps(void)
+{
+    return (float)s_gyro_requested_direction *
+           ((float)s_gyro_requested_speed_percent / 100.0f) *
+           MECANUM_GYRO_BASE_SPIN_DPS;
+}
+
 void Mecanum_CancelControl(void) {
     uint32_t primask = __get_PRIMASK();
 
@@ -275,6 +369,7 @@ void Mecanum_CancelControl(void) {
 
 void Mecanum_EmergencyStop(void) {
     s_pending_command_valid = 0U;
+    mecanum_clear_gyro_state();
     s_user_vx = 0.0f;
     s_user_vy = 0.0f;
     s_user_wz_raw = 0.0f;
@@ -285,7 +380,9 @@ void Mecanum_EmergencyStop(void) {
 }
 
 uint8_t Mecanum_IsMotionActive(void) {
-    if (s_hybrid_active != 0U) {
+    if ((s_hybrid_active != 0U) ||
+        (s_gyro_requested_enabled != 0U) ||
+        (s_gyro_active != 0U)) {
         return 1U;
     }
 
@@ -323,6 +420,7 @@ void Mecanum_Rotate_CCW(float speed, float dist) {
 void Mecanum_Tick10ms(void) {
     ImuServiceSnapshot_t imu_snapshot;
     eulerian_angles_t angles = {0.0f, 0.0f, 0.0f};
+    float planar_heading = 0.0f;
     uint8_t has_imu;
 
     if (s_pending_command_valid != 0U) {
@@ -330,6 +428,7 @@ void Mecanum_Tick10ms(void) {
         s_pending_command_valid = 0U;
 
         if (command.cancel_only != 0U) {
+            mecanum_clear_gyro_state();
             s_user_vx = 0.0f;
             s_user_vy = 0.0f;
             s_user_wz_raw = 0.0f;
@@ -345,6 +444,48 @@ void Mecanum_Tick10ms(void) {
     has_imu = IMU_Service_GetSnapshot(&imu_snapshot);
     if (has_imu != 0U) {
         angles = imu_snapshot.angles;
+        planar_heading = mecanum_get_planar_heading(&imu_snapshot);
+    }
+
+    if (s_gyro_requested_enabled != 0U) {
+        float requested_spin_dps;
+
+        if ((s_gyro_active == 0U) && (has_imu != 0U)) {
+            s_gyro_reference_yaw = planar_heading;
+            s_gyro_active = 1U;
+            s_is_speed_mode = 1U;
+            s_user_wz_raw = 0.0f;
+            mecanum_reset_hybrid_state();
+            s_target_yaw = angles.yaw;
+            s_yaw_integral = 0.0f;
+        }
+
+        requested_spin_dps = (float)s_gyro_requested_direction *
+                             ((float)s_gyro_requested_speed_percent / 100.0f) *
+                             MECANUM_GYRO_BASE_SPIN_DPS;
+        if (s_gyro_spin_dps < (requested_spin_dps - MECANUM_GYRO_SPIN_SLEW_DPS_PER_TICK))
+        {
+            s_gyro_spin_dps += MECANUM_GYRO_SPIN_SLEW_DPS_PER_TICK;
+        }
+        else if (s_gyro_spin_dps > (requested_spin_dps + MECANUM_GYRO_SPIN_SLEW_DPS_PER_TICK))
+        {
+            s_gyro_spin_dps -= MECANUM_GYRO_SPIN_SLEW_DPS_PER_TICK;
+        }
+        else
+        {
+            s_gyro_spin_dps = requested_spin_dps;
+        }
+    } else if (s_gyro_active != 0U) {
+        /* Coordinate frames change when gyro mode is disabled. Stop first so
+         * an old field-frame Vx/Vy cannot become an unexpected body command. */
+        mecanum_clear_gyro_state();
+        s_user_vx = 0.0f;
+        s_user_vy = 0.0f;
+        s_user_wz_raw = 0.0f;
+        s_is_speed_mode = 0U;
+        mecanum_reset_hybrid_state();
+        s_yaw_integral = 0.0f;
+        DCMotor_OL_StopAll();
     }
 
     if (Mecanum_IsMotionActive() != 0U) {
@@ -360,20 +501,58 @@ void Mecanum_Tick10ms(void) {
         if (s_hybrid_active) {
             const float dt = 0.010f;
 
-            if (s_hybrid_profile_complete == 0U) {
+            if (s_hybrid_profile_complete != 0U) {
+                /* The last commanded 10 ms interval has now elapsed. Stop all
+                 * wheels together; independent wheel position correction can
+                 * leave one wheel driving the chassis after the path is done. */
+                DCMotor_OL_StopAll();
+                mecanum_reset_hybrid_state();
+                s_user_vx = 0.0f;
+                s_user_vy = 0.0f;
+                s_user_wz_raw = 0.0f;
+            } else {
                 float step_vx = s_hybrid_tgt_vx;
                 float step_vy = s_hybrid_tgt_vy;
                 float step_wz = s_hybrid_tgt_wz;
-                float wz_comp_spd;
-                float k_pulses;
+                float wheel_speed[4];
+                float dist_step;
 
                 if (s_hybrid_bound_x && s_hybrid_rem_dx > 0.0f) {
-                    float dist_step = fabsf(step_vx) * dt;
+                    dist_step = fabsf(step_vx) * dt;
                     if (dist_step >= s_hybrid_rem_dx) {
-                        dist_step = s_hybrid_rem_dx;
-                        step_vx = (step_vx >= 0.0f) ? (dist_step / dt) : -(dist_step / dt);
+                        step_vx = (step_vx >= 0.0f) ? (s_hybrid_rem_dx / dt)
+                                                    : -(s_hybrid_rem_dx / dt);
                     }
-                    s_hybrid_rem_dx -= dist_step;
+                } else if (s_hybrid_bound_x) {
+                    step_vx = 0.0f;
+                }
+
+                if (s_hybrid_bound_y && s_hybrid_rem_dy > 0.0f) {
+                    dist_step = fabsf(step_vy) * dt;
+                    if (dist_step >= s_hybrid_rem_dy) {
+                        step_vy = (step_vy >= 0.0f) ? (s_hybrid_rem_dy / dt)
+                                                    : -(s_hybrid_rem_dy / dt);
+                    }
+                } else if (s_hybrid_bound_y) {
+                    step_vy = 0.0f;
+                }
+
+                if (s_hybrid_bound_w && s_hybrid_rem_dw > 0.0f) {
+                    dist_step = fabsf(step_wz) * dt;
+                    if (dist_step >= s_hybrid_rem_dw) {
+                        step_wz = (step_wz >= 0.0f) ? (s_hybrid_rem_dw / dt)
+                                                    : -(s_hybrid_rem_dw / dt);
+                    }
+                } else if (s_hybrid_bound_w) {
+                    step_wz = 0.0f;
+                }
+
+                /* Limit the complete body vector before consuming remaining
+                 * distance. This keeps the requested path valid at saturation. */
+                mecanum_body_to_wheels(&step_vx, &step_vy, &step_wz, wheel_speed);
+
+                if (s_hybrid_bound_x && s_hybrid_rem_dx > 0.0f) {
+                    s_hybrid_rem_dx -= fabsf(step_vx) * dt;
                     if (s_hybrid_rem_dx <= MECANUM_TRAJECTORY_SPEED_EPSILON) {
                         s_hybrid_rem_dx = 0.0f;
                         s_hybrid_tgt_vx = 0.0f;
@@ -381,12 +560,7 @@ void Mecanum_Tick10ms(void) {
                 }
 
                 if (s_hybrid_bound_y && s_hybrid_rem_dy > 0.0f) {
-                    float dist_step = fabsf(step_vy) * dt;
-                    if (dist_step >= s_hybrid_rem_dy) {
-                        dist_step = s_hybrid_rem_dy;
-                        step_vy = (step_vy >= 0.0f) ? (dist_step / dt) : -(dist_step / dt);
-                    }
-                    s_hybrid_rem_dy -= dist_step;
+                    s_hybrid_rem_dy -= fabsf(step_vy) * dt;
                     if (s_hybrid_rem_dy <= MECANUM_TRAJECTORY_SPEED_EPSILON) {
                         s_hybrid_rem_dy = 0.0f;
                         s_hybrid_tgt_vy = 0.0f;
@@ -394,58 +568,27 @@ void Mecanum_Tick10ms(void) {
                 }
 
                 if (s_hybrid_bound_w && s_hybrid_rem_dw > 0.0f) {
-                    float angle_step = fabsf(step_wz) * dt;
-                    if (angle_step >= s_hybrid_rem_dw) {
-                        angle_step = s_hybrid_rem_dw;
-                        step_wz = (step_wz >= 0.0f) ? (angle_step / dt) : -(angle_step / dt);
-                    }
-                    s_hybrid_rem_dw -= angle_step;
+                    s_hybrid_rem_dw -= fabsf(step_wz) * dt;
                     if (s_hybrid_rem_dw <= MECANUM_TRAJECTORY_SPEED_EPSILON) {
                         s_hybrid_rem_dw = 0.0f;
                         s_hybrid_tgt_wz = 0.0f;
                     }
                 }
 
-                wz_comp_spd = step_wz * MECANUM_RAD_PER_DEG * MECANUM_K_ROTATION_COEFF_MM;
-                k_pulses = (dt / MECANUM_WHEEL_CIRCUMFERENCE_MM) *
-                           (float)DCMOTOR_OL_ENCODER_COUNTS_PER_REV;
-
-                s_hybrid_wheel_offset_pulses[0] += ( step_vx + step_vy + wz_comp_spd) * k_pulses;
-                s_hybrid_wheel_offset_pulses[1] += (-step_vx + step_vy + wz_comp_spd) * k_pulses;
-                s_hybrid_wheel_offset_pulses[2] += (-step_vx - step_vy + wz_comp_spd) * k_pulses;
-                s_hybrid_wheel_offset_pulses[3] += ( step_vx - step_vy + wz_comp_spd) * k_pulses;
-
                 if (((!s_hybrid_bound_x) || (s_hybrid_rem_dx <= 0.0f)) &&
                     ((!s_hybrid_bound_y) || (s_hybrid_rem_dy <= 0.0f)) &&
                     ((!s_hybrid_bound_w) || (s_hybrid_rem_dw <= 0.0f)))
                 {
+                    /* Apply this final, possibly shortened interval. It will be
+                     * stopped synchronously at the start of the next tick. */
                     s_hybrid_profile_complete = 1U;
-                    s_hybrid_settle_count = 0U;
                 }
+
+                /* Track the trajectory with the closed speed loops. */
+                mecanum_apply_wheel_speeds(wheel_speed);
             }
 
-            /* Keep the final position command active until all four wheels converge. */
-            mecanum_submit_hybrid_targets();
-
-            if (s_hybrid_profile_complete != 0U) {
-                if (mecanum_hybrid_wheels_settled() != 0U) {
-                    if (s_hybrid_settle_count < MECANUM_SETTLE_REQUIRED_CYCLES) {
-                        s_hybrid_settle_count++;
-                    }
-                } else {
-                    s_hybrid_settle_count = 0U;
-                }
-
-                if (s_hybrid_settle_count >= MECANUM_SETTLE_REQUIRED_CYCLES) {
-                    DCMotor_OL_StopAll();
-                    mecanum_reset_hybrid_state();
-                    s_user_vx = 0.0f;
-                    s_user_vy = 0.0f;
-                    s_user_wz_raw = 0.0f;
-                }
-            }
-
-            // Hybrid position control owns heading; resynchronise speed-mode yaw target.
+            // The bounded trajectory owns motion; resynchronise speed-mode yaw target.
             s_target_yaw = angles.yaw;
             s_yaw_integral = 0.0f;
         } else {
@@ -460,25 +603,47 @@ void Mecanum_Tick10ms(void) {
     float final_vy = s_user_vy;
     float final_wz = s_user_wz_raw;
 
-    if (s_angle_closed_loop_en) {
-        // Integrate the user rotation command into the target yaw directly
-        // Provide a small deadband for the joystick so it does not drift
+    if (s_gyro_active != 0U) {
+        float relative_yaw = mecanum_wrap_degrees(
+            planar_heading - s_gyro_reference_yaw);
+        float yaw_rad;
+        float cos_yaw;
+        float sin_yaw;
+
+        yaw_rad = relative_yaw * MECANUM_RAD_PER_DEG;
+        cos_yaw = cosf(yaw_rad);
+        sin_yaw = sinf(yaw_rad);
+
+        /* Rotate the fixed-frame command back into the body frame. Both the
+         * planar heading and mecanum Wz use positive-clockwise convention. */
+        final_vx = cos_yaw * s_user_vx + sin_yaw * s_user_vy;
+        final_vy = -sin_yaw * s_user_vx + cos_yaw * s_user_vy;
+        final_wz = s_gyro_spin_dps;
+        s_target_yaw = angles.yaw;
+        s_yaw_integral = 0.0f;
+    } else if (s_angle_closed_loop_en) {
+        // A non-zero joystick yaw command is a yaw-rate command, not a yaw
+        // position target. Applying the heading PI while rotating can make
+        // its error cross zero and briefly reverse all four wheels.
         float eff_wz = s_user_wz_raw;
         if (eff_wz > -3.0f && eff_wz < 3.0f) eff_wz = 0.0f;
-        
-        if (s_user_vx == 0.0f && s_user_vy == 0.0f && eff_wz == 0.0f) {
+
+        if (eff_wz != 0.0f) {
+            // Explicit rotation owns yaw. Keep its sign and magnitude exactly
+            // as requested, and track the measured heading for a bumpless
+            // transition into heading hold when the stick is released.
+            final_wz = eff_wz;
+            s_target_yaw = angles.yaw;
+            s_yaw_integral = 0.0f;
+        } else if (s_user_vx == 0.0f && s_user_vy == 0.0f) {
             // Un-driven state (idle): Sync target_yaw to prevent rotating to 0 on startup
             // and prevent fighting when the user manually moves the car.
             s_target_yaw = angles.yaw;
             s_yaw_integral = 0.0f;
             final_wz = 0.0f;
         } else {
-            if (eff_wz != 0.0f) {
-                s_target_yaw += eff_wz * 0.010f; // 10ms period integration
-                if (s_target_yaw > 180.0f) s_target_yaw -= 360.0f;
-                else if (s_target_yaw < -180.0f) s_target_yaw += 360.0f;
-            }
-
+            // No user rotation request: hold the last measured heading while
+            // translating. Reverse correction is valid only in this branch.
             float error = s_target_yaw - angles.yaw;
             if (error > 180.0f) error -= 360.0f;
             else if (error < -180.0f) error += 360.0f;
@@ -509,16 +674,8 @@ void Mecanum_Tick10ms(void) {
         if (final_wz > -3.0f && final_wz < 3.0f) final_wz = 0.0f;
     }
     
-    float wz_rad_spd = final_wz * (3.14159265f / 180.0f);
-    float wz_comp_spd = wz_rad_spd * ((160.0f + 205.0f) / 2.0f);
+    float wheel_speed[4];
 
-    float ms1 = final_vx + final_vy + wz_comp_spd;
-    float ms2 = -final_vx + final_vy + wz_comp_spd;
-    float ms3 = -final_vx - final_vy + wz_comp_spd;
-    float ms4 = final_vx - final_vy + wz_comp_spd;
-
-    Mecanum_HW_SetSpeed(MECANUM_MOTOR_FL, ms1);
-    Mecanum_HW_SetSpeed(MECANUM_MOTOR_FR, ms2);
-    Mecanum_HW_SetSpeed(MECANUM_MOTOR_RR, ms3);
-    Mecanum_HW_SetSpeed(MECANUM_MOTOR_RL, ms4);
+    mecanum_body_to_wheels(&final_vx, &final_vy, &final_wz, wheel_speed);
+    mecanum_apply_wheel_speeds(wheel_speed);
 }

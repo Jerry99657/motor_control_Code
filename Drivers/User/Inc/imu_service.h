@@ -13,6 +13,10 @@ typedef struct
     int16_t gy;
     int16_t gz;
     eulerian_angles_t angles;
+    /* Ground-vehicle heading: relative yaw integrated directly from the
+     * calibrated Z gyro. Positive is clockwise, matching mecanum Wz. */
+    float planar_yaw;
+    float planar_yaw_rate_dps;
     uint32_t sample_tick;
     uint32_t sequence;
 } ImuServiceSnapshot_t;
