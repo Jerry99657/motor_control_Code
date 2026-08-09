@@ -10,6 +10,7 @@
 - 小陀螺模式：车体连续自转，同时通过航向补偿保持世界坐标方向运动。
 - LVGL 菜单、固定页面骨架、页面过渡、焦点反馈、数值惯性和 UI 性能诊断。
 - SD 卡目录浏览，播放 `.bin` 动画、`.avi` MJPEG 视频和 `.gif` 动画。
+- NES 模拟器：支持 iNES Mapper 0/1/2/3、QSPI ROM 缓存、MMC1 和电池 `.sav` 存档，无音频输出。
 - 媒体播放暂停/继续、前后跳帧、停止和返回目录。
 - WS2812 RGB 控制及上电状态提示。
 - USB CDC、UART5 文本/二进制控制协议和 ESP32-C3 虚拟摇杆。
@@ -26,6 +27,9 @@ Drivers/User/Src/imu.c         MPU6500 采样和姿态融合
 Drivers/User/Src/imu_service.c 平面航向快照、航向角速度和安装方向处理
 Drivers/User/Src/media_control.c 媒体按键、暂停、跳帧和返回状态机
 Drivers/User/Src/mjpeg_player.c AVI/MJPEG 解码与播放调度
+Drivers/User/Src/nes_rom_cache.c NES ROM 的 SD→QSPI 缓存、快速命中和 CRC 校验
+Drivers/User/Src/nes_cpu.c     Ricoh 2A03/6502 指令、NMI/IRQ 和故障现场
+Drivers/User/Src/nes_runtime.c Mapper、PPU、APU 兼容时序、LCD 输出和 `.sav`
 Drivers/User/Src/sd_diskio.c   SD 读写、DMA、Cache 维护
 Drivers/User/Src/ui_*.c        Theme、页面骨架、过渡、反馈、动画和性能诊断
 Drivers/User/Src/ws2812*.c     WS2812 定时器 DMA 驱动
@@ -102,7 +106,9 @@ OK 可以在页面内直接编辑电机或舵机行；Left/Right 修改数值，
 - Left/KEY3 返回上一级目录；在根目录再次返回主菜单。
 - KEY2 停止正在播放的媒体。
 
-当前识别的媒体包括 `.bin`、`.avi` 和 `.gif`。AVI 文件既可按扩展名识别，也可通过 RIFF/AVI 文件头识别，播放返回后会重新扫描当前目录。
+当前识别的媒体包括 `.bin`、`.avi`、`.gif` 和 `.nes`。AVI 文件既可按扩展名识别，也可通过 RIFF/AVI 文件头识别，播放返回后会重新扫描当前目录。
+
+选择 `.nes` 后先检查 W25Q64 缓存；同一 ROM 会显示 `Cache hit 100%`，否则执行 SD→QSPI 复制和 CRC32 校验。缓存完成后按 OK 开始游戏。NES 支持 Mapper 0/1/2/3；KEY3 正常退出并为带电池标志的游戏写入同名 `.sav`，KEY2 保持紧急退出且不等待存档。游戏运行时既可使用开发板实体按键，也可将 ESP32 手机网页切换到 NES 手柄，两组输入能够同时组合。
 
 ### 4.4 Mecanum Control
 
@@ -262,16 +268,16 @@ vx = RY * 10
 
 ### 7.3 ESP32-C3 虚拟手柄
 
-配套程序位于：
+配套程序位于工程内的 `ESP32_connect_Controller`。浏览器右上角按钮可在麦轮遥控和 NES 虚拟手柄之间切换；切换时会主动释放上一模式的输入。
 
-`D:\STM32\ESP32\ESP32_controller\ESP32_connect_XboxController\ESP32_connect_Xbox`
-
-浏览器页面提供左右摇杆、小陀螺 ON/OFF 按钮和 `-100~100` 的方向/速度滑条。当前发送策略为：
+麦轮页面提供左右摇杆、小陀螺 ON/OFF 按钮和 `-100~100` 的方向/速度滑条。当前发送策略为：
 
 - 摇杆以约 50 Hz 发送，使用最新值，不排队发送旧帧。
 - WebSocket 缓冲区超过阈值时丢弃本次旧帧，避免网络拥塞造成延迟累积。
 - 摇杆停止或连接超时时只清零摇杆值。
 - 小陀螺 ON/OFF 为状态事件，不会因摇杆刷新超时自动关闭。
+
+NES 页面提供方向键、Select、Start、B、A，并支持方向键与 A/B 多点触控。手机按键以完整 8 位状态图每 50 ms 发送，STM32 只在 NES 运行期间接收，并与实体按键按位合并。断连 350 ms 后仅释放手机按键，不退出游戏、不报故障，详见 [NES 手机虚拟手柄](docs/nes_mobile_controller_zh.md)。
 
 手机端连接不稳定时，先确认手机已连接 ESP32 热点，再刷新网页；若数据延迟持续增大，优先检查浏览器页面是否为最新版本、WebSocket 缓冲区和热点信道干扰。
 

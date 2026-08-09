@@ -20,6 +20,8 @@ const int sendIntervalMs = 20; // 50 Hz UART update rate
 /* Mobile browsers can briefly defer JavaScript timers while processing touch
  * and layout work. Keep a live-control watchdog, but tolerate short stalls. */
 const uint32_t JOYSTICK_TIMEOUT_MS = 1000;
+const uint32_t NES_INPUT_TIMEOUT_MS = 350;
+const uint32_t NES_KEEPALIVE_MS = 50;
 const uint32_t AP_RETRY_INTERVAL_MS = 2000;
 const uint32_t STATUS_INTERVAL_MS = 5000;
 const uint32_t AP_HEALTH_INTERVAL_MS = 3000;
@@ -33,6 +35,16 @@ bool joystickActive = false;
 bool gyroEnabled = false;
 bool gyroCommandDirty = true;
 int8_t gyroSignedSpeed = 0;
+enum ControlMode : uint8_t {
+  CONTROL_MODE_MECANUM = 0,
+  CONTROL_MODE_NES = 1
+};
+ControlMode controlMode = CONTROL_MODE_MECANUM;
+uint8_t nesButtons = 0;
+uint8_t nesSequence = 0;
+uint32_t lastNesUpdateMs = 0;
+uint32_t lastNesSendMs = 0;
+bool nesCommandDirty = true;
 volatile bool apRunning = false;
 uint8_t selectedApChannel = 6;
 uint8_t apHealthFailures = 0;
@@ -47,6 +59,9 @@ int lx = 0, ly = 0, rx = 0, ry = 0;
 const uint8_t HEADER_1 = 0x77;
 const uint8_t HEADER_2 = 0x68;
 const uint8_t FRAME_END = 0x0A;
+const uint8_t WS_TYPE_MODE = 0x4D; // 'M'
+const uint8_t WS_TYPE_NES = 0x4E;  // 'N'
+const uint8_t UART_DEV_NES = 0x0E;
 
 // HTML/JS Frontend - Highly visible, Captive Portal compatible
 const char index_html[] PROGMEM = R"rawliteral(
@@ -57,9 +72,13 @@ const char index_html[] PROGMEM = R"rawliteral(
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
   <title>ESP32 Xbox Web Controller</title>
   <style>
-    :root { --gyro-color:#4b5563; --gyro-glow:rgba(75,85,99,.35); }
+    :root { --gyro-color:#4b5563; --gyro-glow:rgba(75,85,99,.35); --nes-red:#7b1822; --nes-red-dark:#3f0c13; --nes-cream:#e8dfc8; }
     body { margin:0; padding:0; min-height:100vh; background:radial-gradient(circle at 50% 0%,#1f2937 0%,#111 52%,#090b10 100%); color:#fff; overflow:hidden; touch-action:none; font-family:Arial,sans-serif; }
     .title { text-align: center; margin-top: 10px; font-size: 16px; font-weight: bold; pointer-events: none; color: #00ffcc;}
+    .mode-switch { position:fixed; top:8px; right:10px; z-index:30; min-width:92px; height:32px; padding:0 13px; border:1px solid rgba(255,255,255,.2); border-radius:16px; color:#08111d; background:linear-gradient(135deg,#67e8f9,#22d3ee); box-shadow:0 5px 18px rgba(0,0,0,.35); font-size:11px; font-weight:900; letter-spacing:.5px; touch-action:manipulation; transition:transform .14s cubic-bezier(.2,1.7,.4,1),background .2s,color .2s; }
+    .mode-switch:active { transform:scale(.9); }
+    .mode-switch.nes { color:#f8ead0; background:linear-gradient(145deg,#9a2632,#5b1019); }
+    .mode-page[hidden] { display:none !important; }
     #debug { position: absolute; top: 35px; width: 100%; text-align: center; font-size: 14px; color: #fff; pointer-events: none; text-shadow: 0px 0px 5px #000; z-index: 10;}
     .gyro-panel { box-sizing:border-box; width:min(620px,calc(100% - 28px)); height:76px; margin:42px auto 0; padding:10px 14px; display:grid; grid-template-columns:104px 1fr; gap:16px; align-items:center; border:1px solid rgba(255,255,255,.12); border-radius:18px; background:linear-gradient(145deg,rgba(36,45,61,.94),rgba(18,23,32,.94)); box-shadow:0 12px 30px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.08); }
     #gyroToggle { height:46px; border:1px solid rgba(255,255,255,.16); border-radius:14px; background:linear-gradient(180deg,#374151,#202734); color:#d1d5db; font-size:13px; font-weight:800; letter-spacing:.7px; touch-action:manipulation; transition:transform .16s cubic-bezier(.2,1.7,.4,1),box-shadow .2s,background .2s,color .2s; }
@@ -85,6 +104,30 @@ const char index_html[] PROGMEM = R"rawliteral(
       touch-action: none; 
     }
     .label { margin-top: 10px; color: #aaa; font-size: 14px; pointer-events: none; font-weight: bold;}
+    .nes-page { box-sizing:border-box; width:100%; height:calc(100vh - 34px); padding:7px 12px 10px; display:flex; align-items:center; justify-content:center; }
+    .nes-shell { position:relative; box-sizing:border-box; width:min(920px,96vw); height:min(390px,82vh); min-height:230px; padding:24px 30px; border:5px solid #4a0c13; border-radius:44px; background:linear-gradient(155deg,#9c2e39 0%,#711622 55%,#4b0d15 100%); box-shadow:0 20px 45px rgba(0,0,0,.58),inset 0 2px 0 rgba(255,255,255,.17),inset 0 -8px 18px rgba(0,0,0,.25); }
+    .nes-face { box-sizing:border-box; width:100%; height:100%; display:grid; grid-template-columns:1.05fr .8fr 1.05fr; align-items:center; gap:20px; padding:18px 22px; border-radius:30px; color:#1d1b18; background:linear-gradient(160deg,#f2ead4,#d7cdb4); box-shadow:inset 0 0 0 3px rgba(61,30,25,.17),inset 0 -7px 15px rgba(65,42,32,.12); }
+    .nes-brand { position:absolute; top:31px; left:50%; transform:translateX(-50%); z-index:2; color:rgba(89,18,28,.72); font-size:11px; font-weight:900; letter-spacing:2.2px; pointer-events:none; }
+    .dpad { position:relative; width:174px; height:174px; margin:auto; filter:drop-shadow(0 6px 5px rgba(0,0,0,.35)); }
+    .nes-btn { -webkit-tap-highlight-color:transparent; user-select:none; -webkit-user-select:none; touch-action:none; border:0; outline:0; font-family:Arial,sans-serif; font-weight:900; }
+    .dpad-btn { position:absolute; width:62px; height:62px; border:3px solid #242424; border-radius:9px; color:#777; background:linear-gradient(145deg,#373737,#111); box-shadow:inset 3px 3px 4px rgba(255,255,255,.08),inset -4px -4px 5px rgba(0,0,0,.55); transition:transform .08s,filter .08s; }
+    .dpad-btn.up { left:56px; top:0; }
+    .dpad-btn.down { left:56px; bottom:0; }
+    .dpad-btn.left { left:0; top:56px; }
+    .dpad-btn.right { right:0; top:56px; }
+    .dpad-center { position:absolute; left:56px; top:56px; width:62px; height:62px; border-radius:7px; background:radial-gradient(circle,#252525 0 18%,#151515 20% 100%); box-shadow:inset 2px 2px 4px rgba(255,255,255,.06); }
+    .dpad-btn.pressed { transform:scale(.88); filter:brightness(1.6); }
+    .nes-center { align-self:end; padding-bottom:32px; text-align:center; }
+    .system-buttons { display:flex; justify-content:center; gap:22px; padding:14px 18px; border-radius:28px; background:rgba(120,36,44,.22); box-shadow:inset 0 2px 6px rgba(79,25,31,.25); }
+    .system-btn-wrap { display:flex; flex-direction:column; align-items:center; gap:7px; color:#6a1721; font-size:10px; font-weight:900; letter-spacing:1px; }
+    .system-btn { width:57px; height:23px; border:3px solid #352b29; border-radius:999px; background:linear-gradient(#353535,#171717); box-shadow:0 4px 0 #160f0e,inset 0 1px 2px rgba(255,255,255,.18); transition:transform .08s,box-shadow .08s; }
+    .system-btn.pressed { transform:translateY(4px) scale(.96); box-shadow:0 0 0 #160f0e; }
+    .action-area { display:flex; justify-content:center; align-items:center; gap:26px; transform:rotate(-7deg); }
+    .action-wrap { display:flex; flex-direction:column; align-items:center; gap:8px; color:#701824; font-size:17px; font-weight:900; }
+    .action-well { padding:9px; border-radius:50%; background:#c7bca5; box-shadow:inset 0 3px 6px rgba(60,40,35,.25); }
+    .action-btn { width:72px; height:72px; border:4px solid #4a1017; border-radius:50%; color:#f2d9ca; font-size:26px; background:radial-gradient(circle at 35% 28%,#bd4650,#741722 65%,#4e0c14); box-shadow:0 7px 0 #3b0b11,0 10px 12px rgba(0,0,0,.3),inset 2px 2px 4px rgba(255,255,255,.18); transition:transform .08s,box-shadow .08s; }
+    .action-btn.pressed { transform:translateY(6px) scale(.94); box-shadow:0 1px 0 #3b0b11,0 3px 5px rgba(0,0,0,.3); }
+    .nes-status { position:absolute; bottom:9px; left:50%; transform:translateX(-50%); color:rgba(255,239,211,.72); font-size:10px; font-weight:700; letter-spacing:.5px; pointer-events:none; }
     @media (max-height:430px) {
       .title { margin-top:4px; }
       #debug { top:25px; font-size:12px; }
@@ -93,37 +136,92 @@ const char index_html[] PROGMEM = R"rawliteral(
       .gyro-readout { margin-bottom:4px; }
       .container { height:calc(100vh - 104px); transform:translateY(4px); }
       .label { margin-top:4px; font-size:12px; }
+      .nes-shell { height:calc(100vh - 45px); min-height:225px; padding:13px 20px; border-radius:32px; }
+      .nes-face { padding:12px 18px; gap:12px; }
+      .nes-brand { top:18px; }
+      .dpad { transform:scale(.78); }
+      .action-area { gap:12px; }
+      .action-btn { width:58px; height:58px; }
+      .system-buttons { gap:12px; padding:10px 12px; }
+      .system-btn { width:46px; }
+      .nes-center { padding-bottom:18px; }
+      .nes-status { bottom:3px; }
+    }
+    @media (max-width:560px) and (orientation:portrait) {
+      .nes-shell { width:98vw; height:72vh; min-height:390px; padding:14px; border-radius:30px; }
+      .nes-face { grid-template-columns:1fr 1fr; grid-template-rows:1fr auto; padding:26px 12px 12px; }
+      .nes-center { grid-column:1 / 3; grid-row:2; padding-bottom:0; }
+      .dpad { transform:scale(.78); }
+      .action-area { gap:10px; }
+      .action-btn { width:58px; height:58px; }
+      .system-buttons { padding:8px 15px; }
     }
   </style>
 </head>
 <body>
-  <div class="title">ESP32 Web Joystick Controller</div>
-  <div id="debug">L: (0,0) | R: (0,0)</div>
-  <div class="gyro-panel">
-    <button id="gyroToggle" type="button" aria-pressed="false">GYRO OFF</button>
-    <div class="gyro-slider-wrap">
-      <div class="gyro-readout"><span>Spin control</span><span id="gyroValue">IDLE 0%</span></div>
-      <input id="gyroSlider" type="range" min="-100" max="100" value="0" step="1" aria-label="Gyro direction and speed">
-      <div class="gyro-scale"><span>CCW -100</span><span>0</span><span>CW +100</span></div>
+  <button id="modeSwitch" class="mode-switch" type="button">OPEN NES</button>
+  <main id="robotPage" class="mode-page">
+    <div class="title">ESP32 Web Joystick Controller</div>
+    <div id="debug">L: (0,0) | R: (0,0)</div>
+    <div class="gyro-panel">
+      <button id="gyroToggle" type="button" aria-pressed="false">GYRO OFF</button>
+      <div class="gyro-slider-wrap">
+        <div class="gyro-readout"><span>Spin control</span><span id="gyroValue">IDLE 0%</span></div>
+        <input id="gyroSlider" type="range" min="-100" max="100" value="0" step="1" aria-label="Gyro direction and speed">
+        <div class="gyro-scale"><span>CCW -100</span><span>0</span><span>CW +100</span></div>
+      </div>
     </div>
-  </div>
-  <div class="container">
-    <div class="joy-wrap">
-       <canvas id="joyL" width="160" height="160"></canvas>
-       <div class="label">Left Stick</div>
+    <div class="container">
+      <div class="joy-wrap">
+         <canvas id="joyL" width="160" height="160"></canvas>
+         <div class="label">Left Stick</div>
+      </div>
+      <div class="joy-wrap">
+         <canvas id="joyR" width="160" height="160"></canvas>
+         <div class="label">Right Stick</div>
+      </div>
     </div>
-    <div class="joy-wrap">
-       <canvas id="joyR" width="160" height="160"></canvas>
-       <div class="label">Right Stick</div>
-    </div>
-  </div>
+  </main>
+
+  <main id="nesPage" class="mode-page nes-page" hidden>
+    <section class="nes-shell" aria-label="NES virtual controller">
+      <div class="nes-brand">ESP32 · NES CONTROLLER</div>
+      <div class="nes-face">
+        <div class="dpad" aria-label="Direction pad">
+          <button class="nes-btn dpad-btn up" data-nes-bit="16" aria-label="Up">▲</button>
+          <button class="nes-btn dpad-btn down" data-nes-bit="32" aria-label="Down">▼</button>
+          <button class="nes-btn dpad-btn left" data-nes-bit="64" aria-label="Left">◀</button>
+          <button class="nes-btn dpad-btn right" data-nes-bit="128" aria-label="Right">▶</button>
+          <div class="dpad-center"></div>
+        </div>
+        <div class="nes-center">
+          <div class="system-buttons">
+            <label class="system-btn-wrap">SELECT<button class="nes-btn system-btn" data-nes-bit="4" aria-label="Select"></button></label>
+            <label class="system-btn-wrap">START<button class="nes-btn system-btn" data-nes-bit="8" aria-label="Start"></button></label>
+          </div>
+        </div>
+        <div class="action-area">
+          <div class="action-wrap"><span>B</span><div class="action-well"><button class="nes-btn action-btn" data-nes-bit="2" aria-label="B">B</button></div></div>
+          <div class="action-wrap"><span>A</span><div class="action-well"><button class="nes-btn action-btn" data-nes-bit="1" aria-label="A">A</button></div></div>
+        </div>
+      </div>
+      <div id="nesStatus" class="nes-status">WAIT · BUTTONS 00</div>
+    </section>
+  </main>
 
   <script>
     let clx=0, cly=0, crx=0, cry=0;
     let gyroEnabled=false, gyroSignedSpeed=0, gyroDirty=true;
     let axesDirty=true, lastAxesSendMs=0, debugUpdatePending=false;
+    let controlMode=0, nesButtons=0, nesSequence=0, lastNesSendMs=0;
+    const nesPointers=new Map();
     const AXES_MIN_SEND_MS=20, AXES_KEEPALIVE_MS=100, WS_MAX_BUFFERED_BYTES=128;
+    const NES_KEEPALIVE_MS=50, MODE_MECANUM=0, MODE_NES=1;
     const debug = document.getElementById('debug');
+    const robotPage = document.getElementById('robotPage');
+    const nesPage = document.getElementById('nesPage');
+    const modeSwitch = document.getElementById('modeSwitch');
+    const nesStatus = document.getElementById('nesStatus');
     const gyroToggle = document.getElementById('gyroToggle');
     const gyroSlider = document.getElementById('gyroSlider');
     const gyroValue = document.getElementById('gyroValue');
@@ -171,6 +269,106 @@ const char index_html[] PROGMEM = R"rawliteral(
       sendLatest();
       sendGyroState();
     }
+
+    function updateNesStatus() {
+      const state = socketReady() ? 'LINK' : 'WAIT';
+      nesStatus.textContent = `${state} · BUTTONS ${nesButtons.toString(16).toUpperCase().padStart(2,'0')}`;
+    }
+
+    function sendMode() {
+      if(!socketReady() || socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
+      socket.send(new Uint8Array([0x4D, controlMode]).buffer);
+    }
+
+    function sendNesState(force=false) {
+      if(controlMode !== MODE_NES || !socketReady()) return;
+      const now = performance.now();
+      if(!force && (now - lastNesSendMs < NES_KEEPALIVE_MS)) return;
+      if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
+      socket.send(new Uint8Array([0x4E, nesButtons, nesSequence++ & 0xFF]).buffer);
+      lastNesSendMs = now;
+      updateNesStatus();
+    }
+
+    function releaseAllNes(send=true) {
+      nesPointers.clear();
+      nesButtons = 0;
+      document.querySelectorAll('[data-nes-bit]').forEach(btn => btn.classList.remove('pressed'));
+      if(send) sendNesState(true);
+      updateNesStatus();
+    }
+
+    function updateModeUI() {
+      const nes = controlMode === MODE_NES;
+      robotPage.hidden = nes;
+      nesPage.hidden = !nes;
+      modeSwitch.classList.toggle('nes', nes);
+      modeSwitch.textContent = nes ? 'OPEN ROBOT' : 'OPEN NES';
+      updateDebug();
+      updateNesStatus();
+    }
+
+    function switchMode() {
+      if(controlMode === MODE_MECANUM) {
+        // Stop every latched robot action before exposing the game controls.
+        clx=0; cly=0; crx=0; cry=0; axesDirty=true;
+        gyroEnabled=false; gyroDirty=true;
+        updateGyroUI(false);
+        sendLatest(true);
+        sendGyroState();
+        controlMode=MODE_NES;
+        releaseAllNes(false);
+      } else {
+        releaseAllNes(true);
+        controlMode=MODE_MECANUM;
+        axesDirty=true;
+      }
+      updateModeUI();
+      sendMode();
+      if(controlMode === MODE_NES) sendNesState(true);
+      else sendLatest(true);
+    }
+
+    function setupNesButtons() {
+      document.querySelectorAll('[data-nes-bit]').forEach(btn => {
+        const bit = Number(btn.dataset.nesBit) & 0xFF;
+        btn.addEventListener('contextmenu', e => e.preventDefault());
+        btn.addEventListener('pointerdown', e => {
+          e.preventDefault();
+          if(controlMode !== MODE_NES) return;
+          btn.setPointerCapture(e.pointerId);
+          nesPointers.set(e.pointerId, {bit, btn});
+          nesButtons |= bit;
+          btn.classList.add('pressed');
+          if(navigator.vibrate) navigator.vibrate(7);
+          sendNesState(true);
+        });
+        const release = e => {
+          const held = nesPointers.get(e.pointerId);
+          if(!held) return;
+          e.preventDefault();
+          nesPointers.delete(e.pointerId);
+          let rebuilt=0;
+          nesPointers.forEach(item => rebuilt |= item.bit);
+          nesButtons=rebuilt & 0xFF;
+          if(!Array.from(nesPointers.values()).some(item => item.btn === held.btn)) {
+            held.btn.classList.remove('pressed');
+          }
+          sendNesState(true);
+        };
+        btn.addEventListener('pointerup', release);
+        btn.addEventListener('pointercancel', release);
+        btn.addEventListener('lostpointercapture', release);
+      });
+    }
+
+    modeSwitch.addEventListener('click', switchMode);
+    window.addEventListener('blur', () => {
+      if(controlMode === MODE_NES) releaseAllNes(true);
+    });
+    document.addEventListener('visibilitychange', () => {
+      if(document.hidden && controlMode === MODE_NES) releaseAllNes(true);
+    });
 
     gyroToggle.addEventListener('click', () => {
       gyroEnabled = !gyroEnabled;
@@ -301,6 +499,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     setTimeout(() => {
         initJoy('joyL', true);
         initJoy('joyR', false);
+        setupNesButtons();
+        updateModeUI();
     }, 100);
 
     let socket = null;
@@ -322,7 +522,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function sendLatest(force=false) {
-      if(!socketReady()) return;
+      if(controlMode !== MODE_MECANUM || !socketReady()) return;
 
       const now = performance.now();
       if(!force && (now - lastAxesSendMs < AXES_MIN_SEND_MS)) return;
@@ -339,7 +539,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function sendGyroState() {
-      if(!gyroDirty || !socketReady()) return;
+      if(controlMode !== MODE_MECANUM || !gyroDirty || !socketReady()) return;
       if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
 
       // This low-rate latched command is queued behind the joystick frame.
@@ -366,8 +566,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         socket.onopen = () => {
           gyroDirty = true;
           updateDebug();
-          sendLatest();
-          sendGyroState();
+          sendMode();
+          if(controlMode === MODE_NES) sendNesState(true);
+          else {
+            sendLatest();
+            sendGyroState();
+          }
         };
         socket.onclose = () => {
           socket = null;
@@ -387,8 +591,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     // Dirty axes are sent at up to 50 Hz; unchanged state is kept alive at
     // 10 Hz. Touch handlers also request an immediate latest-value send.
     setInterval(() => {
-      sendLatest();
-      sendGyroState();
+      if(controlMode === MODE_NES) sendNesState();
+      else {
+        sendLatest();
+        sendGyroState();
+      }
     }, 20);
     connectSocket();
     updateGyroUI(false);
@@ -423,6 +630,37 @@ void setGyroControl(bool enabled, int signedSpeed) {
   }
 }
 
+void setNesButtons(uint8_t buttons, uint8_t sequence) {
+  nesButtons = buttons;
+  nesSequence = sequence;
+  lastNesUpdateMs = millis();
+  nesCommandDirty = true;
+}
+
+void clearNesButtons(const char* reason) {
+  if(nesButtons != 0U) {
+    Serial.printf("[Safety] NES buttons released: %s\n", reason);
+  }
+  nesButtons = 0U;
+  nesCommandDirty = true;
+}
+
+void setControlMode(ControlMode mode) {
+  if(mode == CONTROL_MODE_NES) {
+    setJoystickValues(0, 0, 0, 0);
+    joystickActive = false;
+    /* Entering the game controller must never leave the robot spinning from
+     * a previously latched gyro command. */
+    setGyroControl(false, gyroSignedSpeed);
+    gyroCommandDirty = true;
+    clearNesButtons("NES mode entered");
+  } else {
+    clearNesButtons("robot mode entered");
+  }
+  controlMode = mode;
+  Serial.printf("[Mode] %s\n", (controlMode == CONTROL_MODE_NES) ? "NES" : "MECANUM");
+}
+
 void sendGyroCommand() {
   const int8_t direction = (gyroSignedSpeed < 0) ? -1 : 1;
   const uint8_t speedPercent = (uint8_t)abs((int)gyroSignedSpeed);
@@ -436,12 +674,24 @@ void sendGyroCommand() {
   gyroCommandDirty = false;
 }
 
+void sendNesCommand() {
+  const uint8_t txBuf[] = {
+    HEADER_1, HEADER_2, 0x08, UART_DEV_NES, 0x02,
+    nesButtons, nesSequence, FRAME_END
+  };
+
+  Serial1.write(txBuf, sizeof(txBuf));
+  nesCommandDirty = false;
+  lastNesSendMs = millis();
+}
+
 void stopJoystick(const char* reason) {
   const bool wasMoving = (lx != 0 || ly != 0 || rx != 0 || ry != 0);
 
   setJoystickValues(0, 0, 0, 0);
   joystickActive = false;
   activeWebSocketClient = 0xFF;
+  clearNesButtons(reason);
   /* Gyro is a latched command. A joystick heartbeat timeout only zeros the
    * translation command; it must never synthesize a GYRO OFF frame. */
   if(wasMoving) {
@@ -483,13 +733,23 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
       break;
 
     case WStype_BIN:
-      if(length == 4U) {
+      if((length == 2U) && (payload[0] == WS_TYPE_MODE) &&
+         (payload[1] <= (uint8_t)CONTROL_MODE_NES)) {
+        setControlMode((ControlMode)payload[1]);
+        activeWebSocketClient = client;
+      } else if((length == 3U) && (payload[0] == WS_TYPE_NES)) {
+        if(controlMode == CONTROL_MODE_NES) {
+          setNesButtons(payload[1], payload[2]);
+          activeWebSocketClient = client;
+        }
+      } else if((length == 4U) && (controlMode == CONTROL_MODE_MECANUM)) {
         setJoystickValues((int8_t)payload[0], (int8_t)payload[1],
                           (int8_t)payload[2], (int8_t)payload[3]);
         activeWebSocketClient = client;
         lastJoystickUpdateMs = millis();
         joystickActive = true;
-      } else if((length == 3U) && (payload[0] == 0x47U)) {
+      } else if((length == 3U) && (payload[0] == 0x47U) &&
+                (controlMode == CONTROL_MODE_MECANUM)) {
         setGyroControl(payload[1] != 0U, (int8_t)payload[2]);
         activeWebSocketClient = client;
         lastJoystickUpdateMs = millis();
@@ -736,6 +996,10 @@ void loop() {
   if(joystickActive && (now - lastJoystickUpdateMs >= JOYSTICK_TIMEOUT_MS)) {
     stopJoystick("control heartbeat timeout");
   }
+  if((controlMode == CONTROL_MODE_NES) && (nesButtons != 0U) &&
+     (now - lastNesUpdateMs >= NES_INPUT_TIMEOUT_MS)) {
+    clearNesButtons("NES heartbeat timeout");
+  }
 
   if(!apRunning && (now - lastApRetryMs >= AP_RETRY_INTERVAL_MS)) {
     lastApRetryMs = now;
@@ -761,14 +1025,17 @@ void loop() {
 
   if(now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
-    Serial.printf("[Status] AP=%u clients=%u heap=%u axes=%d,%d,%d,%d gyro=%u/%d\n",
+    Serial.printf("[Status] AP=%u clients=%u heap=%u mode=%s axes=%d,%d,%d,%d gyro=%u/%d nes=%02X\n",
                   apRunning ? 1U : 0U,
                   WiFi.softAPgetStationNum(),
-                  ESP.getFreeHeap(), lx, ly, rx, ry,
-                  gyroEnabled ? 1U : 0U, gyroSignedSpeed);
+                  ESP.getFreeHeap(),
+                  (controlMode == CONTROL_MODE_NES) ? "NES" : "ROBOT",
+                  lx, ly, rx, ry,
+                  gyroEnabled ? 1U : 0U, gyroSignedSpeed, nesButtons);
   }
 
-  if (now - lastSendTime >= sendIntervalMs) {
+  if ((controlMode == CONTROL_MODE_MECANUM) &&
+      (now - lastSendTime >= sendIntervalMs)) {
     lastSendTime = now;
     
     uint8_t frameLen = 0x0A;
@@ -794,6 +1061,12 @@ void loop() {
     };
 
     Serial1.write(tx_buf, sizeof(tx_buf)); // 发送到硬件UART
+  }
+
+  if(nesCommandDirty ||
+     ((controlMode == CONTROL_MODE_NES) &&
+      (now - lastNesSendMs >= NES_KEEPALIVE_MS))) {
+    sendNesCommand();
   }
 
   /* ON/OFF is event driven and latched by STM32. No periodic gyro heartbeat:

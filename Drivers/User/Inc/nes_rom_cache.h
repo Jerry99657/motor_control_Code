@@ -22,8 +22,9 @@ extern "C" {
 #define NES_ROM_CACHE_ERR_CANCELLED       -12
 
 #define NES_ROM_CACHE_METADATA_MAGIC       0x3153454EU /* "NES1" */
-#define NES_ROM_CACHE_METADATA_VERSION     1U
+#define NES_ROM_CACHE_METADATA_VERSION     2U
 #define NES_ROM_CACHE_METADATA_SIZE        64U
+#define NES_ROM_CACHE_READ_RETRY_LIMIT      4U
 
 typedef enum
 {
@@ -52,7 +53,10 @@ typedef struct
   uint8_t flags6;
   uint8_t flags7;
   uint8_t ines_header[16];
-  uint8_t reserved[12];
+  uint32_t source_path_crc32;
+  uint16_t source_fdate;
+  uint16_t source_ftime;
+  uint32_t source_tail_crc32;
   uint32_t metadata_crc32;
 } NES_RomCacheMetadata;
 
@@ -69,6 +73,11 @@ typedef struct
   uint16_t mapper;
   uint8_t flags6;
   uint8_t flags7;
+  uint8_t last_fs_error;
+  uint8_t read_retry_attempt;
+  uint8_t read_error_count;
+  uint8_t read_recovery_count;
+  uint8_t cache_hit;
 } NES_RomCacheSnapshot;
 
 /* Start and Process form a cooperative state machine.  Process performs at

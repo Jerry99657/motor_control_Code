@@ -24,6 +24,7 @@
 #include "camera_service.h"
 #include "media_memory.h"
 #include "nes_rom_cache.h"
+#include "nes_runtime.h"
 #include "qspi_partition.h"
 #include "safety_manager.h"
 #include <stdlib.h>
@@ -118,6 +119,7 @@ typedef enum
     LVGL_APP_SCREEN_REQ_COMMAND,
     LVGL_APP_SCREEN_REQ_SD_BROWSER,
     LVGL_APP_SCREEN_REQ_NES_CACHE,
+    LVGL_APP_SCREEN_REQ_NES_PLAYER,
     LVGL_APP_SCREEN_REQ_MECANUM,
     LVGL_APP_SCREEN_REQ_MPU6500,
     LVGL_APP_SCREEN_REQ_WS2812,
@@ -232,6 +234,7 @@ static lv_obj_t *s_nes_cache_info_label = NULL;
 static char s_nes_cache_name[LVGL_APP_ENTRY_NAME_LEN] = {0};
 static NES_RomCachePhase s_nes_cache_last_phase = NES_ROM_CACHE_PHASE_IDLE;
 static uint32_t s_nes_cache_last_completed = UINT32_MAX;
+static uint8_t s_nes_cache_last_read_errors = UINT8_MAX;
 static lvgl_app_activity_t s_header_activity = (lvgl_app_activity_t)0xFFU;
 static uint32_t s_header_activity_tick = 0U;
 
@@ -369,6 +372,8 @@ static void lvgl_app_show_sd_browser(void);
 static void lvgl_app_show_nes_cache(void);
 static void lvgl_app_nes_cache_process(void);
 static void lvgl_app_nes_cache_exit(const char *reason);
+static void lvgl_app_nes_player_start(void);
+static int8_t lvgl_app_nes_player_process(void);
 static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_ws2812_control(void);
 static void lvgl_app_show_diagnostics(void);
@@ -393,6 +398,7 @@ static uint8_t lvgl_app_screen_depth(lvgl_app_screen_req_t screen)
     if ((screen == LVGL_APP_SCREEN_REQ_MOTOR_SPEED) ||
         (screen == LVGL_APP_SCREEN_REQ_SERVO_ANGLE) ||
         (screen == LVGL_APP_SCREEN_REQ_NES_CACHE) ||
+        (screen == LVGL_APP_SCREEN_REQ_NES_PLAYER) ||
         (screen == LVGL_APP_SCREEN_REQ_GIF))
     {
         return 2U;
@@ -2613,6 +2619,141 @@ static const char *lvgl_app_nes_cache_error_text(int8_t result)
     }
 }
 
+static const char *lvgl_app_nes_runtime_error_text(int8_t result)
+{
+    switch (result)
+    {
+        case NES_RUNTIME_ERR_CACHE: return "NES cache unavailable";
+        case NES_RUNTIME_ERR_MAPPER: return "Mapper is not supported";
+        case NES_RUNTIME_ERR_ROM: return "Mapper 0/1/2/3 ROM layout invalid";
+        case NES_RUNTIME_ERR_MEMORY: return "Media memory pool is busy";
+        case NES_RUNTIME_ERR_CPU: return "6502 stopped on an invalid opcode";
+        case NES_RUNTIME_ERR_DISPLAY: return "LCD transfer failed";
+        case NES_RUNTIME_ERR_SAVE: return "Battery save failed";
+        default: return "NES runtime failed";
+    }
+}
+
+static void lvgl_app_nes_player_start(void)
+{
+    NES_RomCacheSnapshot snapshot;
+    int8_t result;
+
+    NES_RomCache_GetSnapshot(&snapshot);
+    if (snapshot.phase != NES_ROM_CACHE_PHASE_READY)
+    {
+        lvgl_app_set_status("NES ROM is not ready");
+        lvgl_app_show_toast(UI_NOTICE_WARNING, "Wait for cache verification");
+        return;
+    }
+
+    /* Media playback must never leave a motion command active. */
+    Mecanum_EmergencyStop();
+    DCMotor_OL_RequestStopAll();
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
+
+    lvgl_app_set_status("NES: OK=A, KEY1=B, OK+KEY1=Start, double KEY1=Select");
+    UI_TransitionManager_Cancel(&s_transition_manager);
+    lv_refr_now(NULL);
+    if (lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS) == 0U)
+    {
+        lvgl_app_set_status("NES start failed: LCD flush timeout");
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "LCD is busy");
+        return;
+    }
+
+    result = NES_Runtime_Start();
+    if (result != NES_RUNTIME_RUNNING)
+    {
+        lvgl_app_set_status("NES start failed (%d): %s", (int)result,
+                            lvgl_app_nes_runtime_error_text(result));
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "NES start failed (%d)",
+                            (int)result);
+        return;
+    }
+
+    lv_port_indev_suppress_all_keys_until_release();
+    s_current_screen = LVGL_APP_SCREEN_REQ_NES_PLAYER;
+}
+
+static int8_t lvgl_app_nes_player_process(void)
+{
+    int8_t result = NES_Runtime_Process();
+    int8_t save_result;
+    NES_RuntimeDiagnostics diagnostics;
+    uint32_t frames;
+    uint32_t rendered;
+
+    if (result == NES_RUNTIME_RUNNING)
+    {
+        return result;
+    }
+
+    frames = NES_Runtime_GetFrameCount();
+    rendered = NES_Runtime_GetRenderedFrameCount();
+    save_result = NES_Runtime_Stop(
+        (result == NES_RUNTIME_STOP_KEY3) ? 1U : 0U
+    );
+    NES_Runtime_GetDiagnostics(&diagnostics);
+    s_nes_cache_phase_label = NULL;
+    s_nes_cache_progress_bar = NULL;
+    s_nes_cache_info_label = NULL;
+    lv_port_indev_suppress_exit_keys_until_release();
+
+    if (result == NES_RUNTIME_STOP_KEY3)
+    {
+        if (save_result == NES_RUNTIME_ERR_SAVE)
+        {
+            lvgl_app_set_status("KEY3 returned - save failed (fs=%u)",
+                                (unsigned int)diagnostics.last_fs_error);
+            lvgl_app_show_toast(UI_NOTICE_ERROR, "NES save failed (fs=%u)",
+                                (unsigned int)diagnostics.last_fs_error);
+        }
+        else
+        {
+            if (save_result == NES_RUNTIME_SAVE_WRITTEN)
+            {
+                lvgl_app_set_status("Returned by KEY3 - save written (%lu frames)",
+                                    (unsigned long)frames);
+            }
+            else
+            {
+                lvgl_app_set_status("Returned by KEY3 - NES %lu frames (%lu shown)",
+                                    (unsigned long)frames,
+                                    (unsigned long)rendered);
+            }
+            lvgl_app_show_toast(UI_NOTICE_INFO,
+                                (save_result == NES_RUNTIME_SAVE_WRITTEN) ?
+                                  "Returned by KEY3 - save written" :
+                                  "Returned by KEY3");
+        }
+    }
+    else if (result == NES_RUNTIME_STOP_KEY2)
+    {
+        Mecanum_EmergencyStop();
+        DCMotor_OL_RequestStopAll();
+        lvgl_app_set_status("Stopped by KEY2 - NES %lu frames",
+                            (unsigned long)frames);
+        lvgl_app_show_toast(UI_NOTICE_WARNING, "Stopped by KEY2");
+    }
+    else
+    {
+        lvgl_app_set_status(
+            "NES failed %d M%u PC:%04X OP:%02X L:%u",
+            (int)result, (unsigned int)diagnostics.mapper,
+            (unsigned int)diagnostics.pc,
+            (unsigned int)diagnostics.opcode,
+            (unsigned int)diagnostics.scanline
+        );
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "NES failed (%d)", (int)result);
+    }
+
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+    return result;
+}
+
 static void lvgl_app_nes_cache_exit(const char *reason)
 {
     if (NES_RomCache_IsBusy() != 0U)
@@ -2646,7 +2787,7 @@ static void lvgl_app_nes_cache_event_cb(lv_event_t *e)
     else if ((key == LV_KEY_ENTER) && (NES_RomCache_IsBusy() == 0U))
     {
         lv_port_indev_suppress_all_keys_until_release();
-        lvgl_app_nes_cache_exit("NES cache result acknowledged");
+        lvgl_app_nes_player_start();
     }
 }
 
@@ -2673,7 +2814,8 @@ static void lvgl_app_nes_cache_process(void)
 
     NES_RomCache_GetSnapshot(&snapshot);
     if ((snapshot.phase == s_nes_cache_last_phase) &&
-        (snapshot.completed_bytes == s_nes_cache_last_completed))
+        (snapshot.completed_bytes == s_nes_cache_last_completed) &&
+        (snapshot.read_error_count == s_nes_cache_last_read_errors))
     {
         return;
     }
@@ -2681,6 +2823,7 @@ static void lvgl_app_nes_cache_process(void)
     phase_changed = (snapshot.phase != s_nes_cache_last_phase) ? 1U : 0U;
     s_nes_cache_last_phase = snapshot.phase;
     s_nes_cache_last_completed = snapshot.completed_bytes;
+    s_nes_cache_last_read_errors = snapshot.read_error_count;
     if (phase_changed != 0U)
     {
         s_header_activity = (lvgl_app_activity_t)0xFFU;
@@ -2702,28 +2845,43 @@ static void lvgl_app_nes_cache_process(void)
 
     if (snapshot.phase == NES_ROM_CACHE_PHASE_READY)
     {
-        lv_label_set_text(s_nes_cache_phase_label, "Cache ready  100%");
+        lv_label_set_text(s_nes_cache_phase_label,
+                          (snapshot.cache_hit != 0U) ?
+                            "Cache hit  100%" : "Cache ready  100%");
         lv_bar_set_value(s_nes_cache_progress_bar, 100, LV_ANIM_ON);
         (void)snprintf(info, sizeof(info),
-                       "Mapper %u   PRG %lu KB   CHR %lu KB\n"
+                       "Mapper %u%s   PRG %lu KB   CHR %lu KB\n"
                        "CRC32 %08lX   QSPI 0x%06lX\n"
-                       "Phase 1 ready - OK/Left returns",
+                       "OK starts game - Left/KEY3 returns",
                        (unsigned int)snapshot.mapper,
+                       ((snapshot.flags6 & 0x02U) != 0U) ? " BAT" : "",
                        (unsigned long)(snapshot.prg_size / 1024U),
                        (unsigned long)(snapshot.chr_size / 1024U),
                        (unsigned long)snapshot.rom_crc32,
                        (unsigned long)QSPI_PARTITION_NES_ROM_OFFSET);
         lv_label_set_text(s_nes_cache_info_label, info);
-        lvgl_app_set_status("NES ROM cached and verified - OK/Left/KEY3 returns");
-        lvgl_app_show_toast(UI_NOTICE_SUCCESS, "NES ROM cache ready");
+        lvgl_app_set_status((snapshot.cache_hit != 0U) ?
+                            "NES cache hit - OK starts" :
+                            "NES ready - OK starts, Left/KEY3 returns");
+        lvgl_app_show_toast(UI_NOTICE_SUCCESS,
+                            (snapshot.cache_hit != 0U) ?
+                              "NES cache reused" : "NES ROM cache ready");
     }
     else if (snapshot.phase == NES_ROM_CACHE_PHASE_ERROR)
     {
-        (void)snprintf(info, sizeof(info), "%s\nError %d\nOK/Left/KEY3 returns",
+        (void)snprintf(info, sizeof(info),
+                       "%s\nError %d   FatFs %u   at %lu KiB\n"
+                       "Read errors %u - OK/Left/KEY3 returns",
                        lvgl_app_nes_cache_error_text(snapshot.result),
-                       (int)snapshot.result);
+                       (int)snapshot.result,
+                       (unsigned int)snapshot.last_fs_error,
+                       (unsigned long)(snapshot.completed_bytes / 1024U),
+                       (unsigned int)snapshot.read_error_count);
         lv_label_set_text(s_nes_cache_info_label, info);
-        lvgl_app_set_status("NES cache failed (%d)", (int)snapshot.result);
+        lvgl_app_set_status("NES cache failed (%d, fs=%u, retry=%u)",
+                            (int)snapshot.result,
+                            (unsigned int)snapshot.last_fs_error,
+                            (unsigned int)snapshot.read_error_count);
         lvgl_app_show_toast(UI_NOTICE_ERROR, "NES cache failed (%d)",
                             (int)snapshot.result);
     }
@@ -2733,11 +2891,29 @@ static void lvgl_app_nes_cache_process(void)
     }
     else
     {
-        (void)snprintf(info, sizeof(info),
-                       "%lu / %lu KiB\n"
-                       "Do not remove SD card\nLeft/KEY2/KEY3 cancels",
-                       (unsigned long)((snapshot.completed_bytes + 1023U) / 1024U),
-                       (unsigned long)((snapshot.total_bytes + 1023U) / 1024U));
+        if (snapshot.read_retry_attempt != 0U)
+        {
+            (void)snprintf(info, sizeof(info),
+                           "%lu / %lu KiB\n"
+                           "Recovering SD %u/%u (FatFs %u)\n"
+                           "Left/KEY2/KEY3 cancels",
+                           (unsigned long)((snapshot.completed_bytes + 1023U) / 1024U),
+                           (unsigned long)((snapshot.total_bytes + 1023U) / 1024U),
+                           (unsigned int)snapshot.read_retry_attempt,
+                           (unsigned int)NES_ROM_CACHE_READ_RETRY_LIMIT,
+                           (unsigned int)snapshot.last_fs_error);
+        }
+        else
+        {
+            (void)snprintf(info, sizeof(info),
+                           "%lu / %lu KiB\n"
+                           "SD recovered %u/%u read errors\n"
+                           "Left/KEY2/KEY3 cancels",
+                           (unsigned long)((snapshot.completed_bytes + 1023U) / 1024U),
+                           (unsigned long)((snapshot.total_bytes + 1023U) / 1024U),
+                           (unsigned int)snapshot.read_recovery_count,
+                           (unsigned int)snapshot.read_error_count);
+        }
         lv_label_set_text(s_nes_cache_info_label, info);
     }
 }
@@ -2813,6 +2989,7 @@ static void lvgl_app_show_nes_cache(void)
 
     s_nes_cache_last_phase = NES_ROM_CACHE_PHASE_IDLE;
     s_nes_cache_last_completed = UINT32_MAX;
+    s_nes_cache_last_read_errors = UINT8_MAX;
     lvgl_app_set_status("Caching NES ROM - Left/KEY2/KEY3 cancels");
     UI_Anim_StaggerIn(name_label, 0U);
     UI_Anim_StaggerIn(panel, 1U);
@@ -3871,6 +4048,19 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
     uint8_t dev_id = frame[3];
     uint8_t cmd    = frame[4];
 
+    /* ESP32 virtual NES controller is a global UART5 input source. It is
+     * accepted while NES owns the LCD, independently of the Command Control
+     * page; all motor-related devices remain page-gated below. */
+    if ((channel == 0U) && (dev_id == 0x0EU) && (cmd == 0x02U) &&
+        (len == 0x08U))
+    {
+        if (NES_Runtime_IsActive() != 0U)
+        {
+            NES_Runtime_SetRemoteButtons(frame[5]);
+        }
+        return;
+    }
+
     if (LVGL_App_IsCommandControlActive() == 0U)
     {
         return;
@@ -4047,15 +4237,16 @@ void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
     if ((buf == NULL) || (channel >= 2U)) return;
     if (LVGL_App_IsCommandControlActive() == 0U)
     {
-        s_cmd_rx_idx[channel] = 0U;
         s_cmd_text_rx_idx[channel] = 0U;
-        return;
     }
     rx_buf = s_cmd_rx_buf[channel];
     rx_idx = &s_cmd_rx_idx[channel];
 
     for (i = 0; i < len; i++) {
-        lvgl_app_cmd_text_rx_byte(channel, buf[i]);
+        if (LVGL_App_IsCommandControlActive() != 0U)
+        {
+            lvgl_app_cmd_text_rx_byte(channel, buf[i]);
+        }
 
         if (*rx_idx < sizeof(s_cmd_rx_buf[channel])) {
             rx_buf[(*rx_idx)++] = buf[i];
@@ -4404,6 +4595,18 @@ void LVGL_App_Process(void)
 {
     uint32_t safety_faults = Safety_GetFaults();
     uint32_t ui_handler_start;
+
+    /* NES owns the physical LCD while active.  Keep LVGL frozen so its flush
+     * pipeline cannot overwrite a direct emulator frame.  The surrounding
+     * main loop remains cooperative, so communication and safety services
+     * continue to run between emulated frames. */
+    if (NES_Runtime_IsActive() != 0U)
+    {
+        if (lvgl_app_nes_player_process() == NES_RUNTIME_RUNNING)
+        {
+            return;
+        }
+    }
 
     NES_RomCache_Process();
     UI_PerfDiag_Process();

@@ -175,6 +175,15 @@ SECTIONS
     . = ALIGN(32);
   } >RAM
 
+  /* CPU-only, deterministic-latency state for the NES interpreter/PPU. */
+  .ram_dtcm (NOLOAD) : ALIGN(32)
+  {
+    . = ALIGN(32);
+    *(.ram_dtcm)
+    *(.ram_dtcm*)
+    . = ALIGN(32);
+  } >DTCMRAM
+
   .ram_d2 (NOLOAD) : ALIGN(32)
   {
     . = ALIGN(32);

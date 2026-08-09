@@ -13,7 +13,8 @@ typedef enum
   MEDIA_MEMORY_OWNER_MJPEG,
   MEDIA_MEMORY_OWNER_SD_ANIM,
   MEDIA_MEMORY_OWNER_QSPI_ANIM,
-  MEDIA_MEMORY_OWNER_CAMERA
+  MEDIA_MEMORY_OWNER_CAMERA,
+  MEDIA_MEMORY_OWNER_NES
 } MediaMemoryOwner;
 
 uint8_t *MediaMemory_Acquire(MediaMemoryOwner owner, uint32_t required_bytes, uint32_t *capacity_bytes);
