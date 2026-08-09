@@ -71,8 +71,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
 # Add include paths
 # Persistent user include directories (kept in top-level CMakeLists)
 set(USER_PERSISTENT_INCLUDE_DIRS
-    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc
     ${CMAKE_CURRENT_SOURCE_DIR}/Drivers/User/Inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/Core/Inc
     ${CMAKE_CURRENT_SOURCE_DIR}/FATFS/App
     ${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target
     ${CMAKE_CURRENT_SOURCE_DIR}/USB_DEVICE/App
@@ -83,6 +83,13 @@ set(USER_PERSISTENT_INCLUDE_DIRS
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user defined include paths
     ${USER_PERSISTENT_INCLUDE_DIRS}
+)
+
+# CubeMX regenerates Core/Inc/jpeg_utils_conf.h without USER CODE markers.
+# Keep the project RGB565 configuration in Drivers/User/Inc and make it win
+# for the separately compiled JPEG Utilities object library as well.
+target_include_directories(Utilities BEFORE PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/Drivers/User/Inc
 )
 
 # Add project symbols (macros)

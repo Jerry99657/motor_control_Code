@@ -2,6 +2,8 @@
 
 extern QSPI_HandleTypeDef hqspi;
 
+static uint8_t s_qspi_memory_mapped = 0U;
+
 static int8_t QSPI_W25Qxx_AutoPollingMemReady(uint32_t timeoutMs)
 {
   QSPI_CommandTypeDef sCommand = {0};
@@ -76,6 +78,11 @@ static int8_t QSPI_W25Qxx_EraseByCommand(uint8_t instruction, uint32_t address)
 {
   QSPI_CommandTypeDef sCommand = {0};
 
+  if (s_qspi_memory_mapped != 0U)
+  {
+    return W25QXX_ERROR_ABORT;
+  }
+
   if (QSPI_W25Qxx_WriteEnable() != QSPI_W25QXX_OK)
   {
     return W25QXX_ERROR_WRITE_ENABLE;
@@ -111,6 +118,8 @@ int8_t QSPI_W25Qxx_Init(uint32_t *pDeviceId)
   {
     *pDeviceId = 0U;
   }
+
+  s_qspi_memory_mapped = 0U;
 
   if (HAL_QSPI_DeInit(&hqspi) != HAL_OK)
   {
@@ -161,6 +170,11 @@ int8_t QSPI_W25Qxx_Reset(void)
 {
   QSPI_CommandTypeDef sCommand = {0};
 
+  if (s_qspi_memory_mapped != 0U)
+  {
+    return W25QXX_ERROR_ABORT;
+  }
+
   sCommand.InstructionMode = QSPI_INSTRUCTION_1_LINE;
   sCommand.AddressMode = QSPI_ADDRESS_NONE;
   sCommand.AlternateByteMode = QSPI_ALTERNATE_BYTES_NONE;
@@ -194,6 +208,11 @@ uint32_t QSPI_W25Qxx_ReadID(void)
   QSPI_CommandTypeDef sCommand = {0};
   uint8_t recv[3] = {0};
 
+  if (s_qspi_memory_mapped != 0U)
+  {
+    return 0U;
+  }
+
   sCommand.InstructionMode = QSPI_INSTRUCTION_1_LINE;
   sCommand.AddressMode = QSPI_ADDRESS_NONE;
   sCommand.AddressSize = QSPI_ADDRESS_24_BITS;
@@ -224,6 +243,11 @@ int8_t QSPI_W25Qxx_MemoryMappedMode(void)
   QSPI_CommandTypeDef sCommand = {0};
   QSPI_MemoryMappedTypeDef sMemMapped = {0};
 
+  if (s_qspi_memory_mapped != 0U)
+  {
+    return QSPI_W25QXX_OK;
+  }
+
   if (QSPI_W25Qxx_Reset() != QSPI_W25QXX_OK)
   {
     return W25QXX_ERROR_INIT;
@@ -248,7 +272,34 @@ int8_t QSPI_W25Qxx_MemoryMappedMode(void)
     return W25QXX_ERROR_MEMORY_MAPPED;
   }
 
+  s_qspi_memory_mapped = 1U;
+  __DSB();
+  __ISB();
+
   return QSPI_W25QXX_OK;
+}
+
+int8_t QSPI_W25Qxx_ExitMemoryMappedMode(void)
+{
+  if (s_qspi_memory_mapped == 0U)
+  {
+    return QSPI_W25QXX_OK;
+  }
+
+  if (HAL_QSPI_Abort(&hqspi) != HAL_OK)
+  {
+    return W25QXX_ERROR_ABORT;
+  }
+
+  s_qspi_memory_mapped = 0U;
+  __DSB();
+  __ISB();
+  return QSPI_W25QXX_OK;
+}
+
+uint8_t QSPI_W25Qxx_IsMemoryMapped(void)
+{
+  return s_qspi_memory_mapped;
 }
 
 int8_t QSPI_W25Qxx_SectorErase(uint32_t sectorAddress)
@@ -274,6 +325,11 @@ int8_t QSPI_W25Qxx_ChipErase(void)
 int8_t QSPI_W25Qxx_WritePage(uint8_t *pBuffer, uint32_t writeAddr, uint16_t numByteToWrite)
 {
   QSPI_CommandTypeDef sCommand = {0};
+
+  if (s_qspi_memory_mapped != 0U)
+  {
+    return W25QXX_ERROR_ABORT;
+  }
 
   if (pBuffer == NULL || numByteToWrite == 0 || numByteToWrite > W25QXX_PAGE_SIZE)
   {
@@ -370,6 +426,11 @@ int8_t QSPI_W25Qxx_ReadBuffer(uint8_t *pBuffer, uint32_t readAddr, uint32_t numB
 {
   QSPI_CommandTypeDef sCommand = {0};
   uint8_t attempt;
+
+  if (s_qspi_memory_mapped != 0U)
+  {
+    return W25QXX_ERROR_ABORT;
+  }
 
   if (pBuffer == NULL || numByteToRead == 0)
   {

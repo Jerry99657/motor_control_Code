@@ -354,10 +354,12 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
   */
 uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 {
-  uint8_t next;
-  uint8_t index;
-  uint32_t primask;
+  uint8_t result = USBD_OK;
   /* USER CODE BEGIN 7 */
+  uint8_t next;
+  uint8_t queue_index;
+  uint32_t primask;
+
   if ((Buf == NULL) || (Len == 0U) || (Len > CDC_TX_PACKET_SIZE))
   {
     return USBD_FAIL;
@@ -386,9 +388,9 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
     return USBD_BUSY;
   }
 
-  index = g_cdc_tx_head;
-  memcpy(g_cdc_tx_queue[index].data, Buf, Len);
-  g_cdc_tx_queue[index].length = Len;
+  queue_index = g_cdc_tx_head;
+  memcpy(g_cdc_tx_queue[queue_index].data, Buf, Len);
+  g_cdc_tx_queue[queue_index].length = Len;
   __DMB();
   g_cdc_tx_head = next;
   if (primask == 0U)
@@ -398,7 +400,7 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
 
   CDC_TxKick();
   /* USER CODE END 7 */
-  return USBD_OK;
+  return result;
 }
 
 /**

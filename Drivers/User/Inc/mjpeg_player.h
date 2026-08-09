@@ -22,6 +22,13 @@ extern "C" {
 
 int8_t MJPEG_Player_PlayFile(const char *file_path);
 uint8_t MJPEG_Player_GetLastFsError(void);
+int8_t MJPEG_Player_DecodeMemoryToRgb565(uint8_t *jpeg_data,
+                                        uint32_t jpeg_len,
+                                        uint32_t jpeg_capacity,
+                                        uint16_t *rgb565_buffer,
+                                        uint32_t rgb565_capacity_bytes,
+                                        uint16_t *image_width,
+                                        uint16_t *image_height);
 
 #ifdef __cplusplus
 }

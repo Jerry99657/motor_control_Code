@@ -130,6 +130,9 @@ static uint8_t s_mjpeg_pipeline_display_pending = 0U;
 static uint8_t s_mjpeg_pipeline_frame_started = 0U;
 static uint8_t s_mjpeg_pipeline_async_lcd = 1U;
 static uint8_t s_mjpeg_seek_decode_pending = 0U;
+static uint8_t s_mjpeg_decode_only = 0U;
+static uint16_t s_mjpeg_decoded_width = 0U;
+static uint16_t s_mjpeg_decoded_height = 0U;
 static volatile uint8_t s_mjpeg_last_fs_error = (uint8_t)FR_OK;
 static media_control_action_t s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
 static mjpeg_seek_snapshot_t s_mjpeg_seek_history[MJPEG_PLAYER_SEEK_HISTORY_SIZE];
@@ -237,7 +240,8 @@ static uint8_t mjpeg_frame_geometry_fits(uint32_t width, uint32_t height)
   uint32_t row_bytes;
 
   if ((width == 0U) || (height == 0U) ||
-      (width > LCD_Width) || (height > LCD_Height) ||
+      (((width > LCD_Width) || (height > LCD_Height)) &&
+       (s_mjpeg_decode_only == 0U)) ||
       (s_mjpeg_frame_io_buffer == NULL))
   {
     return 0U;
@@ -1340,7 +1344,10 @@ static int8_t mjpeg_gray_convert_and_show(const mjpeg_jpeg_header_info_t *header
   return MJPEG_PLAYER_OK;
 }
 
-static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len, uint16_t fallback_width, uint16_t fallback_height)
+static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len,
+                                     uint32_t jpeg_capacity,
+                                     uint16_t fallback_width,
+                                     uint16_t fallback_height)
 {
   uint32_t decode_len;
   JPEG_ConfTypeDef prefill_info;
@@ -1383,7 +1390,7 @@ static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len, uint
   prepare_status = mjpeg_prepare_decode_stream(
     jpeg_data,
     jpeg_len,
-    (uint32_t)sizeof(s_mjpeg_ycbcr_buffer),
+    jpeg_capacity,
     &decode_len
   );
   if (prepare_status != MJPEG_PLAYER_OK)
@@ -1522,10 +1529,18 @@ static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len, uint
   }
 
   if ((info.ImageWidth == 0U) || (info.ImageHeight == 0U) ||
-      (info.ImageWidth > LCD_Width) || (info.ImageHeight > LCD_Height))
+      ((((info.ImageWidth > LCD_Width) || (info.ImageHeight > LCD_Height))) &&
+       (s_mjpeg_decode_only == 0U)))
   {
     mjpeg_log("MJPEG: image size unsupported\r\n");
     return MJPEG_PLAYER_ERR_UNSUPPORTED;
+  }
+
+  if (s_mjpeg_decode_only != 0U)
+  {
+    s_mjpeg_decoded_width = (uint16_t)info.ImageWidth;
+    s_mjpeg_decoded_height = (uint16_t)info.ImageHeight;
+    return MJPEG_PLAYER_OK;
   }
 
   return mjpeg_pipeline_show_frame(
@@ -2959,6 +2974,7 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
       frame_status = mjpeg_decode_one_frame(
         s_mjpeg_ycbcr_buffer,
         frame_len,
+        (uint32_t)sizeof(s_mjpeg_ycbcr_buffer),
         avi_width,
         avi_height
       );
@@ -3072,6 +3088,7 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
         frame_status = mjpeg_decode_one_frame(
           s_mjpeg_ycbcr_buffer,
           frame_len,
+          (uint32_t)sizeof(s_mjpeg_ycbcr_buffer),
           avi_width,
           avi_height
         );
@@ -3220,6 +3237,7 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
       frame_status = mjpeg_decode_one_frame(
         s_mjpeg_ycbcr_buffer,
         frame_len,
+        (uint32_t)sizeof(s_mjpeg_ycbcr_buffer),
         avi_width,
         avi_height
       );
@@ -3291,4 +3309,48 @@ cleanup:
 uint8_t MJPEG_Player_GetLastFsError(void)
 {
   return s_mjpeg_last_fs_error;
+}
+
+int8_t MJPEG_Player_DecodeMemoryToRgb565(uint8_t *jpeg_data,
+                                        uint32_t jpeg_len,
+                                        uint32_t jpeg_capacity,
+                                        uint16_t *rgb565_buffer,
+                                        uint32_t rgb565_capacity_bytes,
+                                        uint16_t *image_width,
+                                        uint16_t *image_height)
+{
+  int8_t result;
+
+  if ((jpeg_data == NULL) || (jpeg_len < 4U) ||
+      (jpeg_capacity < jpeg_len) || (rgb565_buffer == NULL) ||
+      (rgb565_capacity_bytes == 0U) ||
+      (image_width == NULL) || (image_height == NULL))
+  {
+    return MJPEG_PLAYER_ERR_PARAM;
+  }
+  if ((s_mjpeg_frame_io_buffer != NULL) || (s_mjpeg_dma_ctx.active != 0U))
+  {
+    return MJPEG_PLAYER_ERR_BUSY;
+  }
+
+  s_mjpeg_frame_io_buffer = (uint8_t *)rgb565_buffer;
+  s_mjpeg_frame_io_capacity = rgb565_capacity_bytes;
+  s_mjpeg_decode_only = 1U;
+  s_mjpeg_decoded_width = 0U;
+  s_mjpeg_decoded_height = 0U;
+  s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
+  s_mjpeg_seek_decode_pending = 0U;
+  MediaControl_Init();
+
+  result = mjpeg_decode_one_frame(jpeg_data, jpeg_len, jpeg_capacity, 0U, 0U);
+  if (result == MJPEG_PLAYER_OK)
+  {
+    *image_width = s_mjpeg_decoded_width;
+    *image_height = s_mjpeg_decoded_height;
+  }
+
+  s_mjpeg_decode_only = 0U;
+  s_mjpeg_frame_io_buffer = NULL;
+  s_mjpeg_frame_io_capacity = 0U;
+  return result;
 }

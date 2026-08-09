@@ -79,10 +79,12 @@ void Boot_DebugFlushStageLogsViaCdc(void);
 #define LED1_GPIO_Port GPIOC
 #define LED2_Pin GPIO_PIN_3
 #define LED2_GPIO_Port GPIOC
+#define OV_RESET_Pin GPIO_PIN_4
+#define OV_RESET_GPIO_Port GPIOC
 #define SD_Pin GPIO_PIN_0
 #define SD_GPIO_Port GPIOB
-#define CAMERAPWDN_Pin GPIO_PIN_13
-#define CAMERAPWDN_GPIO_Port GPIOF
+#define OV_PWDN_Pin GPIO_PIN_13
+#define OV_PWDN_GPIO_Port GPIOF
 #define M1_PH_Pin GPIO_PIN_2
 #define M1_PH_GPIO_Port GPIOG
 #define M2_PH_Pin GPIO_PIN_3

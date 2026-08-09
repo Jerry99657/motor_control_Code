@@ -38,10 +38,9 @@
  * in case of errors in either BSP_SD_ReadCpltCallback() or BSP_SD_WriteCpltCallback()
  * the value by default is as defined in the BSP platform driver otherwise 30 secs
  */
-#define SD_TIMEOUT 3000U
+#define SD_TIMEOUT 30 * 1000
 
 #define SD_DEFAULT_BLOCK_SIZE 512
-#define SD_SCRATCH_BLOCK_COUNT 8U
 
 /*
  * Depending on the use case, the SD card initialization could be done at the
@@ -69,23 +68,21 @@
 * transfer data
 */
 /* USER CODE BEGIN enableScratchBuffer */
-#define ENABLE_SCRATCH_BUFFER
+/* The protected media path below owns its aligned scratch buffer. */
 /* USER CODE END enableScratchBuffer */
 
 /* Private variables ---------------------------------------------------------*/
 #if defined(ENABLE_SCRATCH_BUFFER)
 #if defined (ENABLE_SD_DMA_CACHE_MAINTENANCE)
-ALIGN_32BYTES(static uint8_t scratch[BLOCKSIZE * SD_SCRATCH_BLOCK_COUNT]);
+ALIGN_32BYTES(static uint8_t scratch[BLOCKSIZE]); // 32-Byte aligned for cache maintenance
 #else
-__ALIGN_BEGIN static uint8_t scratch[BLOCKSIZE * SD_SCRATCH_BLOCK_COUNT] __ALIGN_END;
+__ALIGN_BEGIN static uint8_t scratch[BLOCKSIZE] __ALIGN_END;
 #endif
 #endif
 /* Disk status */
 static volatile DSTATUS Stat = STA_NOINIT;
 
 static volatile  UINT  WriteStatus = 0, ReadStatus = 0;
-static volatile uint8_t SD_ForcePollingRead = 0U;
-extern SD_HandleTypeDef hsd1;
 /* Private function prototypes -----------------------------------------------*/
 static DSTATUS SD_CheckStatus(BYTE lun);
 DSTATUS SD_initialize (BYTE);
@@ -113,41 +110,32 @@ const Diskio_drvTypeDef  SD_Driver =
 };
 
 /* USER CODE BEGIN beforeFunctionSection */
-/* can be used to modify / undefine following code or add new code */
-/* USER CODE END beforeFunctionSection */
+#define SD_MEDIA_TIMEOUT             3000U
+#define SD_MEDIA_SCRATCH_BLOCK_COUNT 8U
 
-/* Private functions ---------------------------------------------------------*/
+static volatile uint8_t SD_ForcePollingRead = 0U;
+extern SD_HandleTypeDef hsd1;
+ALIGN_32BYTES(static uint8_t SD_MediaScratch[
+  BLOCKSIZE * SD_MEDIA_SCRATCH_BLOCK_COUNT
+]);
 
-static int SD_CheckStatusWithTimeout(uint32_t timeout)
-{
-  uint32_t timer = HAL_GetTick();
-  /* block until SDIO IP is ready again or a timeout occur */
-  while(HAL_GetTick() - timer < timeout)
-  {
-    if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
-    {
-      return 0;
-    }
-  }
-
-  return -1;
-}
+static int SD_CheckStatusWithTimeout(uint32_t timeout);
 
 static uint8_t SD_ReadBlocksDMAOnce(uint32_t *data, uint32_t sector, uint32_t count)
 {
   uint32_t timeout;
 
-  /* Arm the completion flag before starting DMA.  Clearing it after the
-     start races a fast completion IRQ and can lose the event forever. */
+  /* Arm the flag before DMA starts so a fast completion IRQ cannot be lost. */
   ReadStatus = 0U;
   if (BSP_SD_ReadBlocks_DMA(data, sector, count) == MSD_OK)
   {
     timeout = HAL_GetTick();
-    while ((ReadStatus == 0U) && ((HAL_GetTick() - timeout) < SD_TIMEOUT))
+    while ((ReadStatus == 0U) && ((HAL_GetTick() - timeout) < SD_MEDIA_TIMEOUT))
     {
     }
 
-    if ((ReadStatus == 1U) && (SD_CheckStatusWithTimeout(SD_TIMEOUT) == 0))
+    if ((ReadStatus == 1U) &&
+        (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) == 0))
     {
       ReadStatus = 0U;
       return MSD_OK;
@@ -160,20 +148,16 @@ static uint8_t SD_ReadBlocksDMAOnce(uint32_t *data, uint32_t sector, uint32_t co
 
 static uint8_t SD_ReadBlocksPollingOnce(uint32_t *data, uint32_t sector, uint32_t count)
 {
-  if (BSP_SD_ReadBlocks(data, sector, count, SD_TIMEOUT) != MSD_OK)
+  if (BSP_SD_ReadBlocks(data, sector, count, SD_MEDIA_TIMEOUT) != MSD_OK)
   {
     return MSD_ERROR;
   }
 
-  return (SD_CheckStatusWithTimeout(SD_TIMEOUT) == 0) ? MSD_OK : MSD_ERROR;
+  return (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) == 0) ? MSD_OK : MSD_ERROR;
 }
 
 static uint8_t SD_ReinitializeCard(void)
 {
-  /* HAL_SD_Abort() only resets the current data path.  After an IDMA/SDMMC
-     error the HAL handle or the card can remain BUSY/ERROR, making every
-     later FatFs access fail until reset.  Recreate the complete peripheral
-     and card state before retrying the sector read. */
   (void)HAL_SD_Abort(&hsd1);
   ReadStatus = 0U;
   WriteStatus = 0U;
@@ -195,7 +179,7 @@ static uint8_t SD_ReinitializeCard(void)
     return MSD_ERROR;
   }
 
-  if (SD_CheckStatusWithTimeout(SD_TIMEOUT) < 0)
+  if (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) < 0)
   {
     Stat |= STA_NOINIT;
     return MSD_ERROR;
@@ -212,18 +196,13 @@ static uint8_t SD_ReadBlocksWithRecovery(uint32_t *data, uint32_t sector, uint32
     return MSD_OK;
   }
 
-  /* Do not repeat the IDMA operation that just failed.  Reinitialize the card
-     and finish this request in polling mode.  Clean the CPU-written data to
-     RAM because the aligned caller performs a DMA-style cache invalidate. */
-  if (SD_ReinitializeCard() == MSD_OK)
+  if ((SD_ReinitializeCard() == MSD_OK) &&
+      (SD_ReadBlocksPollingOnce(data, sector, count) == MSD_OK))
   {
-    if (SD_ReadBlocksPollingOnce(data, sector, count) == MSD_OK)
-    {
 #if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
-      SCB_CleanDCache_by_Addr((uint32_t *)data, count * BLOCKSIZE);
+    SCB_CleanDCache_by_Addr((uint32_t *)data, count * BLOCKSIZE);
 #endif
-      return MSD_OK;
-    }
+    return MSD_OK;
   }
 
   (void)HAL_SD_Abort(&hsd1);
@@ -232,7 +211,11 @@ static uint8_t SD_ReadBlocksWithRecovery(uint32_t *data, uint32_t sector, uint32
   return MSD_ERROR;
 }
 
-static uint8_t SD_ReadBlocksPollingWithRecovery(uint32_t *data, uint32_t sector, uint32_t count)
+static uint8_t SD_ReadBlocksPollingWithRecovery(
+  uint32_t *data,
+  uint32_t sector,
+  uint32_t count
+)
 {
   if (SD_ReadBlocksPollingOnce(data, sector, count) == MSD_OK)
   {
@@ -250,7 +233,6 @@ static uint8_t SD_ReadBlocksPollingWithRecovery(uint32_t *data, uint32_t sector,
   return MSD_ERROR;
 }
 
-#if defined(ENABLE_SCRATCH_BUFFER)
 static uint8_t SD_ReadUnalignedBlocks(uint8_t *data, uint32_t sector, uint32_t count)
 {
   uint32_t completed = 0U;
@@ -259,16 +241,13 @@ static uint8_t SD_ReadUnalignedBlocks(uint8_t *data, uint32_t sector, uint32_t c
   {
     uint32_t block_count = count - completed;
 
-    if (block_count > SD_SCRATCH_BLOCK_COUNT)
+    if (block_count > SD_MEDIA_SCRATCH_BLOCK_COUNT)
     {
-      block_count = SD_SCRATCH_BLOCK_COUNT;
+      block_count = SD_MEDIA_SCRATCH_BLOCK_COUNT;
     }
 
-    /* AVI frame payloads are commonly unaligned.  Starting one IDMA transfer
-       per 512-byte sector creates hundreds of short transfers per second and
-       is the failure mode seen during MJPEG playback. */
     if (SD_ReadBlocksPollingWithRecovery(
-          (uint32_t *)scratch,
+          (uint32_t *)SD_MediaScratch,
           sector + completed,
           block_count
         ) != MSD_OK)
@@ -276,14 +255,31 @@ static uint8_t SD_ReadUnalignedBlocks(uint8_t *data, uint32_t sector, uint32_t c
       return MSD_ERROR;
     }
 
-    memcpy(data, scratch, block_count * BLOCKSIZE);
+    memcpy(data, SD_MediaScratch, block_count * BLOCKSIZE);
     data += block_count * BLOCKSIZE;
     completed += block_count;
   }
 
   return MSD_OK;
 }
-#endif
+/* USER CODE END beforeFunctionSection */
+
+/* Private functions ---------------------------------------------------------*/
+
+static int SD_CheckStatusWithTimeout(uint32_t timeout)
+{
+  uint32_t timer = HAL_GetTick();
+  /* block until SDIO IP is ready again or a timeout occur */
+  while(HAL_GetTick() - timer < timeout)
+  {
+    if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
+    {
+      return 0;
+    }
+  }
+
+  return -1;
+}
 
 static DSTATUS SD_CheckStatus(BYTE lun)
 {
@@ -329,13 +325,78 @@ DSTATUS SD_status(BYTE lun)
   return SD_CheckStatus(lun);
 }
 
+/* USER CODE BEGIN beforeReadSection */
 void SD_SetReadPollingMode(uint8_t enabled)
 {
   SD_ForcePollingRead = (enabled != 0U) ? 1U : 0U;
 }
 
-/* USER CODE BEGIN beforeReadSection */
-/* can be used to modify previous code / undefine following code / add new code */
+DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
+{
+  DRESULT res = RES_ERROR;
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+  uint32_t alignedAddr;
+#endif
+
+  (void)lun;
+  if (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) < 0)
+  {
+    if (SD_ReinitializeCard() != MSD_OK)
+    {
+      return res;
+    }
+  }
+
+  if (((uint32_t)buff & 0x1FU) == 0U)
+  {
+    if (SD_ForcePollingRead != 0U)
+    {
+      if (SD_ReadBlocksPollingWithRecovery(
+            (uint32_t *)buff,
+            (uint32_t)sector,
+            count
+          ) == MSD_OK)
+      {
+        res = RES_OK;
+      }
+    }
+    else
+    {
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+      alignedAddr = (uint32_t)buff & ~0x1FU;
+      SCB_CleanInvalidateDCache_by_Addr(
+        (uint32_t *)alignedAddr,
+        count * BLOCKSIZE + ((uint32_t)buff - alignedAddr)
+      );
+#endif
+      if (SD_ReadBlocksWithRecovery(
+            (uint32_t *)buff,
+            (uint32_t)sector,
+            count
+          ) == MSD_OK)
+      {
+        res = RES_OK;
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+        alignedAddr = (uint32_t)buff & ~0x1FU;
+        SCB_InvalidateDCache_by_Addr(
+          (uint32_t *)alignedAddr,
+          count * BLOCKSIZE + ((uint32_t)buff - alignedAddr)
+        );
+#endif
+      }
+    }
+  }
+  else if (SD_ReadUnalignedBlocks(buff, (uint32_t)sector, count) == MSD_OK)
+  {
+    res = RES_OK;
+  }
+
+  return res;
+}
+
+/* Keep CubeMX's generated SD_read below for regeneration, but compile the
+   protected implementation above instead. */
+#if 0
 /* USER CODE END beforeReadSection */
 /**
   * @brief  Reads Sector(s)
@@ -349,6 +410,10 @@ void SD_SetReadPollingMode(uint8_t enabled)
 DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 {
   DRESULT res = RES_ERROR;
+  uint32_t timeout;
+#if defined(ENABLE_SCRATCH_BUFFER)
+  uint8_t ret;
+#endif
 #if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
   uint32_t alignedAddr;
 #endif
@@ -359,49 +424,92 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 
   if (SD_CheckStatusWithTimeout(SD_TIMEOUT) < 0)
   {
-    if (SD_ReinitializeCard() != MSD_OK)
-    {
-      return res;
-    }
+    return res;
   }
 
 #if defined(ENABLE_SCRATCH_BUFFER)
   if (!((uint32_t)buff & 0x1F))
   {
 #endif
-    if (SD_ForcePollingRead != 0U)
+    if(BSP_SD_ReadBlocks_DMA((uint32_t*)buff,
+                             (uint32_t) (sector),
+                             count) == MSD_OK)
     {
-      if (SD_ReadBlocksPollingWithRecovery((uint32_t *)buff, (uint32_t)sector, count) == MSD_OK)
+      ReadStatus = 0;
+      /* Wait that the reading process is completed or a timeout occurs */
+      timeout = HAL_GetTick();
+      while((ReadStatus == 0) && ((HAL_GetTick() - timeout) < SD_TIMEOUT))
       {
-        res = RES_OK;
       }
-    }
-    else
-    {
-#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
-      alignedAddr = (uint32_t)buff & ~0x1F;
-      SCB_CleanInvalidateDCache_by_Addr(
-        (uint32_t *)alignedAddr,
-        count * BLOCKSIZE + ((uint32_t)buff - alignedAddr)
-      );
-#endif
-      if (SD_ReadBlocksWithRecovery((uint32_t *)buff, (uint32_t)sector, count) == MSD_OK)
+      /* in case of a timeout return error */
+      if (ReadStatus == 0)
       {
-        res = RES_OK;
+        res = RES_ERROR;
+      }
+      else
+      {
+        ReadStatus = 0;
+        timeout = HAL_GetTick();
+
+        while((HAL_GetTick() - timeout) < SD_TIMEOUT)
+        {
+          if (BSP_SD_GetCardState() == SD_TRANSFER_OK)
+          {
+            res = RES_OK;
 #if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
-        alignedAddr = (uint32_t)buff & ~0x1F;
-        SCB_InvalidateDCache_by_Addr((uint32_t*)alignedAddr, count*BLOCKSIZE + ((uint32_t)buff - alignedAddr));
+            /*
+            the SCB_InvalidateDCache_by_Addr() requires a 32-Byte aligned address,
+            adjust the address and the D-Cache size to invalidate accordingly.
+            */
+            alignedAddr = (uint32_t)buff & ~0x1F;
+            SCB_InvalidateDCache_by_Addr((uint32_t*)alignedAddr, count*BLOCKSIZE + ((uint32_t)buff - alignedAddr));
 #endif
+            break;
+          }
+        }
       }
     }
 #if defined(ENABLE_SCRATCH_BUFFER)
   }
     else
     {
-      if (SD_ReadUnalignedBlocks(buff, (uint32_t)sector, count) == MSD_OK)
-      {
-        res = RES_OK;
+      /* Slow path, fetch each sector a part and memcpy to destination buffer */
+      int i;
+
+      for (i = 0; i < count; i++) {
+        ret = BSP_SD_ReadBlocks_DMA((uint32_t*)scratch, (uint32_t)sector++, 1);
+        if (ret == MSD_OK) {
+          /* wait until the read is successful or a timeout occurs */
+
+          timeout = HAL_GetTick();
+          while((ReadStatus == 0) && ((HAL_GetTick() - timeout) < SD_TIMEOUT))
+          {
+          }
+          if (ReadStatus == 0)
+          {
+            res = RES_ERROR;
+            break;
+          }
+          ReadStatus = 0;
+
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+          /*
+          *
+          * invalidate the scratch buffer before the next read to get the actual data instead of the cached one
+          */
+          SCB_InvalidateDCache_by_Addr((uint32_t*)scratch, BLOCKSIZE);
+#endif
+          memcpy(buff, scratch, BLOCKSIZE);
+          buff += BLOCKSIZE;
+        }
+        else
+        {
+          break;
+        }
       }
+
+      if ((i == count) && (ret == MSD_OK))
+        res = RES_OK;
     }
 #endif
 
@@ -409,7 +517,108 @@ DRESULT SD_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 }
 
 /* USER CODE BEGIN beforeWriteSection */
-/* can be used to modify previous code / undefine following code / add new code */
+#endif
+
+#if _USE_WRITE == 1
+DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
+{
+  DRESULT res = RES_ERROR;
+  uint32_t timeout;
+  uint32_t completed = 0U;
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+  uint32_t alignedAddr;
+#endif
+
+  (void)lun;
+  if (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) < 0)
+  {
+    if (SD_ReinitializeCard() != MSD_OK)
+    {
+      return res;
+    }
+  }
+
+  if (((uint32_t)buff & 0x1FU) == 0U)
+  {
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+    alignedAddr = (uint32_t)buff & ~0x1FU;
+    SCB_CleanDCache_by_Addr(
+      (uint32_t *)alignedAddr,
+      count * BLOCKSIZE + ((uint32_t)buff - alignedAddr)
+    );
+#endif
+    WriteStatus = 0U;
+    if (BSP_SD_WriteBlocks_DMA(
+          (uint32_t *)buff,
+          (uint32_t)sector,
+          count
+        ) == MSD_OK)
+    {
+      timeout = HAL_GetTick();
+      while ((WriteStatus == 0U) &&
+             ((HAL_GetTick() - timeout) < SD_MEDIA_TIMEOUT))
+      {
+      }
+
+      if ((WriteStatus == 1U) &&
+          (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) == 0))
+      {
+        res = RES_OK;
+      }
+    }
+  }
+  else
+  {
+    while (completed < count)
+    {
+      memcpy(SD_MediaScratch, buff, BLOCKSIZE);
+#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
+      SCB_CleanDCache_by_Addr((uint32_t *)SD_MediaScratch, BLOCKSIZE);
+#endif
+      WriteStatus = 0U;
+      if (BSP_SD_WriteBlocks_DMA(
+            (uint32_t *)SD_MediaScratch,
+            (uint32_t)sector + completed,
+            1U
+          ) != MSD_OK)
+      {
+        break;
+      }
+
+      timeout = HAL_GetTick();
+      while ((WriteStatus == 0U) &&
+             ((HAL_GetTick() - timeout) < SD_MEDIA_TIMEOUT))
+      {
+      }
+      if (WriteStatus != 1U)
+      {
+        break;
+      }
+
+      buff += BLOCKSIZE;
+      completed++;
+    }
+
+    if ((completed == count) &&
+        (SD_CheckStatusWithTimeout(SD_MEDIA_TIMEOUT) == 0))
+    {
+      res = RES_OK;
+    }
+  }
+
+  if (res != RES_OK)
+  {
+    (void)HAL_SD_Abort(&hsd1);
+    WriteStatus = 0U;
+  }
+
+  return res;
+}
+#endif /* _USE_WRITE == 1 */
+
+/* Keep CubeMX's generated SD_write below for regeneration, but compile the
+   protected implementation above instead. */
+#if 0
 /* USER CODE END beforeWriteSection */
 /**
   * @brief  Writes Sector(s)
@@ -454,7 +663,6 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
     SCB_CleanDCache_by_Addr((uint32_t*)alignedAddr, count*BLOCKSIZE + ((uint32_t)buff - alignedAddr));
 #endif
 
-    WriteStatus = 0U;
     if(BSP_SD_WriteBlocks_DMA((uint32_t*)buff,
                               (uint32_t)(sector),
                               count) == MSD_OK)
@@ -466,10 +674,8 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
       {
       }
       /* in case of a timeout return error */
-      if (WriteStatus != 1U)
+      if (WriteStatus == 0)
       {
-        (void)HAL_SD_Abort(&hsd1);
-        WriteStatus = 0U;
         res = RES_ERROR;
       }
       else
@@ -506,10 +712,6 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
         memcpy((void *)scratch, (void *)buff, BLOCKSIZE);
         buff += BLOCKSIZE;
 
-#if (ENABLE_SD_DMA_CACHE_MAINTENANCE == 1)
-        SCB_CleanDCache_by_Addr((uint32_t *)scratch, BLOCKSIZE);
-#endif
-
         ret = BSP_SD_WriteBlocks_DMA((uint32_t*)scratch, (uint32_t)sector++, 1);
         if (ret == MSD_OK) {
           /* wait for a message from the queue or a timeout */
@@ -517,10 +719,8 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
           while((WriteStatus == 0) && ((HAL_GetTick() - timeout) < SD_TIMEOUT))
           {
           }
-          if (WriteStatus != 1U)
+          if (WriteStatus == 0)
           {
-            (void)HAL_SD_Abort(&hsd1);
-            WriteStatus = 0U;
             break;
           }
 
@@ -539,6 +739,7 @@ DRESULT SD_write(BYTE lun, const BYTE *buff, DWORD sector, UINT count)
 #endif /* _USE_WRITE == 1 */
 
 /* USER CODE BEGIN beforeIoctlSection */
+#endif
 /* can be used to modify previous code / undefine following code / add new code */
 /* USER CODE END beforeIoctlSection */
 /**

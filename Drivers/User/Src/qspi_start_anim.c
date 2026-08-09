@@ -115,7 +115,8 @@ int8_t QSPI_StartAnim_ReadInfo(QSPI_StartAnimInfo *info)
     return QSPI_START_ANIM_ERR_HEADER;
   }
 
-  if ((uint64_t)QSPI_START_ANIM_BASE_ADDR + (uint64_t)data_offset + (uint64_t)payload_size > (uint64_t)W25QXX_FLASH_SIZE_BYTES)
+  if ((uint64_t)QSPI_START_ANIM_BASE_ADDR + (uint64_t)data_offset +
+      (uint64_t)payload_size > (uint64_t)QSPI_PARTITION_START_ANIM_END)
   {
     return QSPI_START_ANIM_ERR_HEADER;
   }

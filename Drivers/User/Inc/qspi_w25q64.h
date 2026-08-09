@@ -19,6 +19,7 @@ extern "C" {
 #define W25QXX_ERROR_DEINIT               -8
 #define W25QXX_ERROR_RESET                -9
 #define W25QXX_ERROR_READID              -10
+#define W25QXX_ERROR_ABORT               -11
 
 #define W25QXX_CMD_ENABLE_RESET           0x66U
 #define W25QXX_CMD_RESET_DEVICE           0x99U
@@ -50,6 +51,8 @@ int8_t QSPI_W25Qxx_Init(uint32_t *pDeviceId);
 int8_t QSPI_W25Qxx_Reset(void);
 uint32_t QSPI_W25Qxx_ReadID(void);
 int8_t QSPI_W25Qxx_MemoryMappedMode(void);
+int8_t QSPI_W25Qxx_ExitMemoryMappedMode(void);
+uint8_t QSPI_W25Qxx_IsMemoryMapped(void);
 
 int8_t QSPI_W25Qxx_SectorErase(uint32_t sectorAddress);
 int8_t QSPI_W25Qxx_BlockErase_32K(uint32_t blockAddress);

@@ -1,5 +1,6 @@
 #include "qspi_anim_loader.h"
 
+#include "qspi_partition.h"
 #include "qspi_w25q64.h"
 #include "usbd_cdc_if.h"
 
@@ -183,7 +184,7 @@ static int8_t QSPI_StartAnim_DownloadSession(void *context, LoaderSendFn send_fn
     return QSPI_ANIM_LOADER_ERR_PARAM;
   }
 
-  if (base_addr >= W25QXX_FLASH_SIZE_BYTES)
+  if (base_addr != QSPI_PARTITION_START_ANIM_OFFSET)
   {
     return QSPI_ANIM_LOADER_ERR_PARAM;
   }
@@ -207,7 +208,8 @@ static int8_t QSPI_StartAnim_DownloadSession(void *context, LoaderSendFn send_fn
     return QSPI_ANIM_LOADER_ERR_HEADER;
   }
 
-  if ((uint64_t)base_addr + (uint64_t)payload_size > (uint64_t)W25QXX_FLASH_SIZE_BYTES)
+  if ((uint64_t)base_addr + (uint64_t)payload_size >
+      (uint64_t)QSPI_PARTITION_START_ANIM_END)
   {
     send_text(send_fn, context, "ERR SIZE\r\n");
     return QSPI_ANIM_LOADER_ERR_HEADER;

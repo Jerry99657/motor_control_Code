@@ -60,7 +60,7 @@ LVGL 当前使用以下逻辑按键：
 
 ## 4. 主页面和各功能页面
 
-主菜单共 7 项：
+主菜单共 8 项：
 
 1. `Motor Control`
 2. `Command Control`
@@ -69,6 +69,7 @@ LVGL 当前使用以下逻辑按键：
 5. `MPU6500 Data`
 6. `WS2812 Control`
 7. `UI Diagnostics`
+8. `Camera Test`
 
 ### 4.1 Motor Control
 
@@ -139,6 +140,16 @@ V4 = Vx - Vy + W
 ### 4.7 UI Diagnostics
 
 UI Diagnostics 分为 Overview、Display、Memory 三个视图，使用 Left/Right 切换，KEY2/KEY3/ESC 返回。页面只显示关键指标：LVGL FPS、刷新耗时、脏区刷新次数、媒体/显示状态和内存池使用情况，避免一次性显示过多信息影响诊断本身。
+
+### 4.8 Camera Test
+
+进入页面后按需唤醒 OV5640、校验传感器 ID，并自动采集一帧 `320×240 JPEG`。JPEG 使用 STM32H7 硬件 JPEG 外设解码为 RGB565，再缩放为 `200×150` 显示在 LVGL 预览区；页面底部同时显示 JPEG 大小、采集耗时和解码耗时。
+
+- OK：重新初始化摄像头并采集下一帧。
+- Left/KEY2/KEY3：停止当前采集、拉低 `OV_RESET`、进入掉电状态并返回主菜单。
+- 初始化或采集失败时，页面显示传感器 ID、Camera 错误码和 DCMI 错误码；按 OK 可重试。
+
+该页面只做单帧拍照测试，不持续占用 DCMI。离开页面会释放共享 RGB565 媒体内存池，摄像头压缩帧缓冲与显示帧缓冲分别位于 D2 SRAM 和 AXI SRAM，保证硬件 JPEG 解码时输入、输出能够同时存在。
 
 ## 5. 媒体播放操作
 

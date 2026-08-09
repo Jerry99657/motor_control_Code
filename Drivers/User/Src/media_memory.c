@@ -4,8 +4,12 @@
 #include "main.h"
 
 #define MEDIA_MEMORY_FRAME_BYTES ((uint32_t)LCD_Width * (uint32_t)LCD_Height * 2U)
+#define MEDIA_MEMORY_CAMERA_BYTES (320U * 240U * 2U)
+#define MEDIA_MEMORY_POOL_BYTES \
+  ((MEDIA_MEMORY_FRAME_BYTES > MEDIA_MEMORY_CAMERA_BYTES) \
+    ? MEDIA_MEMORY_FRAME_BYTES : MEDIA_MEMORY_CAMERA_BYTES)
 
-static uint8_t s_media_frame_pool[MEDIA_MEMORY_FRAME_BYTES]
+static uint8_t s_media_frame_pool[MEDIA_MEMORY_POOL_BYTES]
   __attribute__((section(".media_pool"), aligned(32)));
 static volatile MediaMemoryOwner s_media_owner = MEDIA_MEMORY_OWNER_NONE;
 

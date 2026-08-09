@@ -2,6 +2,7 @@
 #define QSPI_START_ANIM_H
 
 #include <stdint.h>
+#include "qspi_partition.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,7 +14,7 @@ extern "C" {
 #define QSPI_START_ANIM_ERR_QSPI     -3
 #define QSPI_START_ANIM_ERR_BUSY     -4
 
-#define QSPI_START_ANIM_BASE_ADDR    0x000000U
+#define QSPI_START_ANIM_BASE_ADDR    QSPI_PARTITION_START_ANIM_OFFSET
 #define QSPI_START_ANIM_MAGIC        0x314E4151U
 #define QSPI_START_ANIM_VERSION      1U
 #define QSPI_START_ANIM_HEADER_SIZE  32U

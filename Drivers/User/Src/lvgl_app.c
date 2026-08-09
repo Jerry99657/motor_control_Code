@@ -21,6 +21,10 @@
 #include "imu.h"
 #include "imu_service.h"
 #include "comm_service.h"
+#include "camera_service.h"
+#include "media_memory.h"
+#include "nes_rom_cache.h"
+#include "qspi_partition.h"
 #include "safety_manager.h"
 #include <stdlib.h>
 #include <ctype.h>
@@ -49,6 +53,7 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_MENU_ID_MPU6500     5U
 #define LVGL_APP_MENU_ID_WS2812      6U
 #define LVGL_APP_MENU_ID_DIAGNOSTICS 7U
+#define LVGL_APP_MENU_ID_CAMERA      8U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -58,6 +63,7 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 
 #define LVGL_APP_MOTOR_COUNT         4U
 #define LVGL_APP_SERVO_COUNT         2U
+#define LVGL_APP_SERVO_HW_ENABLED    0U
 #define LVGL_APP_SPEED_MIN           (-100)
 #define LVGL_APP_SPEED_MAX           100
 #define LVGL_APP_SPEED_STEP          10
@@ -76,6 +82,7 @@ typedef enum
     LVGL_APP_ENTRY_BIN,
     LVGL_APP_ENTRY_GIF,
     LVGL_APP_ENTRY_MJPEG,
+    LVGL_APP_ENTRY_NES,
     LVGL_APP_ENTRY_FILE
 } lvgl_app_entry_type_t;
 
@@ -110,12 +117,25 @@ typedef enum
     LVGL_APP_SCREEN_REQ_SERVO_ANGLE,
     LVGL_APP_SCREEN_REQ_COMMAND,
     LVGL_APP_SCREEN_REQ_SD_BROWSER,
+    LVGL_APP_SCREEN_REQ_NES_CACHE,
     LVGL_APP_SCREEN_REQ_MECANUM,
     LVGL_APP_SCREEN_REQ_MPU6500,
     LVGL_APP_SCREEN_REQ_WS2812,
     LVGL_APP_SCREEN_REQ_DIAGNOSTICS,
+    LVGL_APP_SCREEN_REQ_CAMERA,
     LVGL_APP_SCREEN_REQ_GIF
 } lvgl_app_screen_req_t;
+
+typedef enum
+{
+    LVGL_APP_CAMERA_PHASE_OFF = 0,
+    LVGL_APP_CAMERA_PHASE_INIT_PENDING,
+    LVGL_APP_CAMERA_PHASE_READY,
+    LVGL_APP_CAMERA_PHASE_CAPTURING,
+    LVGL_APP_CAMERA_PHASE_DECODE_PENDING,
+    LVGL_APP_CAMERA_PHASE_SHOWING,
+    LVGL_APP_CAMERA_PHASE_ERROR
+} lvgl_app_camera_phase_t;
 
 typedef enum
 {
@@ -194,6 +214,24 @@ static lv_chart_series_t *s_diag_heap_series = NULL;
 static ui_perf_status_t s_diag_last_status = (ui_perf_status_t)0xFFU;
 static uint8_t s_diag_page_index = 0U;
 static uint32_t s_diag_last_refresh_tick = 0U;
+static lvgl_app_camera_phase_t s_camera_phase = LVGL_APP_CAMERA_PHASE_OFF;
+static lv_obj_t *s_camera_preview_card = NULL;
+static lv_obj_t *s_camera_preview_image = NULL;
+static lv_obj_t *s_camera_placeholder_label = NULL;
+static lv_obj_t *s_camera_info_label = NULL;
+static lv_img_dsc_t s_camera_image_dsc;
+static uint16_t *s_camera_rgb_buffer = NULL;
+static uint32_t s_camera_rgb_capacity = 0U;
+static uint32_t s_camera_phase_tick = 0U;
+static uint32_t s_camera_capture_started_tick = 0U;
+static uint32_t s_camera_capture_elapsed_ms = 0U;
+static uint8_t s_camera_capture_after_init = 0U;
+static lv_obj_t *s_nes_cache_phase_label = NULL;
+static lv_obj_t *s_nes_cache_progress_bar = NULL;
+static lv_obj_t *s_nes_cache_info_label = NULL;
+static char s_nes_cache_name[LVGL_APP_ENTRY_NAME_LEN] = {0};
+static NES_RomCachePhase s_nes_cache_last_phase = NES_ROM_CACHE_PHASE_IDLE;
+static uint32_t s_nes_cache_last_completed = UINT32_MAX;
 static lvgl_app_activity_t s_header_activity = (lvgl_app_activity_t)0xFFU;
 static uint32_t s_header_activity_tick = 0U;
 
@@ -232,11 +270,14 @@ static void lvgl_app_update_header_activity(void)
         color = (s_gif_paused != 0U) ? lv_color_hex(0xFCD34D) : lv_color_hex(0x86EFAC);
         spin = 0U;
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_SD_BROWSER)
+    else if ((s_current_screen == LVGL_APP_SCREEN_REQ_SD_BROWSER) ||
+             (s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE))
     {
         activity = LVGL_APP_ACTIVITY_STORAGE;
         symbol = LV_SYMBOL_SD_CARD;
         color = lv_color_hex(0x93C5FD);
+        spin = ((s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE) &&
+                (NES_RomCache_IsBusy() != 0U)) ? 1U : 0U;
     }
     else if (s_current_screen == LVGL_APP_SCREEN_REQ_COMMAND)
     {
@@ -249,6 +290,16 @@ static void lvgl_app_update_header_activity(void)
         activity = LVGL_APP_ACTIVITY_DIAGNOSTIC;
         symbol = LV_SYMBOL_EYE_OPEN;
         color = lv_color_hex(0xC4B5FD);
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_CAMERA)
+    {
+        activity = LVGL_APP_ACTIVITY_RUNNING;
+        symbol = LV_SYMBOL_IMAGE;
+        color = (s_camera_phase == LVGL_APP_CAMERA_PHASE_ERROR) ?
+                lv_color_hex(0xFCA5A5) : lv_color_hex(0x86EFAC);
+        spin = ((s_camera_phase == LVGL_APP_CAMERA_PHASE_INIT_PENDING) ||
+                (s_camera_phase == LVGL_APP_CAMERA_PHASE_CAPTURING) ||
+                (s_camera_phase == LVGL_APP_CAMERA_PHASE_DECODE_PENDING)) ? 1U : 0U;
     }
     else if ((s_current_screen == LVGL_APP_SCREEN_REQ_MECANUM) &&
              ((s_mecanum_executing != 0U) || (Mecanum_IsMotionActive() != 0U)))
@@ -315,10 +366,16 @@ static void lvgl_app_show_servo_angle_control(void);
 static void lvgl_app_show_command_control(void);
 static void lvgl_app_show_mecanum_control(void);
 static void lvgl_app_show_sd_browser(void);
+static void lvgl_app_show_nes_cache(void);
+static void lvgl_app_nes_cache_process(void);
+static void lvgl_app_nes_cache_exit(const char *reason);
 static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_ws2812_control(void);
 static void lvgl_app_show_diagnostics(void);
 static void lvgl_app_diagnostics_refresh(void);
+static void lvgl_app_show_camera_test(void);
+static void lvgl_app_camera_process(void);
+static void lvgl_app_camera_exit(const char *reason);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
@@ -335,6 +392,7 @@ static uint8_t lvgl_app_screen_depth(lvgl_app_screen_req_t screen)
 
     if ((screen == LVGL_APP_SCREEN_REQ_MOTOR_SPEED) ||
         (screen == LVGL_APP_SCREEN_REQ_SERVO_ANGLE) ||
+        (screen == LVGL_APP_SCREEN_REQ_NES_CACHE) ||
         (screen == LVGL_APP_SCREEN_REQ_GIF))
     {
         return 2U;
@@ -508,6 +566,11 @@ static uint8_t lvgl_app_is_bin_file(const char *name)
 static uint8_t lvgl_app_is_gif_file(const char *name)
 {
     return lvgl_app_is_ext_file(name, "GIF");
+}
+
+static uint8_t lvgl_app_is_nes_file(const char *name)
+{
+    return lvgl_app_is_ext_file(name, "NES");
 }
 
 static uint8_t lvgl_app_is_avi_file(const char *name)
@@ -705,6 +768,10 @@ static uint16_t lvgl_app_scan_browser_entries(void)
             else if ((lvgl_app_is_avi_file(fno.fname) != 0U) || (lvgl_app_is_mjpeg_file(fno.fname) != 0U))
             {
                 file_type = LVGL_APP_ENTRY_MJPEG;
+            }
+            else if (lvgl_app_is_nes_file(fno.fname) != 0U)
+            {
+                file_type = LVGL_APP_ENTRY_NES;
             }
             else
             {
@@ -930,10 +997,13 @@ static void lvgl_app_motor_speed_force_clear_all(void)
     }
 }
 
+#if LVGL_APP_SERVO_HW_ENABLED
 extern TIM_HandleTypeDef htim8;
+#endif
 
 static void lvgl_app_servo_angle_send_cmd(uint8_t servo_index, int16_t angle)
 {
+#if LVGL_APP_SERVO_HW_ENABLED
     uint32_t ccr;
     if (angle < LVGL_APP_SERVO_MIN) { angle = LVGL_APP_SERVO_MIN; }
     if (angle > LVGL_APP_SERVO_MAX) { angle = LVGL_APP_SERVO_MAX; }
@@ -949,6 +1019,10 @@ static void lvgl_app_servo_angle_send_cmd(uint8_t servo_index, int16_t angle)
     {
         __HAL_TIM_SET_COMPARE(&htim8, TIM_CHANNEL_2, ccr);
     }
+#else
+    (void)servo_index;
+    (void)angle;
+#endif
 }
 
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
@@ -983,6 +1057,10 @@ static void lvgl_app_process_pending_screen(void)
     {
         lvgl_app_show_sd_browser();
     }
+    else if (req == LVGL_APP_SCREEN_REQ_NES_CACHE)
+    {
+        lvgl_app_show_nes_cache();
+    }
     else if (req == LVGL_APP_SCREEN_REQ_COMMAND)
     {
         lvgl_app_show_command_control();
@@ -1002,6 +1080,10 @@ static void lvgl_app_process_pending_screen(void)
     else if (req == LVGL_APP_SCREEN_REQ_DIAGNOSTICS)
     {
         lvgl_app_show_diagnostics();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_CAMERA)
+    {
+        lvgl_app_show_camera_test();
     }
 }
 
@@ -1862,10 +1944,14 @@ static void lvgl_app_show_motor_control_menu(void)
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 0U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 Servo Angle");
+    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 Servo Angle (Disabled)");
+#if LVGL_APP_SERVO_HW_ENABLED
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
     lvgl_app_group_add_obj(btn);
+#else
+    lv_obj_add_state(btn, LV_STATE_DISABLED);
+#endif
     UI_Anim_StaggerIn(btn, 1U);
 
     btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back to Main Menu");
@@ -2509,6 +2595,256 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
     }
 }
 
+static const char *lvgl_app_nes_cache_error_text(int8_t result)
+{
+    switch (result)
+    {
+        case NES_ROM_CACHE_ERR_MOUNT: return "SD mount failed";
+        case NES_ROM_CACHE_ERR_OPEN: return "ROM open failed";
+        case NES_ROM_CACHE_ERR_READ: return "SD read failed";
+        case NES_ROM_CACHE_ERR_HEADER: return "Invalid iNES header";
+        case NES_ROM_CACHE_ERR_SIZE: return "ROM size is invalid";
+        case NES_ROM_CACHE_ERR_QSPI: return "QSPI operation failed";
+        case NES_ROM_CACHE_ERR_CRC: return "Read-back CRC mismatch";
+        case NES_ROM_CACHE_ERR_METADATA: return "Metadata verify failed";
+        case NES_ROM_CACHE_ERR_UNSUPPORTED: return "NES 2.0 is not supported";
+        case NES_ROM_CACHE_ERR_CANCELLED: return "Caching cancelled";
+        default: return "ROM cache failed";
+    }
+}
+
+static void lvgl_app_nes_cache_exit(const char *reason)
+{
+    if (NES_RomCache_IsBusy() != 0U)
+    {
+        NES_RomCache_Cancel();
+    }
+
+    s_nes_cache_phase_label = NULL;
+    s_nes_cache_progress_bar = NULL;
+    s_nes_cache_info_label = NULL;
+    lvgl_app_set_status("%s", (reason != NULL) ? reason : "NES cache closed");
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+}
+
+static void lvgl_app_nes_cache_event_cb(lv_event_t *e)
+{
+    uint32_t key;
+
+    if (lv_event_get_code(e) != LV_EVENT_KEY)
+    {
+        return;
+    }
+
+    key = lvgl_app_event_get_key(e);
+    if ((key == LV_KEY_LEFT) || (key == LV_KEY_ESC))
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_nes_cache_exit((key == LV_KEY_LEFT) ?
+                                "NES cache closed" : "NES cache cancelled by KEY2");
+    }
+    else if ((key == LV_KEY_ENTER) && (NES_RomCache_IsBusy() == 0U))
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_nes_cache_exit("NES cache result acknowledged");
+    }
+}
+
+static void lvgl_app_nes_cache_process(void)
+{
+    NES_RomCacheSnapshot snapshot;
+    uint32_t percent = 0U;
+    uint8_t phase_changed;
+    char info[192];
+
+    if (s_current_screen != LVGL_APP_SCREEN_REQ_NES_CACHE)
+    {
+        return;
+    }
+    if ((s_nes_cache_phase_label == NULL) ||
+        (s_nes_cache_progress_bar == NULL) ||
+        (s_nes_cache_info_label == NULL) ||
+        (lv_obj_is_valid(s_nes_cache_phase_label) == false) ||
+        (lv_obj_is_valid(s_nes_cache_progress_bar) == false) ||
+        (lv_obj_is_valid(s_nes_cache_info_label) == false))
+    {
+        return;
+    }
+
+    NES_RomCache_GetSnapshot(&snapshot);
+    if ((snapshot.phase == s_nes_cache_last_phase) &&
+        (snapshot.completed_bytes == s_nes_cache_last_completed))
+    {
+        return;
+    }
+
+    phase_changed = (snapshot.phase != s_nes_cache_last_phase) ? 1U : 0U;
+    s_nes_cache_last_phase = snapshot.phase;
+    s_nes_cache_last_completed = snapshot.completed_bytes;
+    if (phase_changed != 0U)
+    {
+        s_header_activity = (lvgl_app_activity_t)0xFFU;
+    }
+    if (snapshot.total_bytes != 0U)
+    {
+        percent = (uint32_t)(((uint64_t)snapshot.completed_bytes * 100U) /
+                             snapshot.total_bytes);
+        if (percent > 100U)
+        {
+            percent = 100U;
+        }
+    }
+
+    lv_label_set_text_fmt(s_nes_cache_phase_label, "%s  %lu%%",
+                          NES_RomCache_PhaseText(snapshot.phase),
+                          (unsigned long)percent);
+    lv_bar_set_value(s_nes_cache_progress_bar, (int32_t)percent, LV_ANIM_OFF);
+
+    if (snapshot.phase == NES_ROM_CACHE_PHASE_READY)
+    {
+        lv_label_set_text(s_nes_cache_phase_label, "Cache ready  100%");
+        lv_bar_set_value(s_nes_cache_progress_bar, 100, LV_ANIM_ON);
+        (void)snprintf(info, sizeof(info),
+                       "Mapper %u   PRG %lu KB   CHR %lu KB\n"
+                       "CRC32 %08lX   QSPI 0x%06lX\n"
+                       "Phase 1 ready - OK/Left returns",
+                       (unsigned int)snapshot.mapper,
+                       (unsigned long)(snapshot.prg_size / 1024U),
+                       (unsigned long)(snapshot.chr_size / 1024U),
+                       (unsigned long)snapshot.rom_crc32,
+                       (unsigned long)QSPI_PARTITION_NES_ROM_OFFSET);
+        lv_label_set_text(s_nes_cache_info_label, info);
+        lvgl_app_set_status("NES ROM cached and verified - OK/Left/KEY3 returns");
+        lvgl_app_show_toast(UI_NOTICE_SUCCESS, "NES ROM cache ready");
+    }
+    else if (snapshot.phase == NES_ROM_CACHE_PHASE_ERROR)
+    {
+        (void)snprintf(info, sizeof(info), "%s\nError %d\nOK/Left/KEY3 returns",
+                       lvgl_app_nes_cache_error_text(snapshot.result),
+                       (int)snapshot.result);
+        lv_label_set_text(s_nes_cache_info_label, info);
+        lvgl_app_set_status("NES cache failed (%d)", (int)snapshot.result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "NES cache failed (%d)",
+                            (int)snapshot.result);
+    }
+    else if (snapshot.phase == NES_ROM_CACHE_PHASE_CANCELLED)
+    {
+        lv_label_set_text(s_nes_cache_info_label, "Caching cancelled");
+    }
+    else
+    {
+        (void)snprintf(info, sizeof(info),
+                       "%lu / %lu KiB\n"
+                       "Do not remove SD card\nLeft/KEY2/KEY3 cancels",
+                       (unsigned long)((snapshot.completed_bytes + 1023U) / 1024U),
+                       (unsigned long)((snapshot.total_bytes + 1023U) / 1024U));
+        lv_label_set_text(s_nes_cache_info_label, info);
+    }
+}
+
+static void lvgl_app_show_nes_cache(void)
+{
+    lv_obj_t *name_label;
+    lv_obj_t *panel;
+    lv_obj_t *key_receiver;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_NES_CACHE, "NES ROM Cache");
+
+    name_label = lv_label_create(s_page_content);
+    lv_obj_set_width(name_label, 216);
+    lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(name_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(name_label, lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_label_set_text(name_label, s_nes_cache_name);
+    lv_obj_align(name_label, LV_ALIGN_TOP_MID, 0, 1);
+
+    panel = lv_obj_create(s_page_content);
+    lv_obj_set_size(panel, 220, 148);
+    lv_obj_align(panel, LV_ALIGN_BOTTOM_MID, 0, -1);
+    UI_Theme_ApplyPanel(panel);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_nes_cache_phase_label = lv_label_create(panel);
+    lv_obj_set_width(s_nes_cache_phase_label, 196);
+    lv_obj_set_style_text_align(s_nes_cache_phase_label,
+                                LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_nes_cache_phase_label,
+                                lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_label_set_text(s_nes_cache_phase_label, "Preparing...");
+    lv_obj_align(s_nes_cache_phase_label, LV_ALIGN_TOP_MID, 0, 2);
+
+    s_nes_cache_progress_bar = lv_bar_create(panel);
+    lv_obj_set_size(s_nes_cache_progress_bar, 194, 14);
+    lv_bar_set_range(s_nes_cache_progress_bar, 0, 100);
+    lv_bar_set_value(s_nes_cache_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_radius(s_nes_cache_progress_bar, 7, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_nes_cache_progress_bar, 7, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(s_nes_cache_progress_bar,
+                              lv_color_hex(0xDCEBFA), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_nes_cache_progress_bar,
+                              lv_color_hex(0x4EA1E8), LV_PART_INDICATOR);
+    lv_obj_align(s_nes_cache_progress_bar, LV_ALIGN_TOP_MID, 0, 28);
+
+    s_nes_cache_info_label = lv_label_create(panel);
+    lv_obj_set_width(s_nes_cache_info_label, 198);
+    lv_obj_set_style_text_font(s_nes_cache_info_label,
+                               &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_nes_cache_info_label,
+                                LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_nes_cache_info_label,
+                                lv_color_hex(0x1F2937), LV_PART_MAIN);
+    lv_label_set_text(s_nes_cache_info_label, "Inspecting ROM...");
+    lv_obj_align(s_nes_cache_info_label, LV_ALIGN_TOP_MID, 0, 54);
+
+    key_receiver = lv_obj_create(s_page_content);
+    lv_obj_set_size(key_receiver, 1, 1);
+    lv_obj_set_style_opa(key_receiver, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(key_receiver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(key_receiver, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(key_receiver, lvgl_app_nes_cache_event_cb,
+                        LV_EVENT_KEY, NULL);
+    lv_group_add_obj(s_group, key_receiver);
+    lv_group_focus_obj(key_receiver);
+
+    s_nes_cache_last_phase = NES_ROM_CACHE_PHASE_IDLE;
+    s_nes_cache_last_completed = UINT32_MAX;
+    lvgl_app_set_status("Caching NES ROM - Left/KEY2/KEY3 cancels");
+    UI_Anim_StaggerIn(name_label, 0U);
+    UI_Anim_StaggerIn(panel, 1U);
+    lvgl_app_nes_cache_process();
+    lvgl_app_page_finish();
+}
+
+static void lvgl_app_sd_cache_nes_by_index(uint16_t index)
+{
+    char rom_path[LVGL_APP_BROWSER_PATH_LEN];
+    int8_t result;
+
+    if (lvgl_app_browser_make_file_path(s_browser_entries[index].name,
+                                        rom_path, sizeof(rom_path)) == 0U)
+    {
+        lvgl_app_set_status("Failed to build NES path");
+        return;
+    }
+
+    result = NES_RomCache_Start(rom_path);
+    if (result != NES_ROM_CACHE_OK)
+    {
+        lvgl_app_set_status("Cannot start NES cache (%d)", (int)result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "NES cache start failed");
+        return;
+    }
+
+    (void)snprintf(s_nes_cache_name, sizeof(s_nes_cache_name), "%s",
+                   s_browser_entries[index].name);
+    lvgl_app_show_nes_cache();
+}
+
 static void lvgl_app_sd_select_id(uintptr_t id)
 {
     uint16_t index;
@@ -2550,6 +2886,10 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_MJPEG)
     {
         lvgl_app_sd_play_mjpeg_by_index(index);
+    }
+    else if (s_browser_entries[index].type == LVGL_APP_ENTRY_NES)
+    {
+        lvgl_app_sd_cache_nes_by_index(index);
     }
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_FILE)
     {
@@ -2650,6 +2990,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     else if (id == LVGL_APP_MENU_ID_DIAGNOSTICS)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_DIAGNOSTICS);
+    }
+    else if (id == LVGL_APP_MENU_ID_CAMERA)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_CAMERA);
     }
 }
 
@@ -2914,6 +3258,405 @@ static void lvgl_app_show_diagnostics(void)
     lvgl_app_page_finish();
 }
 
+#define LVGL_APP_CAMERA_PREVIEW_WIDTH   200U
+#define LVGL_APP_CAMERA_PREVIEW_HEIGHT  150U
+#define LVGL_APP_CAMERA_RGB_BYTES       \
+    ((uint32_t)CAMERA_JPEG_WIDTH * (uint32_t)CAMERA_JPEG_HEIGHT * 2U)
+
+static void lvgl_app_camera_set_info(const char *fmt, ...)
+{
+    char text[128];
+    va_list args;
+
+    if ((s_camera_info_label == NULL) ||
+        (lv_obj_is_valid(s_camera_info_label) == false))
+    {
+        return;
+    }
+
+    va_start(args, fmt);
+    (void)vsnprintf(text, sizeof(text), fmt, args);
+    va_end(args);
+    (void)UI_LabelSetTextIfChanged(s_camera_info_label, text);
+}
+
+static void lvgl_app_camera_release_preview(void)
+{
+    if (s_camera_image_dsc.data != NULL)
+    {
+        lv_img_cache_invalidate_src(&s_camera_image_dsc);
+    }
+    if ((s_camera_preview_image != NULL) &&
+        (lv_obj_is_valid(s_camera_preview_image) != false))
+    {
+        lv_obj_add_flag(s_camera_preview_image, LV_OBJ_FLAG_HIDDEN);
+    }
+    if ((s_camera_placeholder_label != NULL) &&
+        (lv_obj_is_valid(s_camera_placeholder_label) != false))
+    {
+        lv_obj_clear_flag(s_camera_placeholder_label, LV_OBJ_FLAG_HIDDEN);
+        lv_label_set_text(s_camera_placeholder_label, LV_SYMBOL_IMAGE "\nCamera ready");
+    }
+
+    MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+    s_camera_rgb_buffer = NULL;
+    s_camera_rgb_capacity = 0U;
+    (void)memset(&s_camera_image_dsc, 0, sizeof(s_camera_image_dsc));
+}
+
+static void lvgl_app_camera_scale_rgb565_in_place(uint16_t *pixels,
+                                                   uint16_t src_width,
+                                                   uint16_t src_height,
+                                                   uint16_t dst_width,
+                                                   uint16_t dst_height)
+{
+    uint32_t dst_y;
+    uint32_t dst_x;
+
+    if ((pixels == NULL) || (src_width == 0U) || (src_height == 0U) ||
+        (dst_width == 0U) || (dst_height == 0U) ||
+        (dst_width > src_width) || (dst_height > src_height))
+    {
+        return;
+    }
+
+    for (dst_y = 0U; dst_y < dst_height; ++dst_y)
+    {
+        uint32_t src_y = (dst_y * src_height) / dst_height;
+        for (dst_x = 0U; dst_x < dst_width; ++dst_x)
+        {
+            uint32_t src_x = (dst_x * src_width) / dst_width;
+            pixels[(dst_y * dst_width) + dst_x] =
+                pixels[(src_y * src_width) + src_x];
+        }
+    }
+}
+
+static void lvgl_app_camera_show_error(Camera_Result result)
+{
+    Camera_Diagnostics diagnostics;
+
+    Camera_Service_GetDiagnostics(&diagnostics);
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_ERROR;
+    if ((result == CAMERA_RESULT_I2C) ||
+        (diagnostics.i2c_error != HAL_I2C_ERROR_NONE))
+    {
+        lvgl_app_camera_set_info("SCCB E%02lX L%u%u N%u P%uR%u\nStep %u  ID 0x%04lX",
+                                 (unsigned long)diagnostics.i2c_error,
+                                 diagnostics.scl_level,
+                                 diagnostics.sda_level,
+                                 diagnostics.sccb_nack_phase,
+                                 diagnostics.pwdn_level,
+                                 diagnostics.reset_level,
+                                 (unsigned int)diagnostics.init_stage,
+                                 (unsigned long)diagnostics.sensor_id);
+    }
+    else
+    {
+        lvgl_app_camera_set_info("ID 0x%04lX  Error %d\nDCMI 0x%08lX",
+                                 (unsigned long)diagnostics.sensor_id,
+                                 (int)result,
+                                 (unsigned long)diagnostics.dcmi_error);
+    }
+    lvgl_app_set_status("Camera failed (%d) - OK retries, KEY3 returns", (int)result);
+    lvgl_app_show_toast(UI_NOTICE_ERROR, "Camera test failed");
+}
+
+static void lvgl_app_camera_start_capture(void)
+{
+    Camera_Result result;
+
+    lvgl_app_camera_release_preview();
+    result = Camera_Service_StartSnapshot(CAMERA_CAPTURE_TIMEOUT_DEFAULT);
+    if (result != CAMERA_RESULT_OK)
+    {
+        lvgl_app_camera_show_error(result);
+        return;
+    }
+
+    s_camera_capture_started_tick = HAL_GetTick();
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_CAPTURING;
+    lvgl_app_camera_set_info("ID 0x%04X\nCapturing 320x240 JPEG...",
+                             CAMERA_OV5640_SENSOR_ID);
+    lvgl_app_set_status("Capturing... KEY3 cancels and returns");
+}
+
+static void lvgl_app_camera_request_capture(void)
+{
+    if (s_camera_phase == LVGL_APP_CAMERA_PHASE_READY)
+    {
+        lvgl_app_camera_start_capture();
+        return;
+    }
+    if ((s_camera_phase == LVGL_APP_CAMERA_PHASE_INIT_PENDING) ||
+        (s_camera_phase == LVGL_APP_CAMERA_PHASE_CAPTURING) ||
+        (s_camera_phase == LVGL_APP_CAMERA_PHASE_DECODE_PENDING))
+    {
+        lvgl_app_show_toast(UI_NOTICE_INFO, "Camera is busy");
+        return;
+    }
+
+    lvgl_app_camera_release_preview();
+    Camera_Service_Sleep();
+    s_camera_capture_after_init = 1U;
+    s_camera_phase_tick = HAL_GetTick();
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
+    lvgl_app_camera_set_info("Powering OV5640...\nPlease wait");
+    lvgl_app_set_status("Initializing camera...");
+}
+
+static void lvgl_app_camera_event_cb(lv_event_t *e)
+{
+    uint32_t key;
+
+    if (lv_event_get_code(e) != LV_EVENT_KEY)
+    {
+        return;
+    }
+
+    key = lvgl_app_event_get_key(e);
+    if (key == LV_KEY_ENTER)
+    {
+        lvgl_app_camera_request_capture();
+    }
+    else if ((key == LV_KEY_LEFT) || (key == LV_KEY_ESC))
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_camera_exit((key == LV_KEY_LEFT) ?
+                             "Returned by Left" : "Returned by KEY2");
+    }
+}
+
+static void lvgl_app_camera_process(void)
+{
+    Camera_Result result;
+    Camera_State camera_state;
+    Camera_Diagnostics diagnostics;
+    const uint8_t *jpeg_data;
+    uint32_t jpeg_size;
+    uint16_t image_width;
+    uint16_t image_height;
+    uint32_t decode_started;
+    int8_t decode_result;
+
+    if (s_current_screen != LVGL_APP_SCREEN_REQ_CAMERA)
+    {
+        return;
+    }
+
+    if ((s_camera_phase == LVGL_APP_CAMERA_PHASE_INIT_PENDING) &&
+        ((HAL_GetTick() - s_camera_phase_tick) >= 80U))
+    {
+        result = Camera_Service_Init();
+        Camera_Service_GetDiagnostics(&diagnostics);
+        if (result != CAMERA_RESULT_OK)
+        {
+            lvgl_app_camera_show_error(result);
+            return;
+        }
+
+        s_camera_phase = LVGL_APP_CAMERA_PHASE_READY;
+        lvgl_app_camera_set_info("OV5640 ID 0x%04lX\n320x240 JPEG ready",
+                                 (unsigned long)diagnostics.sensor_id);
+        lvgl_app_set_status("OK captures - Left/KEY3 returns");
+        lvgl_app_show_toast(UI_NOTICE_SUCCESS, "OV5640 ready");
+        if (s_camera_capture_after_init != 0U)
+        {
+            s_camera_capture_after_init = 0U;
+            lvgl_app_camera_start_capture();
+        }
+        return;
+    }
+
+    if (s_camera_phase == LVGL_APP_CAMERA_PHASE_CAPTURING)
+    {
+        camera_state = Camera_Service_GetState();
+        if (camera_state == CAMERA_STATE_FRAME_READY)
+        {
+            result = Camera_Service_GetSnapshot(&jpeg_data, &jpeg_size);
+            if (result != CAMERA_RESULT_OK)
+            {
+                lvgl_app_camera_show_error(result);
+                return;
+            }
+
+            s_camera_capture_elapsed_ms = HAL_GetTick() - s_camera_capture_started_tick;
+            s_camera_phase_tick = HAL_GetTick();
+            s_camera_phase = LVGL_APP_CAMERA_PHASE_DECODE_PENDING;
+            lvgl_app_camera_set_info("JPEG %lu B  Capture %lu ms\nDecoding...",
+                                     (unsigned long)jpeg_size,
+                                     (unsigned long)s_camera_capture_elapsed_ms);
+            lvgl_app_set_status("JPEG captured - decoding...");
+        }
+        else if (camera_state == CAMERA_STATE_ERROR)
+        {
+            lvgl_app_camera_show_error(Camera_Service_GetLastResult());
+        }
+        return;
+    }
+
+    if ((s_camera_phase != LVGL_APP_CAMERA_PHASE_DECODE_PENDING) ||
+        ((HAL_GetTick() - s_camera_phase_tick) < 30U))
+    {
+        return;
+    }
+
+    result = Camera_Service_GetSnapshot(&jpeg_data, &jpeg_size);
+    if (result != CAMERA_RESULT_OK)
+    {
+        lvgl_app_camera_show_error(result);
+        return;
+    }
+
+    s_camera_rgb_buffer = (uint16_t *)MediaMemory_Acquire(
+        MEDIA_MEMORY_OWNER_CAMERA,
+        LVGL_APP_CAMERA_RGB_BYTES,
+        &s_camera_rgb_capacity);
+    if (s_camera_rgb_buffer == NULL)
+    {
+        lvgl_app_camera_show_error(CAMERA_RESULT_BUSY);
+        return;
+    }
+
+    decode_started = HAL_GetTick();
+    decode_result = MJPEG_Player_DecodeMemoryToRgb565(
+        (uint8_t *)jpeg_data,
+        jpeg_size,
+        CAMERA_JPEG_BUFFER_CAPACITY,
+        s_camera_rgb_buffer,
+        s_camera_rgb_capacity,
+        &image_width,
+        &image_height);
+    if (decode_result != MJPEG_PLAYER_OK)
+    {
+        lvgl_app_camera_release_preview();
+        lvgl_app_camera_set_info("JPEG %lu B\nDecode failed (%d)",
+                                 (unsigned long)jpeg_size,
+                                 (int)decode_result);
+        lvgl_app_set_status("JPEG decode failed (%d) - OK retries", (int)decode_result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "JPEG decode failed");
+        s_camera_phase = LVGL_APP_CAMERA_PHASE_ERROR;
+        return;
+    }
+
+    lvgl_app_camera_scale_rgb565_in_place(s_camera_rgb_buffer,
+                                           image_width,
+                                           image_height,
+                                           LVGL_APP_CAMERA_PREVIEW_WIDTH,
+                                           LVGL_APP_CAMERA_PREVIEW_HEIGHT);
+    (void)memset(&s_camera_image_dsc, 0, sizeof(s_camera_image_dsc));
+    s_camera_image_dsc.header.always_zero = 0U;
+    s_camera_image_dsc.header.w = LVGL_APP_CAMERA_PREVIEW_WIDTH;
+    s_camera_image_dsc.header.h = LVGL_APP_CAMERA_PREVIEW_HEIGHT;
+    s_camera_image_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+    s_camera_image_dsc.data_size =
+        LVGL_APP_CAMERA_PREVIEW_WIDTH * LVGL_APP_CAMERA_PREVIEW_HEIGHT * 2U;
+    s_camera_image_dsc.data = (const uint8_t *)s_camera_rgb_buffer;
+
+    lv_img_cache_invalidate_src(&s_camera_image_dsc);
+    lv_img_set_src(s_camera_preview_image, &s_camera_image_dsc);
+    lv_obj_center(s_camera_preview_image);
+    lv_obj_clear_flag(s_camera_preview_image, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_camera_placeholder_label, LV_OBJ_FLAG_HIDDEN);
+    UI_Anim_StateBounce(s_camera_preview_card);
+
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_SHOWING;
+    lvgl_app_camera_set_info("JPEG %lu B  Cap %lu ms  Dec %lu ms",
+                             (unsigned long)jpeg_size,
+                             (unsigned long)s_camera_capture_elapsed_ms,
+                             (unsigned long)(HAL_GetTick() - decode_started));
+    lvgl_app_set_status("OK captures again - Left/KEY3 returns");
+    lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Camera frame ready");
+}
+
+static void lvgl_app_camera_exit(const char *reason)
+{
+    if (s_current_screen != LVGL_APP_SCREEN_REQ_CAMERA)
+    {
+        return;
+    }
+
+    lvgl_app_camera_release_preview();
+    Camera_Service_Sleep();
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_OFF;
+    s_camera_capture_after_init = 0U;
+    s_camera_preview_card = NULL;
+    s_camera_preview_image = NULL;
+    s_camera_placeholder_label = NULL;
+    s_camera_info_label = NULL;
+    lvgl_app_set_status("%s", (reason != NULL) ? reason : "Camera closed");
+    lvgl_app_show_toast(UI_NOTICE_INFO,
+                        (reason != NULL) ? reason : "Camera closed");
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+}
+
+static void lvgl_app_show_camera_test(void)
+{
+    lv_obj_t *key_receiver;
+
+    Camera_Service_Sleep();
+    MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+    (void)memset(&s_camera_image_dsc, 0, sizeof(s_camera_image_dsc));
+    s_camera_rgb_buffer = NULL;
+    s_camera_rgb_capacity = 0U;
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_CAMERA, "Camera Test");
+
+    s_camera_preview_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(s_camera_preview_card, 208, 154);
+    lv_obj_align(s_camera_preview_card, LV_ALIGN_TOP_MID, 0, 2);
+    UI_Theme_ApplyPanel(s_camera_preview_card);
+    lv_obj_set_style_pad_all(s_camera_preview_card, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(s_camera_preview_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_camera_preview_image = lv_img_create(s_camera_preview_card);
+    lv_obj_add_flag(s_camera_preview_image, LV_OBJ_FLAG_HIDDEN);
+
+    s_camera_placeholder_label = lv_label_create(s_camera_preview_card);
+    lv_obj_set_style_text_align(s_camera_placeholder_label,
+                                LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_camera_placeholder_label,
+                                lv_color_hex(0x6B7280), LV_PART_MAIN);
+    lv_label_set_text(s_camera_placeholder_label,
+                      LV_SYMBOL_IMAGE "\nPowering OV5640...");
+    lv_obj_center(s_camera_placeholder_label);
+
+    s_camera_info_label = lv_label_create(s_page_content);
+    lv_obj_set_width(s_camera_info_label, 224);
+    lv_obj_set_style_text_font(s_camera_info_label,
+                               &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_camera_info_label,
+                                LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_camera_info_label,
+                                lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_obj_align(s_camera_info_label, LV_ALIGN_BOTTOM_MID, 0, -1);
+    lv_label_set_text(s_camera_info_label, "Initializing camera...");
+
+    key_receiver = lv_obj_create(s_page_content);
+    lv_obj_set_size(key_receiver, 1, 1);
+    lv_obj_set_style_opa(key_receiver, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(key_receiver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(key_receiver, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(key_receiver, lvgl_app_camera_event_cb, LV_EVENT_KEY, NULL);
+    lv_group_add_obj(s_group, key_receiver);
+    lv_group_focus_obj(key_receiver);
+
+    /* Entering the test page should produce a result without an extra key
+       press. Subsequent OK presses re-initialize and capture another frame. */
+    s_camera_capture_after_init = 1U;
+    s_camera_capture_elapsed_ms = 0U;
+    s_camera_phase_tick = HAL_GetTick();
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
+    lvgl_app_set_status("Initializing OV5640...");
+    UI_Anim_StaggerIn(s_camera_preview_card, 0U);
+    UI_Anim_StaggerIn(s_camera_info_label, 1U);
+    lvgl_app_page_finish();
+}
+
 static void lvgl_app_show_main_menu(void)
 {
     lv_obj_t *list;
@@ -2977,6 +3720,12 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
     lvgl_app_group_add_obj(btn);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, "8 Camera Test");
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_CAMERA);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_CAMERA);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 7U);
 
     lv_group_focus_obj(first_btn);
 
@@ -3217,6 +3966,7 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
         }
         else if (dev_id == 0x05 && len >= 0x09) // PWM Servo
         {
+#if LVGL_APP_SERVO_HW_ENABLED
             uint8_t port  = frame[5]; // 1~7
             uint8_t angle = frame[7]; // 0~180
             
@@ -3225,6 +3975,7 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
                 s_servo_angle_preset[port - 1] = target_angle;
                 lvgl_app_servo_angle_send_cmd(port, target_angle);
             }
+#endif
         }
     }
     else if (cmd == 0x01) // Read Encoder
@@ -3519,6 +4270,10 @@ static void lvgl_app_show_sd_browser(void)
             {
                 btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, s_browser_entries[i].name);
             }
+            else if (s_browser_entries[i].type == LVGL_APP_ENTRY_NES)
+            {
+                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, s_browser_entries[i].name);
+            }
             else
             {
                 btn = lv_list_add_btn(list, LV_SYMBOL_FILE, s_browser_entries[i].name);
@@ -3584,6 +4339,11 @@ static void lvgl_app_process_global_stop_key(void)
         lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_exit_gif_player("Stopped by KEY2");
     }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE)
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_nes_cache_exit("NES cache cancelled by KEY2");
+    }
 }
 
 static void lvgl_app_process_media_return_key(void)
@@ -3608,6 +4368,16 @@ static void lvgl_app_process_media_return_key(void)
         lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_exit_gif_player("Returned by KEY3");
     }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_CAMERA)
+    {
+        lv_port_indev_suppress_exit_keys_until_release();
+        lvgl_app_camera_exit("Returned by KEY3");
+    }
+    else if (s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE)
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_nes_cache_exit("Returned by KEY3");
+    }
 }
 
 void LVGL_App_Init(void)
@@ -3617,9 +4387,11 @@ void LVGL_App_Init(void)
     UI_Feedback_Init(&s_feedback);
     UI_PerfDiag_Init();
 
-    /* Start TIM8 PWM for servos (1 and 2 only, 3 and 4 used by SDMMC1) */
+    /* Servo PWM is disabled while PC6/PC7 are assigned to DCMI D0/D1. */
+#if LVGL_APP_SERVO_HW_ENABLED
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+#endif
     
     MPU6500_Init();
     imu_init();
@@ -3633,6 +4405,7 @@ void LVGL_App_Process(void)
     uint32_t safety_faults = Safety_GetFaults();
     uint32_t ui_handler_start;
 
+    NES_RomCache_Process();
     UI_PerfDiag_Process();
     if ((s_current_screen == LVGL_APP_SCREEN_REQ_DIAGNOSTICS) &&
         ((HAL_GetTick() - s_diag_last_refresh_tick) >= 500U))
@@ -3640,6 +4413,8 @@ void LVGL_App_Process(void)
         s_diag_last_refresh_tick = HAL_GetTick();
         lvgl_app_diagnostics_refresh();
     }
+    lvgl_app_camera_process();
+    lvgl_app_nes_cache_process();
 
     if (safety_faults != s_last_safety_faults)
     {
