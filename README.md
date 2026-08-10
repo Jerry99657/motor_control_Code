@@ -112,6 +112,8 @@ OK 可以在页面内直接编辑电机或舵机行；Left/Right 修改数值，
 
 当前识别的媒体包括 `.bin`、`.avi`、`.gif` 和 `.nes`。AVI 文件既可按扩展名识别，也可通过 RIFF/AVI 文件头识别，播放返回后会重新扫描当前目录。
 
+FatFs 保持 CubeMX 的 CP936 长文件名配置：目录扫描得到的原始 CP936/GBK 名称用于 `f_open()`、`f_opendir()` 和媒体接口；文件列表、目录路径、播放标题及状态文本在显示前通过 `ff_convert()` 转为 LVGL 所需的 UTF-8。转换使用临时缓冲，不会把 UTF-8 名称误传给 FatFs，也不会为 48 个目录项长期保存第二份名称。完整 GB2312 字库采用 16 px、2 bpp，Unicode 映射和字形度量保留在 MCU Flash，约 396 KB 位图存放于 W25Q64 最后 512 KB 分区，并通过 QSPI Memory-Mapped 窗口和 8 项 RAM 字形缓存读取；NES 缓存擦写期间自动切换为安全的间接读取。未覆盖的 CP936 扩展字明确显示为 `?`，不再无提示消失。首次使用请把 [`assets/GB2312.FNT`](assets/GB2312.FNT) 复制到 SD 卡根目录并重启，固件会执行全量 CRC32 后一次性安装。详细结构见 [`docs/lvgl_chinese_font_w25q64_zh.md`](docs/lvgl_chinese_font_w25q64_zh.md)。
+
 选择 `.nes` 后先检查 W25Q64 缓存；同一 ROM 会显示 `Cache hit 100%`，否则执行 SD→QSPI 复制和 CRC32 校验。缓存完成后按 OK 开始游戏。NES 支持 Mapper 0/1/2/3；KEY3 正常退出并为带电池标志的游戏写入同名 `.sav`，KEY2 保持紧急退出且不等待存档。游戏运行时既可使用开发板实体按键，也可将 ESP32 手机网页切换到 NES 手柄，两组输入能够同时组合。
 
 ### 4.4 Mecanum Control

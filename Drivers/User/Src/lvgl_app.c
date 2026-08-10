@@ -5,6 +5,7 @@
 #include "lv_port_disp.h"
 #include "ui_animation.h"
 #include "ui_feedback.h"
+#include "ui_font.h"
 #include "ui_page.h"
 #include "ui_perf_diag.h"
 #include "ui_theme.h"
@@ -47,6 +48,8 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_MAX_BROWSER_ENTRIES 48U
 #define LVGL_APP_ENTRY_NAME_LEN      256U
 #define LVGL_APP_BROWSER_PATH_LEN    512U
+#define LVGL_APP_ENTRY_UTF8_LEN      (((LVGL_APP_ENTRY_NAME_LEN * 3U) / 2U) + 1U)
+#define LVGL_APP_PATH_UTF8_LEN       (((LVGL_APP_BROWSER_PATH_LEN * 3U) / 2U) + 1U)
 #define LVGL_APP_LVFS_PATH_LEN       (LVGL_APP_BROWSER_PATH_LEN + 3U)
 
 #define LVGL_APP_MENU_ID_MANUAL      1U
@@ -247,7 +250,7 @@ static uint8_t s_camera_capture_after_init = 0U;
 static lv_obj_t *s_nes_cache_phase_label = NULL;
 static lv_obj_t *s_nes_cache_progress_bar = NULL;
 static lv_obj_t *s_nes_cache_info_label = NULL;
-static char s_nes_cache_name[LVGL_APP_ENTRY_NAME_LEN] = {0};
+static char s_nes_cache_name[LVGL_APP_ENTRY_UTF8_LEN] = {0};
 static NES_RomCachePhase s_nes_cache_last_phase = NES_ROM_CACHE_PHASE_IDLE;
 static uint32_t s_nes_cache_last_completed = UINT32_MAX;
 static uint8_t s_nes_cache_last_read_errors = UINT8_MAX;
@@ -464,6 +467,13 @@ static void lvgl_app_page_begin(lvgl_app_screen_req_t target, const char *title)
     s_page_root = s_page.root;
     s_page_content = UI_Page_CreateContentLayer(&s_page);
     s_status_label = s_page.status_label;
+    if (s_status_label != NULL)
+    {
+        /* Page-specific font overrides must not leak into the next page. */
+        (void)lv_obj_remove_local_style_prop(s_status_label,
+                                             LV_STYLE_TEXT_FONT,
+                                             LV_PART_MAIN);
+    }
     if (s_page_content == NULL)
     {
         return;
@@ -641,6 +651,130 @@ static void lvgl_app_browser_reset_path(void)
 {
     s_browser_path[0] = '/';
     s_browser_path[1] = '\0';
+}
+
+static size_t lvgl_app_cp936_to_utf8(const char *src, char *dst, size_t dst_size)
+{
+    size_t src_index = 0U;
+    size_t dst_index = 0U;
+
+    if ((src == NULL) || (dst == NULL) || (dst_size == 0U))
+    {
+        return 0U;
+    }
+
+    while (src[src_index] != '\0')
+    {
+        uint8_t first = (uint8_t)src[src_index];
+        uint32_t unicode;
+        size_t consumed = 1U;
+        size_t encoded_len;
+
+        if (first < 0x80U)
+        {
+            unicode = first;
+        }
+        else if ((first >= 0x81U) && (first <= 0xFEU) &&
+                 (src[src_index + 1U] != '\0'))
+        {
+            uint8_t second = (uint8_t)src[src_index + 1U];
+
+            if ((second >= 0x40U) && (second <= 0xFEU) &&
+                (second != 0x7FU))
+            {
+                WCHAR oem_code = (WCHAR)(((uint16_t)first << 8U) | second);
+                unicode = (uint32_t)ff_convert(oem_code, 1U);
+                consumed = 2U;
+            }
+            else
+            {
+                unicode = (uint32_t)'?';
+            }
+        }
+        else
+        {
+            unicode = (uint32_t)'?';
+        }
+
+        if (unicode == 0U)
+        {
+            unicode = (uint32_t)'?';
+        }
+
+        if (unicode >= 0x80U)
+        {
+            lv_font_glyph_dsc_t glyph_dsc;
+
+            if (lv_font_get_glyph_dsc(UI_FONT_CJK, &glyph_dsc,
+                                      unicode, 0U) == false)
+            {
+                /* Never let an unsupported filename character disappear. */
+                unicode = (uint32_t)'?';
+            }
+        }
+
+        if (unicode < 0x80U)
+        {
+            encoded_len = 1U;
+        }
+        else if (unicode < 0x800U)
+        {
+            encoded_len = 2U;
+        }
+        else
+        {
+            encoded_len = 3U;
+        }
+
+        if ((dst_index + encoded_len) >= dst_size)
+        {
+            break;
+        }
+
+        if (encoded_len == 1U)
+        {
+            dst[dst_index++] = (char)unicode;
+        }
+        else if (encoded_len == 2U)
+        {
+            dst[dst_index++] = (char)(0xC0U | (unicode >> 6U));
+            dst[dst_index++] = (char)(0x80U | (unicode & 0x3FU));
+        }
+        else
+        {
+            dst[dst_index++] = (char)(0xE0U | (unicode >> 12U));
+            dst[dst_index++] = (char)(0x80U | ((unicode >> 6U) & 0x3FU));
+            dst[dst_index++] = (char)(0x80U | (unicode & 0x3FU));
+        }
+
+        src_index += consumed;
+    }
+
+    dst[dst_index] = '\0';
+    return dst_index;
+}
+
+static void lvgl_app_apply_browser_text_font(lv_obj_t *button)
+{
+    uint32_t child_count;
+    lv_obj_t *text_label;
+
+    if (button == NULL)
+    {
+        return;
+    }
+
+    child_count = lv_obj_get_child_cnt(button);
+    if (child_count == 0U)
+    {
+        return;
+    }
+
+    text_label = lv_obj_get_child(button, (int32_t)(child_count - 1U));
+    if (text_label != NULL)
+    {
+        lv_obj_set_style_text_font(text_label, UI_FONT_CJK, LV_PART_MAIN);
+    }
 }
 
 static uint8_t lvgl_app_browser_enter_dir(const char *name)
@@ -2305,6 +2439,7 @@ static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
 {
     uint8_t enter_ok;
     char prev_path[LVGL_APP_BROWSER_PATH_LEN];
+    char display_path[LVGL_APP_PATH_UTF8_LEN];
 
     (void)snprintf(prev_path, sizeof(prev_path), "%s", s_browser_path);
     enter_ok = lvgl_app_browser_enter_dir(s_browser_entries[index].name);
@@ -2315,7 +2450,9 @@ static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
     }
     else
     {
-        lvgl_app_set_status("Path: %s", s_browser_path);
+        (void)lvgl_app_cp936_to_utf8(s_browser_path, display_path,
+                                     sizeof(display_path));
+        lvgl_app_set_status("Path: %s", display_path);
     }
 
     lvgl_app_show_sd_browser();
@@ -2571,7 +2708,7 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
 {
     int8_t play_status;
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
-    char played_name[LVGL_APP_ENTRY_NAME_LEN];
+    char played_name[LVGL_APP_ENTRY_UTF8_LEN];
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
@@ -2580,7 +2717,8 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
         return;
     }
 
-    (void)snprintf(played_name, sizeof(played_name), "%s", s_browser_entries[index].name);
+    (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name, played_name,
+                                 sizeof(played_name));
     lvgl_app_set_status("BIN: OK pause, Left/Right seek, KEY3 return");
     lv_refr_now(NULL);
     (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
@@ -2735,6 +2873,11 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     lvgl_app_group_reset();
     s_status_label = NULL;
     lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_GIF, "Media Player");
+    if (s_status_label != NULL)
+    {
+        lv_obj_set_style_text_font(s_status_label, UI_FONT_CJK,
+                                   LV_PART_MAIN);
+    }
 
     s_gif_obj = lv_img_create(s_page_content);
     s_gif_imgdsc.header.always_zero = 0;
@@ -2854,6 +2997,7 @@ static void lvgl_app_exit_gif_player(const char *reason)
 static void lvgl_app_sd_play_gif_by_index(uint16_t index)
 {
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
+    char display_name[LVGL_APP_ENTRY_UTF8_LEN];
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
@@ -2862,14 +3006,16 @@ static void lvgl_app_sd_play_gif_by_index(uint16_t index)
         return;
     }
 
-    lvgl_app_show_gif_player(play_path, s_browser_entries[index].name);
+    (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name, display_name,
+                                 sizeof(display_name));
+    lvgl_app_show_gif_player(play_path, display_name);
 }
 
 static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
 {
     int8_t play_status;
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
-    char played_name[LVGL_APP_ENTRY_NAME_LEN];
+    char played_name[LVGL_APP_ENTRY_UTF8_LEN];
 
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
@@ -2878,7 +3024,8 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
         return;
     }
 
-    (void)snprintf(played_name, sizeof(played_name), "%s", s_browser_entries[index].name);
+    (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name, played_name,
+                                 sizeof(played_name));
     lvgl_app_set_status("Video: OK pause, Left/Right seek, KEY3 return");
     lv_refr_now(NULL);
     (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
@@ -3264,6 +3411,7 @@ static void lvgl_app_show_nes_cache(void)
     name_label = lv_label_create(s_page_content);
     lv_obj_set_width(name_label, 216);
     lv_label_set_long_mode(name_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(name_label, UI_FONT_CJK, LV_PART_MAIN);
     lv_obj_set_style_text_align(name_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(name_label, lv_color_hex(0x173B67), LV_PART_MAIN);
     lv_label_set_text(name_label, s_nes_cache_name);
@@ -3347,8 +3495,9 @@ static void lvgl_app_sd_cache_nes_by_index(uint16_t index)
         return;
     }
 
-    (void)snprintf(s_nes_cache_name, sizeof(s_nes_cache_name), "%s",
-                   s_browser_entries[index].name);
+    (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name,
+                                 s_nes_cache_name,
+                                 sizeof(s_nes_cache_name));
     lvgl_app_show_nes_cache();
 }
 
@@ -3400,7 +3549,10 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     }
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_FILE)
     {
-        lvgl_app_set_status("File: %s", s_browser_entries[index].name);
+        char display_name[LVGL_APP_ENTRY_UTF8_LEN];
+        (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name,
+                                     display_name, sizeof(display_name));
+        lvgl_app_set_status("File: %s", display_name);
     }
 }
 
@@ -4922,7 +5074,8 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_t *back_btn;
     lv_obj_t *up_btn;
     lv_obj_t *focus_obj;
-    char path_line[LVGL_APP_BROWSER_PATH_LEN + 8U];
+    char path_line[LVGL_APP_PATH_UTF8_LEN + 8U];
+    char *display_path = &path_line[sizeof("Path: ") - 1U];
     uint16_t i;
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
@@ -4933,11 +5086,20 @@ static void lvgl_app_show_sd_browser(void)
     lvgl_app_group_reset();
     s_status_label = NULL;
     lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_SD_BROWSER, "SD Card Files");
+    if (s_status_label != NULL)
+    {
+        lv_obj_set_style_text_font(s_status_label, UI_FONT_CJK,
+                                   LV_PART_MAIN);
+    }
 
-    (void)snprintf(path_line, sizeof(path_line), "Path: %s", s_browser_path);
+    (void)snprintf(path_line, sizeof(path_line), "Path: ");
+    (void)lvgl_app_cp936_to_utf8(s_browser_path, display_path,
+                                 sizeof(path_line) -
+                                     (sizeof("Path: ") - 1U));
     btn = lv_label_create(s_page_content);
     lv_label_set_long_mode(btn, LV_LABEL_LONG_DOT);
     lv_obj_set_width(btn, 224);
+    lv_obj_set_style_text_font(btn, UI_FONT_CJK, LV_PART_MAIN);
     lv_label_set_text(btn, path_line);
     lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 2);
 
@@ -4965,12 +5127,13 @@ static void lvgl_app_show_sd_browser(void)
         if (s_browser_scan_result == FR_OK)
         {
             btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "No folders or media");
-            lvgl_app_set_status("Empty: %s", s_browser_path);
+            lvgl_app_set_status("Empty: %s", display_path);
         }
         else
         {
             btn = lv_list_add_btn(list, LV_SYMBOL_WARNING, "SD read failed");
-            lvgl_app_set_status("SD scan failed (%d): %s", (int)s_browser_scan_result, s_browser_path);
+            lvgl_app_set_status("SD scan failed (%d): %s",
+                                (int)s_browser_scan_result, display_path);
         }
         lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
         lv_group_focus_obj(up_btn);
@@ -4979,29 +5142,35 @@ static void lvgl_app_show_sd_browser(void)
     {
         for (i = 0U; i < s_browser_entry_count; ++i)
         {
+            char display_name[LVGL_APP_ENTRY_UTF8_LEN];
+
+            (void)lvgl_app_cp936_to_utf8(s_browser_entries[i].name,
+                                         display_name,
+                                         sizeof(display_name));
             if (s_browser_entries[i].type == LVGL_APP_ENTRY_DIR)
             {
-                char line[LVGL_APP_ENTRY_NAME_LEN + 4U];
-                (void)snprintf(line, sizeof(line), "[%s]", s_browser_entries[i].name);
+                char line[LVGL_APP_ENTRY_UTF8_LEN + 4U];
+                (void)snprintf(line, sizeof(line), "[%s]", display_name);
                 btn = lv_list_add_btn(list, LV_SYMBOL_RIGHT, line);
             }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_GIF)
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, s_browser_entries[i].name);
+                btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, display_name);
             }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_MJPEG)
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, s_browser_entries[i].name);
+                btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, display_name);
             }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_NES)
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, s_browser_entries[i].name);
+                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, display_name);
             }
             else
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, s_browser_entries[i].name);
+                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, display_name);
             }
 
+            lvgl_app_apply_browser_text_font(btn);
             lv_obj_add_event_cb(btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)(i + LVGL_APP_SD_ID_BASE));
             lv_obj_add_event_cb(btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)(i + LVGL_APP_SD_ID_BASE));
             lvgl_app_group_add_obj(btn);
@@ -5115,6 +5284,14 @@ static void lvgl_app_process_media_return_key(void)
 
 void LVGL_App_Init(void)
 {
+    int8_t font_storage_status;
+
+    /* The large Chinese glyph bitmaps live in W25Q64.  On the first boot,
+     * placing GB2312.FNT in the SD root installs it into the reserved font
+     * partition.  Failure is non-fatal: the built-in compact font remains the
+     * fallback and unsupported CP936 characters are rendered as '?'. */
+    font_storage_status = UI_FontStorage_Bootstrap();
+
     UI_Theme_Init(lv_disp_get_default());
     UI_TransitionManager_Init(&s_transition_manager);
     UI_Feedback_Init(&s_feedback);
@@ -5129,7 +5306,15 @@ void LVGL_App_Init(void)
     MPU6500_Init();
     imu_init();
 
-    lvgl_app_set_status("Up/Down move, Right enters, Left goes back, KEY2 exits");
+    if (font_storage_status == UI_FONT_STORAGE_OK)
+    {
+        lvgl_app_set_status("Up/Down move, Right enters, Left goes back, KEY2 exits");
+    }
+    else
+    {
+        lvgl_app_set_status("Chinese font offline (%d): copy GB2312.FNT to SD root",
+                            (int)font_storage_status);
+    }
     lvgl_app_show_main_menu();
 }
 
@@ -5151,6 +5336,13 @@ void LVGL_App_Process(void)
     }
 
     NES_RomCache_Process();
+    if (NES_RomCache_IsBusy() == 0U)
+    {
+        /* Normal pages use the cached QSPI memory window.  NES cache Start()
+         * exits mapped mode before erase/write; while it is busy, glyph reads
+         * automatically use safe indirect QSPI access instead. */
+        UI_FontStorage_MaintainMappedRead();
+    }
     UI_PerfDiag_Process();
     if ((s_current_screen == LVGL_APP_SCREEN_REQ_DIAGNOSTICS) &&
         ((HAL_GetTick() - s_diag_last_refresh_tick) >= 500U))
