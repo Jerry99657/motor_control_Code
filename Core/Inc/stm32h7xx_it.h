@@ -60,6 +60,7 @@ void DMA1_Stream1_IRQHandler(void);
 void ADC_IRQHandler(void);
 void TIM8_UP_TIM13_IRQHandler(void);
 void SDMMC1_IRQHandler(void);
+void UART4_IRQHandler(void);
 void UART5_IRQHandler(void);
 void TIM6_DAC_IRQHandler(void);
 void TIM7_IRQHandler(void);

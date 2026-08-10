@@ -21,6 +21,7 @@
 #include "imu.h"
 #include "imu_service.h"
 #include "comm_service.h"
+#include "foc_link.h"
 #include "camera_service.h"
 #include "media_memory.h"
 #include "nes_rom_cache.h"
@@ -29,6 +30,7 @@
 #include "safety_manager.h"
 #include <stdlib.h>
 #include <ctype.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -53,8 +55,9 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_MENU_ID_MECANUM     4U
 #define LVGL_APP_MENU_ID_MPU6500     5U
 #define LVGL_APP_MENU_ID_WS2812      6U
-#define LVGL_APP_MENU_ID_DIAGNOSTICS 7U
-#define LVGL_APP_MENU_ID_CAMERA      8U
+#define LVGL_APP_MENU_ID_FOC         7U
+#define LVGL_APP_MENU_ID_DIAGNOSTICS 8U
+#define LVGL_APP_MENU_ID_CAMERA      9U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -71,6 +74,13 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_MECANUM_SPEED_MIN   (-100)
 #define LVGL_APP_MECANUM_SPEED_MAX   100
 #define LVGL_APP_MECANUM_SPEED_STEP  10
+#define LVGL_APP_FOC_SPEED_MIN       (-100)
+#define LVGL_APP_FOC_SPEED_MAX       100
+#define LVGL_APP_FOC_SPEED_STEP      10
+#define LVGL_APP_FOC_POSITION_MIN_X10 0
+#define LVGL_APP_FOC_POSITION_MAX_X10 62
+#define LVGL_APP_FOC_POSITION_STEP_X10 1
+#define LVGL_APP_FOC_ROW_COUNT       2U
 #define LVGL_APP_SERVO_MIN           0
 #define LVGL_APP_SERVO_MAX           270
 #define LVGL_APP_SERVO_STEP          10
@@ -106,7 +116,8 @@ typedef enum
     LVGL_APP_CTRL_PAGE_COMMAND,
     LVGL_APP_CTRL_PAGE_MECANUM,
     LVGL_APP_CTRL_PAGE_MPU6500,
-    LVGL_APP_CTRL_PAGE_WS2812
+    LVGL_APP_CTRL_PAGE_WS2812,
+    LVGL_APP_CTRL_PAGE_FOC
 } lvgl_app_ctrl_page_t;
 
 typedef enum
@@ -123,6 +134,7 @@ typedef enum
     LVGL_APP_SCREEN_REQ_MECANUM,
     LVGL_APP_SCREEN_REQ_MPU6500,
     LVGL_APP_SCREEN_REQ_WS2812,
+    LVGL_APP_SCREEN_REQ_FOC,
     LVGL_APP_SCREEN_REQ_DIAGNOSTICS,
     LVGL_APP_SCREEN_REQ_CAMERA,
     LVGL_APP_SCREEN_REQ_GIF
@@ -195,6 +207,10 @@ static int16_t s_mec_rot_z = 0;
 static int16_t s_mec_speed_x = 0;
 static int16_t s_mec_speed_y = 0;
 static int16_t s_mec_speed_z = 0;
+static int16_t s_foc_speed_setpoint = 0;
+static int16_t s_foc_position_setpoint_x10 = 0;
+static uint8_t s_foc_active_loop = 0U;
+static lv_obj_t *s_foc_status_label = NULL;
 static uint8_t s_mecanum_executing = 0;
 static lv_timer_t *s_mecanum_timer = NULL;
 
@@ -376,6 +392,7 @@ static void lvgl_app_nes_player_start(void);
 static int8_t lvgl_app_nes_player_process(void);
 static void lvgl_app_show_mpu6500_data(void);
 static void lvgl_app_show_ws2812_control(void);
+static void lvgl_app_show_foc_control(void);
 static void lvgl_app_show_diagnostics(void);
 static void lvgl_app_diagnostics_refresh(void);
 static void lvgl_app_show_camera_test(void);
@@ -1083,6 +1100,10 @@ static void lvgl_app_process_pending_screen(void)
     {
         lvgl_app_show_ws2812_control();
     }
+    else if (req == LVGL_APP_SCREEN_REQ_FOC)
+    {
+        lvgl_app_show_foc_control();
+    }
     else if (req == LVGL_APP_SCREEN_REQ_DIAGNOSTICS)
     {
         lvgl_app_show_diagnostics();
@@ -1153,6 +1174,7 @@ void LVGL_App_CommandStopMotors(void)
     Mecanum_GyroDisable();
     Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
     DCMotor_OL_RequestStopAll();
+    (void)FOC_Link_SendStop();
     s_ctrl_last_actual_refresh_tick = 0U;
 }
 
@@ -1163,33 +1185,77 @@ static void lvgl_app_control_refresh_rows(void)
     lv_obj_t *row_label;
     lv_obj_t *row_btn;
     uint8_t mecanum_active = 0U;
+    FOC_LinkTelemetry foc_telemetry;
+    uint8_t foc_alive = 0U;
+    float foc_turn_position = 0.0f;
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
     {
         if (s_cmd_ctrl_label != NULL)
         {
             char big_buf[256];
+            FOC_LinkTelemetry foc_telemetry;
+            uint8_t foc_alive;
             s_command_gyro_enabled = Mecanum_IsGyroModeEnabled();
+            FOC_Link_GetTelemetry(&foc_telemetry);
+            foc_alive = FOC_Link_IsTelemetryAlive(250U);
             int gyro_dps = (int)s_command_gyro_signed_speed * 2;
             snprintf(big_buf, sizeof(big_buf),
                      "M1 Set: %+4d, Act: %+5ld\n"
                      "M2 Set: %+4d, Act: %+5ld\n"
                      "M3 Set: %+4d, Act: %+5ld\n"
                      "M4 Set: %+4d, Act: %+5ld\n"
-                     "Sv Set: %3d, %3d\n"
+                     "FOC:%s V:%+6.1f Iq:%+5.2f\n"
                      "Gyro: %s  Spin:%+4d%% %+4ddps\n"
                      "Joy: L(%+3d,%+3d) R(%+3d,%+3d)",
                      s_command_motor_speed_setpoint[0], s_motor_speed_display[0],
                      s_command_motor_speed_setpoint[1], s_motor_speed_display[1],
                      s_command_motor_speed_setpoint[2], s_motor_speed_display[2],
                      s_command_motor_speed_setpoint[3], s_motor_speed_display[3],
-                     s_servo_angle_preset[0], s_servo_angle_preset[1],
+                     (foc_alive != 0U) ? "UP  " : "DOWN",
+                     (double)foc_telemetry.channel[1],
+                     (double)foc_telemetry.channel[2],
                      (s_command_gyro_enabled != 0U) ? "ON " : "OFF",
                      (int)s_command_gyro_signed_speed, gyro_dps,
                      s_joy_lx, s_joy_ly, s_joy_rx, s_joy_ry);
             (void)UI_LabelSetTextIfChanged(s_cmd_ctrl_label, big_buf);
         }
         return;
+    }
+
+    if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+    {
+        char status[64];
+        const char *loop_name = (s_foc_active_loop == 1U) ? "SPEED" :
+                                ((s_foc_active_loop == 2U) ? "POSITION" : "IDLE");
+
+        FOC_Link_GetTelemetry(&foc_telemetry);
+        foc_alive = FOC_Link_IsTelemetryAlive(250U);
+        if (foc_alive != 0U)
+        {
+            foc_turn_position = fmodf(foc_telemetry.channel[13],
+                                      6.28318530718f);
+            if (foc_turn_position < 0.0f)
+            {
+                foc_turn_position += 6.28318530718f;
+            }
+            (void)snprintf(status, sizeof(status),
+                           "C2804 CL:%s | UART4 UP\nENC:%s ALIGN:%s",
+                           loop_name,
+                           (foc_telemetry.channel[8] > 0.5f) ? "OK" : "ERR",
+                           (foc_telemetry.channel[15] > 0.5f) ? "OK" : "WAIT");
+        }
+        else
+        {
+            (void)snprintf(status, sizeof(status),
+                           "C2804 CL:%s | UART4 DOWN\nENC:-- ALIGN:--",
+                           loop_name);
+        }
+        if ((s_foc_status_label != NULL) &&
+            (lv_obj_is_valid(s_foc_status_label) != false))
+        {
+            (void)UI_LabelSetTextIfChanged(s_foc_status_label, status);
+        }
     }
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
@@ -1203,6 +1269,8 @@ static void lvgl_app_control_refresh_rows(void)
         loop_count = 7U;
     } else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE) {
         loop_count = LVGL_APP_SERVO_COUNT;
+    } else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC) {
+        loop_count = LVGL_APP_FOC_ROW_COUNT;
     }
     
     for (i = 0U; i < loop_count; ++i)
@@ -1252,6 +1320,14 @@ static void lvgl_app_control_refresh_rows(void)
         {
             visual_state = UI_VISUAL_RUNNING;
         }
+        else if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC) &&
+                 ((s_foc_active_loop == (uint8_t)(i + 1U)) ||
+                  ((i == 0U) && (foc_alive != 0U) &&
+                   ((foc_telemetry.channel[1] > 0.5f) ||
+                    (foc_telemetry.channel[1] < -0.5f)))))
+        {
+            visual_state = UI_VISUAL_RUNNING;
+        }
 
         if ((row_btn != NULL) &&
             (s_ctrl_row_visual_state[i] != (uint8_t)visual_state))
@@ -1264,6 +1340,18 @@ static void lvgl_app_control_refresh_rows(void)
         if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED)
         {
             signed_bar_value = s_motor_speed_preset[i];
+        }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+        {
+            if (i == 0U)
+            {
+                signed_bar_value = s_foc_speed_setpoint;
+            }
+            else
+            {
+                signed_bar_value = s_foc_position_setpoint_x10;
+                bar_max = LVGL_APP_FOC_POSITION_MAX_X10;
+            }
         }
         else if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) && (i < 6U))
         {
@@ -1330,6 +1418,38 @@ static void lvgl_app_control_refresh_rows(void)
                 (unsigned int)(i + 1U),
                 (int)s_servo_angle_preset[i]
             );
+        }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+        {
+            if (i == 0U)
+            {
+                if (foc_alive != 0U)
+                {
+                    (void)snprintf(line, sizeof(line),
+                                   "Speed Set:%+4d Act:%+6.1f rad/s",
+                                   (int)s_foc_speed_setpoint,
+                                   (double)foc_telemetry.channel[1]);
+                }
+                else
+                {
+                    (void)snprintf(line, sizeof(line),
+                                   "Speed Set:%+4d Act: -- rad/s",
+                                   (int)s_foc_speed_setpoint);
+                }
+            }
+            else if (foc_alive != 0U)
+            {
+                (void)snprintf(line, sizeof(line),
+                               "Turn Pos Set:%3.1f Act:%3.1f rad",
+                               (double)s_foc_position_setpoint_x10 / 10.0,
+                               (double)foc_turn_position);
+            }
+            else
+            {
+                (void)snprintf(line, sizeof(line),
+                               "Turn Pos Set:%3.1f Act: -- rad",
+                               (double)s_foc_position_setpoint_x10 / 10.0);
+            }
         }
         else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
         {
@@ -1453,6 +1573,17 @@ static void lvgl_app_control_confirm_selected(void)
         {
             lvgl_app_set_status("S%u: Left/Right adjust angle, OK send, KEY2 exit edit", (unsigned int)(s_ctrl_selected_row + 1U));
         }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+        {
+            if (s_ctrl_selected_row == 0U)
+            {
+                lvgl_app_set_status("Speed: Left/Right step 10 rad/s, OK sends");
+            }
+            else
+            {
+                lvgl_app_set_status("Turn position: Left/Right step 0.1 rad, OK sends");
+            }
+        }
     }
     else
     {
@@ -1477,6 +1608,68 @@ static void lvgl_app_control_confirm_selected(void)
             );
             lvgl_app_show_toast(UI_NOTICE_SUCCESS, "S%u angle command sent",
                                 (unsigned int)(s_ctrl_selected_row + 1U));
+        }
+        else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+        {
+            int8_t result;
+            FOC_LinkTelemetry telemetry;
+
+            if (s_last_safety_faults != SAFETY_FAULT_NONE)
+            {
+                (void)FOC_Link_SendStop();
+                s_foc_active_loop = 0U;
+                s_foc_speed_setpoint = 0;
+                lvgl_app_set_status("FOC command blocked by safety fault");
+                lvgl_app_show_toast(UI_NOTICE_ERROR,
+                                    "Clear safety fault before FOC control");
+                lvgl_app_control_refresh_rows();
+                return;
+            }
+
+            FOC_Link_GetTelemetry(&telemetry);
+            if ((FOC_Link_IsTelemetryAlive(250U) == 0U) ||
+                (telemetry.channel[8] <= 0.5f) ||
+                (telemetry.channel[15] <= 0.5f))
+            {
+                lvgl_app_set_status("FOC closed loop not ready: check UART/ENC/ALIGN");
+                lvgl_app_show_toast(UI_NOTICE_WARNING,
+                                    "Wait for UART4, encoder and alignment");
+                lvgl_app_control_refresh_rows();
+                return;
+            }
+
+            if (s_ctrl_selected_row == 0U)
+            {
+                result = FOC_Link_SendSpeed((float)s_foc_speed_setpoint);
+                if (result == FOC_LINK_OK)
+                {
+                    s_foc_active_loop = 1U;
+                    lvgl_app_set_status("FOC speed sent: %+d rad/s",
+                                        (int)s_foc_speed_setpoint);
+                    lvgl_app_show_toast(UI_NOTICE_SUCCESS,
+                                        "FOC speed command queued");
+                }
+            }
+            else
+            {
+                result = FOC_Link_SendAngle(
+                    (float)s_foc_position_setpoint_x10 / 10.0f);
+                if (result == FOC_LINK_OK)
+                {
+                    s_foc_active_loop = 2U;
+                    lvgl_app_set_status("FOC turn position sent: %.1f rad",
+                                        (double)s_foc_position_setpoint_x10 / 10.0);
+                    lvgl_app_show_toast(UI_NOTICE_SUCCESS,
+                                        "FOC position command queued");
+                }
+            }
+
+            if (result != FOC_LINK_OK)
+            {
+                lvgl_app_set_status("FOC command failed (%d)", (int)result);
+                lvgl_app_show_toast(UI_NOTICE_ERROR,
+                                    "FOC UART4 queue failed (%d)", (int)result);
+            }
         }
     }
 
@@ -1513,6 +1706,10 @@ static void lvgl_app_control_exit_edit_mode(void)
     {
         lvgl_app_set_status("Exit servo edit, use Up/Down to change servo, OK to edit");
     }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+    {
+        lvgl_app_set_status("Up/Down selects loop, OK edits, Left returns");
+    }
 
     lvgl_app_control_refresh_rows();
 }
@@ -1529,14 +1726,23 @@ static void lvgl_app_control_back_to_motor_menu(void)
     {
         lvgl_app_motor_speed_force_clear_all();
     }
-    
+
     uint8_t previous_page = s_ctrl_page;
+
+    if (previous_page == LVGL_APP_CTRL_PAGE_FOC)
+    {
+        (void)FOC_Link_SendStop();
+        s_foc_active_loop = 0U;
+        s_foc_speed_setpoint = 0;
+        s_foc_status_label = NULL;
+    }
 
     lvgl_app_control_clear_row_refs();
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     s_ctrl_editing = 0U;
 
-    if (previous_page == LVGL_APP_CTRL_PAGE_MECANUM)
+    if ((previous_page == LVGL_APP_CTRL_PAGE_MECANUM) ||
+        (previous_page == LVGL_APP_CTRL_PAGE_FOC))
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
     }
@@ -1582,6 +1788,25 @@ static void lvgl_app_control_adjust_selected(int8_t direction)
         }
 
         s_servo_angle_preset[s_ctrl_selected_row] = value;
+    }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+    {
+        if (s_ctrl_selected_row == 0U)
+        {
+            value = (int16_t)(s_foc_speed_setpoint +
+                              (int16_t)(direction * LVGL_APP_FOC_SPEED_STEP));
+            if (value < LVGL_APP_FOC_SPEED_MIN) value = LVGL_APP_FOC_SPEED_MIN;
+            if (value > LVGL_APP_FOC_SPEED_MAX) value = LVGL_APP_FOC_SPEED_MAX;
+            s_foc_speed_setpoint = value;
+        }
+        else
+        {
+            value = (int16_t)(s_foc_position_setpoint_x10 +
+                              (int16_t)(direction * LVGL_APP_FOC_POSITION_STEP_X10));
+            if (value < LVGL_APP_FOC_POSITION_MIN_X10) value = LVGL_APP_FOC_POSITION_MIN_X10;
+            if (value > LVGL_APP_FOC_POSITION_MAX_X10) value = LVGL_APP_FOC_POSITION_MAX_X10;
+            s_foc_position_setpoint_x10 = value;
+        }
     }
     else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
     {
@@ -1665,7 +1890,11 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
 
     code = lv_event_get_code(e);
     row = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
-    uint8_t max_rows = (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) ? 7U : (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE ? LVGL_APP_SERVO_COUNT : LVGL_APP_MOTOR_COUNT);
+    uint8_t max_rows = (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) ? 7U :
+                       ((s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE) ?
+                        LVGL_APP_SERVO_COUNT :
+                        ((s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC) ?
+                         LVGL_APP_FOC_ROW_COUNT : LVGL_APP_MOTOR_COUNT));
     if (row >= max_rows)
     {
         row = s_ctrl_selected_row;
@@ -1690,6 +1919,12 @@ static void lvgl_app_control_event_cb(lv_event_t *e)
             else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_SERVO_ANGLE)
             {
                 lvgl_app_set_status("Servo S%u selected, OK to edit", (unsigned int)(s_ctrl_selected_row + 1U));
+            }
+            else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+            {
+                lvgl_app_set_status((s_ctrl_selected_row == 0U) ?
+                                    "FOC speed loop selected, OK to edit" :
+                                    "FOC position loop selected, OK to edit");
             }
         }
         return;
@@ -1824,6 +2059,101 @@ static void lvgl_app_show_motor_speed_control(void)
     s_ctrl_last_actual_refresh_tick = HAL_GetTick();
     lvgl_app_control_refresh_rows();
     lvgl_app_set_status("Up/Down select | OK edit/send | KEY2 cancel | Left back");
+    lvgl_app_page_finish();
+}
+
+static void lvgl_app_show_foc_control(void)
+{
+    lv_obj_t *status_card;
+    lv_obj_t *row_btn;
+    int8_t stop_result;
+    int8_t motor_result;
+    uint8_t i;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_FOC;
+    s_ctrl_selected_row = 0U;
+    s_ctrl_editing = 0U;
+    s_ctrl_last_confirm_tick = 0U;
+    s_ctrl_last_actual_refresh_tick = HAL_GetTick();
+    s_foc_speed_setpoint = 0;
+    s_foc_active_loop = 0U;
+    s_foc_status_label = NULL;
+    lvgl_app_control_clear_row_refs();
+
+    /* The FOC page only exposes the encoder-based C2804 closed loops.
+     * Stop stale motion first, then select Motor 0; Motor:0 also clears the
+     * slave's sensorless/open-loop state before accepting Speed/Angle. */
+    stop_result = FOC_Link_SendStop();
+    motor_result = FOC_Link_SendMotor(0U);
+
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_FOC, "FOC Control");
+
+    status_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(status_card, 220, 38);
+    lv_obj_align(status_card, LV_ALIGN_TOP_MID, 0, 2);
+    UI_Theme_ApplyDataCard(status_card);
+    lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_foc_status_label = lv_label_create(status_card);
+    lv_obj_set_style_text_font(s_foc_status_label, &lv_font_montserrat_12,
+                               LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_foc_status_label, LV_TEXT_ALIGN_CENTER,
+                                LV_PART_MAIN);
+    lv_obj_center(s_foc_status_label);
+
+    for (i = 0U; i < LVGL_APP_FOC_ROW_COUNT; ++i)
+    {
+        row_btn = lv_btn_create(s_page_content);
+        s_ctrl_row_btns[i] = row_btn;
+        lv_obj_set_size(row_btn, 220, 52);
+        lv_obj_align(row_btn, LV_ALIGN_TOP_MID, 0,
+                     45 + (lv_coord_t)i * 58);
+        UI_Theme_ApplyDataCard(row_btn);
+        lv_obj_clear_flag(row_btn, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb,
+                            LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb,
+                            LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row_btn, lvgl_app_control_event_cb,
+                            LV_EVENT_KEY, (void *)(uintptr_t)i);
+
+        s_ctrl_row_labels[i] = lv_label_create(row_btn);
+        lv_obj_set_style_text_font(s_ctrl_row_labels[i],
+                                   &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_align(s_ctrl_row_labels[i], LV_ALIGN_TOP_LEFT, 7, 7);
+
+        s_ctrl_row_bars[i] = lv_bar_create(row_btn);
+        lv_bar_set_range(s_ctrl_row_bars[i], 0, 100);
+        lv_obj_set_size(s_ctrl_row_bars[i], 202, 6);
+        lv_obj_align(s_ctrl_row_bars[i], LV_ALIGN_BOTTOM_MID, 0, -6);
+        UI_Theme_ApplyValueBar(s_ctrl_row_bars[i]);
+        lv_obj_clear_flag(s_ctrl_row_bars[i],
+                          LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+        lvgl_app_group_add_obj(row_btn);
+        UI_Anim_StaggerIn(row_btn, (uint8_t)(i + 1U));
+    }
+
+    if (s_ctrl_row_btns[0] != NULL)
+    {
+        lv_group_focus_obj(s_ctrl_row_btns[0]);
+    }
+    lv_group_set_editing(s_group, false);
+
+    lvgl_app_control_refresh_rows();
+    if ((stop_result == FOC_LINK_OK) && (motor_result == FOC_LINK_OK))
+    {
+        lvgl_app_set_status("Closed-loop C2804 ready | OK edits | Left returns");
+    }
+    else
+    {
+        lvgl_app_set_status("FOC init queue failed: stop %d motor %d",
+                            (int)stop_result, (int)motor_result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "FOC UART4 init queue failed");
+    }
+    UI_Anim_StaggerIn(status_card, 0U);
     lvgl_app_page_finish();
 }
 
@@ -3164,6 +3494,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_WS2812);
     }
+    else if (id == LVGL_APP_MENU_ID_FOC)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_FOC);
+    }
     else if (id == LVGL_APP_MENU_ID_DIAGNOSTICS)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_DIAGNOSTICS);
@@ -3893,16 +4227,23 @@ static void lvgl_app_show_main_menu(void)
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
     lvgl_app_group_add_obj(btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_EYE_OPEN, "7 UI Diagnostics");
+    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "7 FOC Control");
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_FOC);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_FOC);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 6U);
+
+    btn = lv_list_add_btn(list, LV_SYMBOL_EYE_OPEN, "8 UI Diagnostics");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
     lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 7U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, "8 Camera Test");
+    btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, "9 Camera Test");
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_CAMERA);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_CAMERA);
     lvgl_app_group_add_obj(btn);
-    UI_Anim_StaggerIn(btn, 7U);
+    UI_Anim_StaggerIn(btn, 8U);
 
     lv_group_focus_obj(first_btn);
 
@@ -3936,6 +4277,81 @@ static void lvgl_app_cmd_send_text(uint8_t channel, const char *text)
     }
 }
 
+static void lvgl_app_cmd_send_binary(uint8_t channel,
+                                     const uint8_t *data, uint16_t length)
+{
+    if ((data == NULL) || (length == 0U))
+    {
+        return;
+    }
+    if (channel == 0U)
+    {
+        (void)CommService_UartSend(data, length);
+    }
+    else
+    {
+        (void)CDC_Transmit_FS((uint8_t *)data, length);
+    }
+}
+
+static uint8_t lvgl_app_cmd_parse_foc_text(uint8_t channel, const char *line)
+{
+    float value_a = 0.0f;
+    unsigned int motor_id = 0U;
+    char trailing = '\0';
+    char response[40];
+    int8_t result = FOC_LINK_ERR_ARGUMENT;
+    const char *operation = "ERROR";
+
+    if ((line == NULL) || (strncmp(line, "FOC ", 4U) != 0))
+    {
+        return 0U;
+    }
+
+    if (sscanf(line, "FOC SPEED %f %c", &value_a, &trailing) == 1)
+    {
+        operation = "SPEED";
+        result = FOC_Link_SendSpeed(value_a);
+    }
+    else if (sscanf(line, "FOC ANGLE %f %c", &value_a, &trailing) == 1)
+    {
+        operation = "ANGLE";
+        result = FOC_Link_SendAngle(value_a);
+    }
+    else if (sscanf(line, "FOC TORQUE %f %c", &value_a, &trailing) == 1)
+    {
+        operation = "TORQUE";
+        result = FOC_Link_SendTorque(value_a);
+    }
+    else if ((sscanf(line, "FOC MOTOR %u %c", &motor_id, &trailing) == 1) &&
+             (motor_id <= 1U))
+    {
+        operation = "MOTOR";
+        result = FOC_Link_SendMotor((uint8_t)motor_id);
+    }
+    else if (strcmp(line, "FOC SENSORLESS") == 0)
+    {
+        operation = "SENSORLESS";
+        result = FOC_Link_SendSensorless();
+    }
+    else if (strcmp(line, "FOC LOCK") == 0)
+    {
+        operation = "LOCK";
+        result = FOC_Link_SendLock();
+    }
+    else if (strcmp(line, "FOC STOP") == 0)
+    {
+        operation = "STOP";
+        result = FOC_Link_SendStop();
+    }
+
+    (void)snprintf(response, sizeof(response), "FOC %s %s (%d)\r\n",
+                   operation, (result == FOC_LINK_OK) ? "QUEUED" : "FAILED",
+                   (int)result);
+    lvgl_app_cmd_send_text(channel, response);
+    return 1U;
+}
+
 static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
 {
     char command[8] = {0};
@@ -3955,6 +4371,11 @@ static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
     for (i = 0U; line[i] != '\0'; ++i)
     {
         line[i] = (char)toupper((unsigned char)line[i]);
+    }
+
+    if (lvgl_app_cmd_parse_foc_text(channel, line) != 0U)
+    {
+        return;
     }
 
     fields = sscanf(line, "%7s %7s %7s %d %7s",
@@ -4043,6 +4464,96 @@ static void lvgl_app_cmd_text_rx_byte(uint8_t channel, uint8_t byte)
     }
 }
 
+static float lvgl_app_cmd_read_float_le(const uint8_t *bytes)
+{
+    float value = 0.0f;
+    if (bytes != NULL)
+    {
+        memcpy(&value, bytes, sizeof(value));
+    }
+    return value;
+}
+
+static int8_t lvgl_app_cmd_execute_foc(const uint8_t *frame, uint8_t len)
+{
+    uint8_t operation;
+
+    if ((frame == NULL) || (len < 7U))
+    {
+        return FOC_LINK_ERR_ARGUMENT;
+    }
+    operation = frame[5];
+    switch (operation)
+    {
+        case FOC_LINK_OP_SPEED:
+            return (len == 11U) ?
+                FOC_Link_SendSpeed(lvgl_app_cmd_read_float_le(&frame[6])) :
+                FOC_LINK_ERR_ARGUMENT;
+        case FOC_LINK_OP_ANGLE:
+            return (len == 11U) ?
+                FOC_Link_SendAngle(lvgl_app_cmd_read_float_le(&frame[6])) :
+                FOC_LINK_ERR_ARGUMENT;
+        case FOC_LINK_OP_TORQUE:
+            return (len == 11U) ?
+                FOC_Link_SendTorque(lvgl_app_cmd_read_float_le(&frame[6])) :
+                FOC_LINK_ERR_ARGUMENT;
+        case FOC_LINK_OP_MOTOR:
+            return (len == 8U) ? FOC_Link_SendMotor(frame[6]) :
+                                 FOC_LINK_ERR_ARGUMENT;
+        case FOC_LINK_OP_SENSORLESS:
+            return (len == 7U) ? FOC_Link_SendSensorless() :
+                                 FOC_LINK_ERR_ARGUMENT;
+        case FOC_LINK_OP_LOCK:
+            return (len == 7U) ? FOC_Link_SendLock() :
+                                 FOC_LINK_ERR_ARGUMENT;
+        case FOC_LINK_OP_STOP:
+            return (len == 7U) ? FOC_Link_SendStop() :
+                                 FOC_LINK_ERR_ARGUMENT;
+        default:
+            return FOC_LINK_ERR_ARGUMENT;
+    }
+}
+
+static void lvgl_app_cmd_send_foc_ack(uint8_t channel, uint8_t operation,
+                                      int8_t result)
+{
+    uint8_t response[8] = {
+        0x77U, 0x68U, 0x08U, FOC_LINK_HOST_DEVICE_ID,
+        FOC_LINK_HOST_CMD_WRITE, operation, (uint8_t)result, 0x0AU
+    };
+    lvgl_app_cmd_send_binary(channel, response, sizeof(response));
+}
+
+static void lvgl_app_cmd_send_foc_status(uint8_t channel)
+{
+    FOC_LinkTelemetry telemetry;
+    uint8_t response[32] = {0};
+    uint8_t flags = 0U;
+
+    FOC_Link_GetTelemetry(&telemetry);
+    if (telemetry.valid != 0U) flags |= 0x01U;
+    if (FOC_Link_IsTelemetryAlive(250U) != 0U) flags |= 0x02U;
+    if (telemetry.rx_overflow_count != 0U) flags |= 0x04U;
+    if (telemetry.rx_error_count != 0U) flags |= 0x08U;
+    if (telemetry.tx_drop_count != 0U) flags |= 0x10U;
+
+    response[0] = 0x77U;
+    response[1] = 0x68U;
+    response[2] = (uint8_t)sizeof(response);
+    response[3] = FOC_LINK_HOST_DEVICE_ID;
+    response[4] = FOC_LINK_HOST_CMD_READ;
+    response[5] = flags;
+    memcpy(&response[6], &telemetry.channel[0], sizeof(float));
+    memcpy(&response[10], &telemetry.channel[1], sizeof(float));
+    memcpy(&response[14], &telemetry.channel[2], sizeof(float));
+    memcpy(&response[18], &telemetry.channel[3], sizeof(float));
+    memcpy(&response[22], &telemetry.channel[8], sizeof(float));
+    memcpy(&response[26], &telemetry.channel[9], sizeof(float));
+    response[30] = (uint8_t)telemetry.frame_count;
+    response[31] = 0x0AU;
+    lvgl_app_cmd_send_binary(channel, response, sizeof(response));
+}
+
 static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
 {
     uint8_t dev_id = frame[3];
@@ -4094,7 +4605,13 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
     
     if (cmd == 0x02) // Write
     {
-        if (dev_id == 0x01 && len == 0x0A) // Multi-motor 
+        if (dev_id == FOC_LINK_HOST_DEVICE_ID)
+        {
+            uint8_t operation = (len >= 7U) ? frame[5] : 0U;
+            int8_t result = lvgl_app_cmd_execute_foc(frame, len);
+            lvgl_app_cmd_send_foc_ack(channel, operation, result);
+        }
+        else if (dev_id == 0x01 && len == 0x0A) // Multi-motor
         {
             uint8_t i;
             for (i = 0; i < 4; i++) {
@@ -4181,7 +4698,13 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
     {
         uint8_t tx_buf[16];
         uint8_t tx_len = 0;
-        
+
+        if ((dev_id == FOC_LINK_HOST_DEVICE_ID) && (len == 0x06U))
+        {
+            lvgl_app_cmd_send_foc_status(channel);
+            return;
+        }
+
         lvgl_app_motor_speed_sync_actual();
         
         if (dev_id == 0x03) // Multi-encoder
@@ -4349,7 +4872,7 @@ static void lvgl_app_show_command_control(void)
     lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
 
     lbl = lv_label_create(status_card);
-    lv_label_set_text(lbl, "USB / USART COMMAND MODE");
+    lv_label_set_text(lbl, "USB/UART5 + UART4 FOC");
     lv_obj_set_style_text_color(lbl, lv_color_hex(0x173B67), LV_PART_MAIN);
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, LV_PART_MAIN);
     lv_obj_center(lbl);
@@ -4383,7 +4906,7 @@ static void lvgl_app_show_command_control(void)
     lv_group_add_obj(s_group, key_receiver);
     lv_group_focus_obj(key_receiver);
 
-    lvgl_app_set_status("USB/USART active - Left/KEY2 returns");
+    lvgl_app_set_status("Commands active; FOC bridge on UART4");
 
     lvgl_app_motor_speed_sync_actual();
     lvgl_app_motor_speed_reset_followers();
@@ -4533,6 +5056,16 @@ static void lvgl_app_process_global_stop_key(void)
         lvgl_app_set_status("EMERGENCY STOP!");
         lvgl_app_control_refresh_rows();
     }
+    else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC)
+    {
+        (void)FOC_Link_SendStop();
+        s_foc_active_loop = 0U;
+        s_foc_speed_setpoint = 0;
+        lvgl_app_control_exit_edit_mode();
+        lvgl_app_set_status("FOC EMERGENCY STOP!");
+        lvgl_app_show_toast(UI_NOTICE_WARNING, "FOC stopped by KEY2");
+        lvgl_app_control_refresh_rows();
+    }
 
     if (s_gif_playing != 0U)
     {
@@ -4634,6 +5167,13 @@ void LVGL_App_Process(void)
         UI_Feedback_SetFault(&s_feedback, safety_faults, s_status_text);
         if (safety_faults != SAFETY_FAULT_NONE)
         {
+            if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC) ||
+                (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND))
+            {
+                (void)FOC_Link_SendStop();
+                s_foc_active_loop = 0U;
+                s_foc_speed_setpoint = 0;
+            }
             lvgl_app_show_toast(UI_NOTICE_ERROR, "Safety stop active");
         }
         else
@@ -4645,7 +5185,8 @@ void LVGL_App_Process(void)
 
     if ((s_ctrl_page == LVGL_APP_CTRL_PAGE_MOTOR_SPEED) ||
         (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND) ||
-        (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM))
+        (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM) ||
+        (s_ctrl_page == LVGL_APP_CTRL_PAGE_FOC))
     {
         uint32_t now = HAL_GetTick();
         if ((now - s_ctrl_last_actual_refresh_tick) >= LVGL_APP_CTRL_REFRESH_MS)

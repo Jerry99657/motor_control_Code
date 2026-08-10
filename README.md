@@ -14,7 +14,9 @@
 - 媒体播放暂停/继续、前后跳帧、停止和返回目录。
 - WS2812 RGB 控制及上电状态提示。
 - USB CDC、UART5 文本/二进制控制协议和 ESP32-C3 虚拟摇杆。
-- VOFA+ 50 Hz JustFloat 实时上传电机转速和占空比。
+- UART4 FOC 主从桥接：把上游统一二进制帧转换为 FOC 从板的 ASCII 指令，并接收 100 Hz JustFloat 遥测。
+- 独立 FOC Control 页面：C2804 编码器闭环速度/位置控制、目标值与实时值显示。
+- VOFA+ 50 Hz、14 通道 JustFloat 实时上传四轮电机数据和 FOC 速度、位置反馈。
 
 ## 2. 代码结构
 
@@ -25,6 +27,7 @@ Drivers/User/Src/mecanum.c     麦轮逆解、距离轨迹、小陀螺航向补�
 Drivers/User/Src/dc_motor_ol.c 电机测速、速度环、位置环、PWM 输出
 Drivers/User/Src/imu.c         MPU6500 采样和姿态融合
 Drivers/User/Src/imu_service.c 平面航向快照、航向角速度和安装方向处理
+Drivers/User/Src/foc_link.c    UART4 FOC 指令队列、停止优先级和遥测解析
 Drivers/User/Src/media_control.c 媒体按键、暂停、跳帧和返回状态机
 Drivers/User/Src/mjpeg_player.c AVI/MJPEG 解码与播放调度
 Drivers/User/Src/nes_rom_cache.c NES ROM 的 SD→QSPI 缓存、快速命中和 CRC 校验
@@ -64,7 +67,7 @@ LVGL 当前使用以下逻辑按键：
 
 ## 4. 主页面和各功能页面
 
-主菜单共 8 项：
+主菜单共 9 项：
 
 1. `Motor Control`
 2. `Command Control`
@@ -72,8 +75,9 @@ LVGL 当前使用以下逻辑按键：
 4. `Mecanum Control`
 5. `MPU6500 Data`
 6. `WS2812 Control`
-7. `UI Diagnostics`
-8. `Camera Test`
+7. `FOC Control`
+8. `UI Diagnostics`
+9. `Camera Test`
 
 ### 4.1 Motor Control
 
@@ -86,12 +90,12 @@ LVGL 当前使用以下逻辑按键：
 
 ### 4.2 Command Control
 
-该页面是 USB/UART5 远程控制的安全门。**只有当前页面为 Command Control 时，USB/UART5 的电机、麦轮、舵机和小陀螺控制指令才会执行**；进入页面会先停止并清空上一轮指令，离开页面也会停止电机和小陀螺。
+该页面是 USB/UART5 远程控制的安全门。**只有当前页面为 Command Control 时，USB/UART5 的电机、麦轮、舵机、小陀螺和 UART4 FOC 控制指令才会执行**；进入页面会先停止并清空上一轮指令，离开页面也会停止本机电机、小陀螺和 FOC 从板。
 
 页面显示：
 
 - M1~M4：`Set` 设定速度和 `Act` 实际速度。
-- Servo：当前舵机设定值。
+- FOC：UART4 链路 UP/DOWN、从板实际速度和 Iq。
 - `Gyro: ON/OFF`、旋转方向、速度百分比和角速度（deg/s）。
 - 虚拟摇杆的 LX/LY/RX/RY 原始值。
 
@@ -143,11 +147,20 @@ V4 = Vx - Vy + W
 
 通过 RGB 三个滑块调节灯带颜色，并实时发送到 WS2812。上电初始化时短暂显示绿色提示，初始化完成后应自动熄灭；若持续亮起，优先检查初始化流程和 DMA 更新完成状态。
 
-### 4.7 UI Diagnostics
+### 4.7 FOC Control
+
+该页面只开放 FOC 板的 C2804 编码器闭环控制。进入页面会先发送高优先级 `Speed:0`，再发送 `Motor:0`，从而退出从板可能遗留的无感或开环状态并选择有感电机。页面包含两行：
+
+- `Speed`：速度环目标范围 `-100~100 rad/s`，Left/Right 步进 `10 rad/s`；同时显示 JustFloat CH1 实际速度。
+- `Turn Pos`：位置环目标为当前机械圈零点的相对位置，范围 `0.0~6.2 rad`，Left/Right 步进 `0.1 rad`；实际值由 JustFloat CH13 多圈机械角对 `2π` 取模得到。
+
+Up/Down 选择控制环，OK 进入编辑，再按 OK 将目标加入 UART4 队列。顶部显示当前活动环、UART4 UP/DOWN、编码器健康状态和对齐状态。只有 UART4 在线、编码器健康且对齐完成后才能发送运动目标。KEY2、安全故障、Left/KEY3 退出页面都会发送高优先级 FOC STOP；安全故障未解除时页面拒绝发送新的速度或位置目标。
+
+### 4.8 UI Diagnostics
 
 UI Diagnostics 分为 Overview、Display、Memory 三个视图，使用 Left/Right 切换，KEY2/KEY3/ESC 返回。页面只显示关键指标：LVGL FPS、刷新耗时、脏区刷新次数、媒体/显示状态和内存池使用情况，避免一次性显示过多信息影响诊断本身。
 
-### 4.8 Camera Test
+### 4.9 Camera Test
 
 进入页面后按需唤醒 OV5640、校验传感器 ID，并自动采集一帧 `320×240 JPEG`。JPEG 使用 STM32H7 硬件 JPEG 外设解码为 RGB565，再缩放为 `200×150` 显示在 LVGL 预览区；页面底部同时显示 JPEG 大小、采集耗时和解码耗时。
 
@@ -228,6 +241,10 @@ STOP                  停止全部电机
 GYRO ON CW 60         顺时针 60%
 GYRO ON CCW 40        逆时针 40%
 GYRO OFF              关闭小陀螺
+FOC MOTOR 0           选择 C2804 电机
+FOC SPEED 10          设置 FOC 速度目标
+FOC TORQUE 0.4        设置 FOC 转矩/电流目标
+FOC STOP              FOC 停止
 ```
 
 `GYRO ...` 可由 USB CDC 或 UART5 接收，但只在 Command Control 页面生效。`M1:xx`/`STOP` 的快速调试入口位于 USB CDC 的 VOFA 接收路径。
@@ -249,6 +266,7 @@ GYRO OFF              关闭小陀螺
 | `0x03` | 麦轮混合控制 | mode、Vx、Vy、Wz；mode=0 速度，mode=1 距离 |
 | `0x05` | 舵机角度 | 舵机端口和角度 |
 | `0x0D` | 小陀螺 | Byte5 使能，Byte6 方向，Byte7 速度百分比 |
+| `0x0F` | UART4 FOC 桥接 | Byte5 操作号，后续为可选 float32 小端负载 |
 
 小陀螺 60% 顺时针示例：
 
@@ -264,9 +282,32 @@ vy = RX * 10
 vx = RY * 10
 ```
 
-读命令回包当前固定从 UART5 发送；即使请求来自 USB CDC，也需要监听 UART5 才能收到回复。
+读命令和写入应答从请求原通道返回：UART5 请求回 UART5，USB CDC 请求回 USB CDC。
 
-### 7.3 ESP32-C3 虚拟手柄
+### 7.3 UART4 FOC 控制板
+
+H743 使用 `PD1/UART4_TX` 连接 FOC 板 `PB7/USART1_RX`，使用 `PD0/UART4_RX` 连接 `PB6/USART1_TX`，并共地。两端均为 115200 8N1。上游继续使用 `77 68 ... 0A` 帧；H743 在内部转换为 FOC 固件现有的 `Speed:`、`Angle:`、`Torque:`、`Motor:`、`Sensorless` 和 `Lock` 换行命令。
+
+UART4 使用中断收发和 8 项发送队列，收到停止请求时会丢弃尚未发出的旧目标，并在当前行发送完成后优先发送 `Speed:0`。FOC 板在同一串口输出的 16 路 JustFloat 数据由主循环解析，Command Control 页面显示链路、实际速度和 Iq。完整操作号、应答、状态回包和首次上板步骤见 [UART4 FOC 主从通信协议](docs/foc_uart4_master_protocol_zh.md)。
+
+### 7.4 USB CDC / VOFA+
+
+USB CDC 始终以 50 Hz 输出一个固定的 14 通道 JustFloat 帧，不随当前 LVGL 页面切换数据源。VOFA+ 应选择 `JustFloat`，并按 CH0~CH13 配置：
+
+| 通道 | 数据 | 单位/取值 |
+| ---: | --- | --- |
+| CH0~CH3 | 主板 M1~M4 实际转速 | rpm |
+| CH4~CH7 | 主板 M1~M4 PWM 占空比 | % |
+| CH8 | FOC 控制模式 | 0 停止、1 速度、2 位置、3 转矩 |
+| CH9 | 主机请求速度 | rad/s |
+| CH10 | FOC 实际速度 | rad/s |
+| CH11 | 主机请求的本圈位置 | rad，`0~2π` |
+| CH12 | FOC 当前本圈位置 | rad，归一化为 `[0, 2π)` |
+| CH13 | FOC 多圈绝对机械位置 | rad，可正可负 |
+
+CH8、CH9 和 CH11 由 UART4 驱动在命令成功进入发送队列时统一更新，因此通过 LVGL、USB CDC 或 UART5 下发的 FOC 命令都会反映到同一组曲线。目标/实际电流和链路诊断项目前已在代码中注释保留。帧长度固定为 `14 × float32 + 4 字节帧尾 = 60 字节`。
+
+### 7.5 ESP32-C3 虚拟手柄
 
 配套程序位于工程内的 `ESP32_connect_Controller`。浏览器右上角按钮可在麦轮遥控和 NES 虚拟手柄之间切换；切换时会主动释放上一模式的输入。
 
@@ -284,6 +325,7 @@ NES 页面提供方向键、Select、Start、B、A，并支持方向键与 A/B �
 ## 8. 安全策略
 
 - Command Control 是远程控制的页面级权限门，离开页面立即停止。
+- UART4 FOC STOP 会抢占待发送目标；未给 FOC 从板增加原生 Stop 前，不开放无法被 `Speed:0` 可靠退出的 OpenLoop 调试命令。
 - Mecanum Control 执行距离轨迹时，所有受限轴到位后统一清零。
 - TIM13 每 10 ms 执行安全控制；运动过程中 IMU 数据超过约 30 ms 未更新会触发 `SAFETY_FAULT_IMU_STALE` 并急停。
 - KEY2 是最高优先级的本地停止输入；媒体播放中先处理 KEY2，再处理暂停和跳帧。
@@ -298,7 +340,7 @@ cmake --preset Debug
 cmake --build --preset Debug
 ```
 
-烧录后检查：USB CDC 是否枚举、UART5 波特率和引脚是否正确、TIM13 是否稳定 10 ms、编码器方向是否正确、SD 卡是否能正常挂载。
+烧录后检查：USB CDC 是否枚举、UART5/UART4 波特率和引脚是否正确、TIM13 是否稳定 10 ms、编码器方向是否正确、SD 卡是否能正常挂载。
 
 ### ESP32-C3
 
@@ -318,12 +360,14 @@ pio run -t upload
 3. AVI 卡顿或退出：检查 SD DMA 缓冲区位置、Cache Clean/Invalidate、文件连续读取和 JPEG 帧长度。
 4. 手机摇杆延迟：观察 WebSocket 连接、浏览器页面是否持续产生旧帧积压；重新连接热点后再测试。
 5. 小陀螺方向不对：在 MPU6500 Data 页面确认 Z 轴角速度符号，再分别发送 CW/CCW 小速度命令。
+6. FOC 显示 DOWN：检查 UART4 与 USART1 是否交叉连接并共地，确认两端都是 115200 8N1，再检查 FOC 板是否持续输出 JustFloat 帧。
 
 ## 10. 已知限制
 
 - MPU6500 无磁力计，小陀螺的“世界坐标”是进入模式瞬间建立的相对坐标，不是绝对地理坐标；长时间运行会有航向漂移。
 - SD 卡、JPEG 解码和显示刷新仍受外部存储器时序、Cache 一致性和帧缓冲区大小影响。
-- USB/UART5 二进制控制命令必须遵守帧头、长度和尾字节格式；读回包默认走 UART5。
+- USB/UART5 二进制控制命令必须遵守帧头、长度和尾字节格式；应答和读回包返回原请求通道。
+- 当前 FOC 从板没有命令级 ACK，主板应答只代表命令已进入 UART4 队列，不能证明从板已经执行。
 - 媒体播放期间 UI 主循环工作量较大，建议使用合理分辨率、帧率和 JPEG 压缩质量。
 
 ## 11. 主要入口函数
@@ -337,6 +381,7 @@ Mecanum_MixedControl() / Mecanum_Tick10ms()
 Mecanum_GyroEnable() / Mecanum_GyroDisable()
 DCMotor_OL_Tick10ms()
 IMU_Service_Process()
+FOC_Link_Init() / FOC_Link_Process()
 MJPEG_Player_PlayFile()
 SD_StartAnim_PlayFile()
 VOFA_Task_Process()

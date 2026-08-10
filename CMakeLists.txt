@@ -104,3 +104,11 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
 
     # Add user defined libraries
 )
+
+# newlib-nano excludes floating-point printf/scanf conversion unless these
+# symbols are explicitly retained. FOC UART4 command formatting uses %g and
+# the USB/UART5 text command parser uses sscanf("%f").
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+    "-u_printf_float"
+    "-u_scanf_float"
+)

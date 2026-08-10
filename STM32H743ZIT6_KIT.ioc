@@ -327,6 +327,7 @@ NVIC.TIM16_IRQn=true\:15\:0\:true\:false\:true\:true\:true\:true
 NVIC.TIM6_DAC_IRQn=true\:3\:0\:true\:false\:true\:true\:true\:true
 NVIC.TIM7_IRQn=true\:4\:0\:true\:false\:true\:true\:true\:true
 NVIC.TIM8_UP_TIM13_IRQn=true\:1\:0\:true\:false\:true\:true\:true\:true
+NVIC.UART4_IRQn=true\:6\:0\:true\:false\:true\:true\:true\:true
 NVIC.UART5_IRQn=true\:5\:0\:true\:false\:true\:true\:true\:true
 NVIC.UsageFault_IRQn=true\:0\:0\:false\:false\:true\:false\:false\:false
 PA0.Signal=S_TIM5_CH1

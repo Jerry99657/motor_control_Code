@@ -39,12 +39,14 @@
 #include "imu_service.h"
 #include "safety_manager.h"
 #include "comm_service.h"
+#include "foc_link.h"
 #include "camera_service.h"
 #include "ws2812.h"
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
 #include "lvgl_app.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -52,6 +54,43 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
+
+typedef enum
+{
+  APP_VOFA_CH_MOTOR1_SPEED_RPM = 0,
+  APP_VOFA_CH_MOTOR2_SPEED_RPM,
+  APP_VOFA_CH_MOTOR3_SPEED_RPM,
+  APP_VOFA_CH_MOTOR4_SPEED_RPM,
+  APP_VOFA_CH_MOTOR1_DUTY_PERCENT,
+  APP_VOFA_CH_MOTOR2_DUTY_PERCENT,
+  APP_VOFA_CH_MOTOR3_DUTY_PERCENT,
+  APP_VOFA_CH_MOTOR4_DUTY_PERCENT,
+  APP_VOFA_CH_FOC_CONTROL_MODE,
+  APP_VOFA_CH_FOC_REQUESTED_SPEED,
+  APP_VOFA_CH_FOC_ACTUAL_SPEED,
+  APP_VOFA_CH_FOC_REQUESTED_TURN_POSITION,
+  APP_VOFA_CH_FOC_ACTUAL_TURN_POSITION,
+  APP_VOFA_CH_FOC_ABSOLUTE_POSITION,
+  /* Reserved for a later VOFA diagnostics stage:
+   * APP_VOFA_CH_FOC_TARGET_IQ,
+   * APP_VOFA_CH_FOC_ACTUAL_IQ,
+   * APP_VOFA_CH_FOC_ACTUAL_ID,
+   * APP_VOFA_CH_FOC_LINK_ALIVE,
+   * APP_VOFA_CH_FOC_ENCODER_HEALTHY,
+   * APP_VOFA_CH_FOC_ENCODER_ALIGNED,
+   */
+  APP_VOFA_CHANNEL_COUNT
+} AppVofaChannel;
+
+typedef struct
+{
+  float channel[APP_VOFA_CHANNEL_COUNT];
+  uint8_t tail[4];
+} AppVofaFrame;
+
+_Static_assert(sizeof(AppVofaFrame) ==
+               ((APP_VOFA_CHANNEL_COUNT * sizeof(float)) + 4U),
+               "VOFA JustFloat frame must not contain padding");
 
 /* USER CODE END PTD */
 
@@ -290,11 +329,16 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
     CommService_UartRxByteFromISR(g_uart5_rx_byte);
     (void)HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
   }
+  else if (huart->Instance == UART4)
+  {
+    FOC_Link_UartRxCompleteFromISR(huart);
+  }
 }
 
 void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 {
   CommService_UartTxCompleteFromISR(huart);
+  FOC_Link_UartTxCompleteFromISR(huart);
 }
 
 void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
@@ -302,6 +346,10 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
   if (huart->Instance == UART5)
   {
     (void)HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
+  }
+  else if (huart->Instance == UART4)
+  {
+    FOC_Link_UartErrorFromISR(huart);
   }
 }
 
@@ -361,22 +409,60 @@ static void VOFA_Task_Process(void)
     last_vofa_tick = now;
     if (g_cdc_welcome_sent != 0U)
     {
-      // Using VOFA+ JustFloat protocol
-      struct {
-        float speed[4];   // 4 motors speed
-        float duty[4];    // 4 motors pwm duty cycle
-        uint8_t tail[4];  // 0x00, 0x00, 0x80, 0x7f
-      } frame;
+      AppVofaFrame frame = {0};
+      FOC_LinkTelemetry foc_telemetry;
+      FOC_LinkCommandState foc_command;
+      float foc_absolute_position;
+      float foc_turn_position;
 
-      frame.speed[0] = (float)DCMotor_OL_GetSpeedRpm(1);
-      frame.speed[1] = (float)DCMotor_OL_GetSpeedRpm(2);
-      frame.speed[2] = (float)DCMotor_OL_GetSpeedRpm(3);
-      frame.speed[3] = (float)DCMotor_OL_GetSpeedRpm(4);
+      FOC_Link_GetTelemetry(&foc_telemetry);
+      FOC_Link_GetCommandState(&foc_command);
 
-      frame.duty[0] = (float)DCMotor_OL_GetDutyPercent(1);
-      frame.duty[1] = (float)DCMotor_OL_GetDutyPercent(2);
-      frame.duty[2] = (float)DCMotor_OL_GetDutyPercent(3);
-      frame.duty[3] = (float)DCMotor_OL_GetDutyPercent(4);
+      frame.channel[APP_VOFA_CH_MOTOR1_SPEED_RPM] =
+          (float)DCMotor_OL_GetSpeedRpm(1);
+      frame.channel[APP_VOFA_CH_MOTOR2_SPEED_RPM] =
+          (float)DCMotor_OL_GetSpeedRpm(2);
+      frame.channel[APP_VOFA_CH_MOTOR3_SPEED_RPM] =
+          (float)DCMotor_OL_GetSpeedRpm(3);
+      frame.channel[APP_VOFA_CH_MOTOR4_SPEED_RPM] =
+          (float)DCMotor_OL_GetSpeedRpm(4);
+
+      frame.channel[APP_VOFA_CH_MOTOR1_DUTY_PERCENT] =
+          (float)DCMotor_OL_GetDutyPercent(1);
+      frame.channel[APP_VOFA_CH_MOTOR2_DUTY_PERCENT] =
+          (float)DCMotor_OL_GetDutyPercent(2);
+      frame.channel[APP_VOFA_CH_MOTOR3_DUTY_PERCENT] =
+          (float)DCMotor_OL_GetDutyPercent(3);
+      frame.channel[APP_VOFA_CH_MOTOR4_DUTY_PERCENT] =
+          (float)DCMotor_OL_GetDutyPercent(4);
+
+      frame.channel[APP_VOFA_CH_FOC_CONTROL_MODE] =
+          (float)foc_command.mode;
+      frame.channel[APP_VOFA_CH_FOC_REQUESTED_SPEED] =
+          foc_command.speed_target;
+      frame.channel[APP_VOFA_CH_FOC_REQUESTED_TURN_POSITION] =
+          foc_command.position_target;
+
+      if (foc_telemetry.valid != 0U)
+      {
+        foc_absolute_position = foc_telemetry.channel[13];
+        foc_turn_position = fmodf(foc_absolute_position, 6.28318530718f);
+        if (foc_turn_position < 0.0f)
+        {
+          foc_turn_position += 6.28318530718f;
+        }
+
+        frame.channel[APP_VOFA_CH_FOC_ACTUAL_SPEED] =
+            foc_telemetry.channel[1];
+        frame.channel[APP_VOFA_CH_FOC_ACTUAL_TURN_POSITION] =
+            foc_turn_position;
+        frame.channel[APP_VOFA_CH_FOC_ABSOLUTE_POSITION] =
+            foc_absolute_position;
+        /* Additional FOC diagnostics are intentionally disabled for now:
+         * target Iq, actual Iq, actual Id, link alive, encoder healthy,
+         * and encoder aligned.
+         */
+      }
 
       frame.tail[0] = 0x00;
       frame.tail[1] = 0x00;
@@ -1082,6 +1168,7 @@ int main(void)
   Camera_Service_BootHold();
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   CommService_Init();
+  FOC_Link_Init();
   HAL_UART_Receive_IT(&huart5, &g_uart5_rx_byte, 1);
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
@@ -1188,6 +1275,7 @@ int main(void)
     uint32_t now = HAL_GetTick();
 
     CommService_Process();
+    FOC_Link_Process();
     IMU_Service_Process();
     Camera_Service_Process();
     ADC_Service_Process();
