@@ -4060,6 +4060,15 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
         }
         return;
     }
+    if ((channel == 0U) && (dev_id == 0x0EU) && (cmd == 0x03U) &&
+        (len == 0x07U))
+    {
+        if (NES_Runtime_IsActive() != 0U)
+        {
+            NES_Runtime_RequestRemoteReset();
+        }
+        return;
+    }
 
     if (LVGL_App_IsCommandControlActive() == 0U)
     {

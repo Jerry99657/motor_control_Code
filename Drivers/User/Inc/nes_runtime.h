@@ -51,6 +51,7 @@ void NES_Runtime_GetDiagnostics(NES_RuntimeDiagnostics *diagnostics);
  * bit3 Start, bit4 Up, bit5 Down, bit6 Left, bit7 Right. */
 void NES_Runtime_SetRemoteButtons(uint8_t buttons);
 void NES_Runtime_ClearRemoteButtons(void);
+void NES_Runtime_RequestRemoteReset(void);
 
 #ifdef __cplusplus
 }

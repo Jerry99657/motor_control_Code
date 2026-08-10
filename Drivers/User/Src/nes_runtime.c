@@ -150,6 +150,7 @@ static uint8_t s_save_io_buffer[NES_SAVE_IO_CHUNK]
   __attribute__((section(".ram_d2"), aligned(32)));
 static volatile uint8_t s_nes_remote_buttons = 0U;
 static volatile uint8_t s_nes_remote_valid = 0U;
+static volatile uint8_t s_nes_remote_reset_pending = 0U;
 static volatile uint32_t s_nes_remote_tick = 0U;
 
 /* RGB565 palette retained from the supplied ye781205/ALIENTEK emulator
@@ -185,6 +186,15 @@ void NES_Runtime_ClearRemoteButtons(void)
   __DMB();
   s_nes_remote_buttons = 0U;
   s_nes_remote_tick = 0U;
+}
+
+void NES_Runtime_RequestRemoteReset(void)
+{
+  if (s_nes_active != 0U)
+  {
+    s_nes_remote_reset_pending = 1U;
+    __DMB();
+  }
 }
 
 static uint8_t nes_remote_buttons_sample(void)
@@ -1486,6 +1496,7 @@ int8_t NES_Runtime_Start(void)
     return NES_RUNTIME_RUNNING;
   }
   NES_Runtime_ClearRemoteButtons();
+  s_nes_remote_reset_pending = 0U;
   if (NES_RomCache_Map(&rom, &metadata) != NES_ROM_CACHE_OK)
   {
     return NES_RUNTIME_ERR_CACHE;
@@ -1616,6 +1627,12 @@ int8_t NES_Runtime_Process(void)
   }
 
   now = HAL_GetTick();
+  if (s_nes_remote_reset_pending != 0U)
+  {
+    s_nes_remote_reset_pending = 0U;
+    __DMB();
+    nes_soft_reset(&s_nes, now);
+  }
   nes_process_special_inputs(&s_nes, now);
   if ((int32_t)(now - s_nes.next_frame_tick) < 0)
   {
@@ -1657,6 +1674,7 @@ int8_t NES_Runtime_Stop(uint8_t persist_battery_save)
   int8_t save_result = NES_RUNTIME_SAVE_NONE;
 
   NES_Runtime_ClearRemoteButtons();
+  s_nes_remote_reset_pending = 0U;
   if (s_nes_active == 0U)
   {
     return NES_RUNTIME_SAVE_NONE;

@@ -45,6 +45,8 @@ uint8_t nesSequence = 0;
 uint32_t lastNesUpdateMs = 0;
 uint32_t lastNesSendMs = 0;
 bool nesCommandDirty = true;
+uint8_t nesResetSequence = 0;
+bool nesResetCommandPending = false;
 volatile bool apRunning = false;
 uint8_t selectedApChannel = 6;
 uint8_t apHealthFailures = 0;
@@ -61,6 +63,7 @@ const uint8_t HEADER_2 = 0x68;
 const uint8_t FRAME_END = 0x0A;
 const uint8_t WS_TYPE_MODE = 0x4D; // 'M'
 const uint8_t WS_TYPE_NES = 0x4E;  // 'N'
+const uint8_t WS_TYPE_NES_RESET = 0x52; // 'R'
 const uint8_t UART_DEV_NES = 0x0E;
 
 // HTML/JS Frontend - Highly visible, Captive Portal compatible
@@ -117,7 +120,13 @@ const char index_html[] PROGMEM = R"rawliteral(
     .dpad-btn.right { right:0; top:56px; }
     .dpad-center { position:absolute; left:56px; top:56px; width:62px; height:62px; border-radius:7px; background:radial-gradient(circle,#252525 0 18%,#151515 20% 100%); box-shadow:inset 2px 2px 4px rgba(255,255,255,.06); }
     .dpad-btn.pressed { transform:scale(.88); filter:brightness(1.6); }
-    .nes-center { align-self:end; padding-bottom:32px; text-align:center; }
+    .nes-center { align-self:end; padding-bottom:24px; display:flex; flex-direction:column; align-items:center; gap:18px; text-align:center; }
+    .reset-btn { position:relative; width:112px; height:34px; overflow:hidden; border:2px solid #6a1721; border-radius:9px; color:#701824; background:#d7cdb4; box-shadow:0 4px 0 #9b8f78,inset 0 1px 0 rgba(255,255,255,.55); font-size:10px; letter-spacing:1px; transition:transform .1s,box-shadow .1s,color .15s; }
+    .reset-btn::before { content:""; position:absolute; inset:0; background:linear-gradient(90deg,#b8323f,#781722); transform:scaleX(0); transform-origin:left; }
+    .reset-btn.holding { transform:translateY(3px); box-shadow:0 1px 0 #9b8f78; color:#fff1dd; }
+    .reset-btn.holding::before { transform:scaleX(1); transition:transform 1s linear; }
+    .reset-btn.sent { color:#fff1dd; background:#781722; transform:scale(.94); }
+    .reset-btn span { position:relative; z-index:1; }
     .system-buttons { display:flex; justify-content:center; gap:22px; padding:14px 18px; border-radius:28px; background:rgba(120,36,44,.22); box-shadow:inset 0 2px 6px rgba(79,25,31,.25); }
     .system-btn-wrap { display:flex; flex-direction:column; align-items:center; gap:7px; color:#6a1721; font-size:10px; font-weight:900; letter-spacing:1px; }
     .system-btn { width:57px; height:23px; border:3px solid #352b29; border-radius:999px; background:linear-gradient(#353535,#171717); box-shadow:0 4px 0 #160f0e,inset 0 1px 2px rgba(255,255,255,.18); transition:transform .08s,box-shadow .08s; }
@@ -144,13 +153,14 @@ const char index_html[] PROGMEM = R"rawliteral(
       .action-btn { width:58px; height:58px; }
       .system-buttons { gap:12px; padding:10px 12px; }
       .system-btn { width:46px; }
-      .nes-center { padding-bottom:18px; }
+      .nes-center { padding-bottom:10px; gap:10px; }
+      .reset-btn { width:96px; height:28px; }
       .nes-status { bottom:3px; }
     }
     @media (max-width:560px) and (orientation:portrait) {
       .nes-shell { width:98vw; height:72vh; min-height:390px; padding:14px; border-radius:30px; }
       .nes-face { grid-template-columns:1fr 1fr; grid-template-rows:1fr auto; padding:26px 12px 12px; }
-      .nes-center { grid-column:1 / 3; grid-row:2; padding-bottom:0; }
+      .nes-center { grid-column:1 / 3; grid-row:2; padding-bottom:0; gap:8px; }
       .dpad { transform:scale(.78); }
       .action-area { gap:10px; }
       .action-btn { width:58px; height:58px; }
@@ -195,6 +205,7 @@ const char index_html[] PROGMEM = R"rawliteral(
           <div class="dpad-center"></div>
         </div>
         <div class="nes-center">
+          <button id="nesReset" class="nes-btn reset-btn" type="button" aria-label="Hold to reset game"><span>HOLD RESET</span></button>
           <div class="system-buttons">
             <label class="system-btn-wrap">SELECT<button class="nes-btn system-btn" data-nes-bit="4" aria-label="Select"></button></label>
             <label class="system-btn-wrap">START<button class="nes-btn system-btn" data-nes-bit="8" aria-label="Start"></button></label>
@@ -222,6 +233,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     const nesPage = document.getElementById('nesPage');
     const modeSwitch = document.getElementById('modeSwitch');
     const nesStatus = document.getElementById('nesStatus');
+    const nesReset = document.getElementById('nesReset');
+    let nesResetTimer=null, nesResetPointer=null, nesResetSequence=0;
     const gyroToggle = document.getElementById('gyroToggle');
     const gyroSlider = document.getElementById('gyroSlider');
     const gyroValue = document.getElementById('gyroValue');
@@ -291,11 +304,64 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function releaseAllNes(send=true) {
+      cancelNesReset();
       nesPointers.clear();
       nesButtons = 0;
       document.querySelectorAll('[data-nes-bit]').forEach(btn => btn.classList.remove('pressed'));
       if(send) sendNesState(true);
       updateNesStatus();
+    }
+
+    function sendNesReset() {
+      if(controlMode !== MODE_NES || !socketReady()) return false;
+      if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return false;
+      socket.send(new Uint8Array([0x52, nesResetSequence++ & 0xFF]).buffer);
+      return true;
+    }
+
+    function cancelNesReset() {
+      if(nesResetTimer !== null) {
+        clearTimeout(nesResetTimer);
+        nesResetTimer=null;
+      }
+      nesResetPointer=null;
+      nesReset.classList.remove('holding','sent');
+      nesReset.querySelector('span').textContent='HOLD RESET';
+    }
+
+    function setupNesReset() {
+      nesReset.addEventListener('contextmenu', e => e.preventDefault());
+      nesReset.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        if(controlMode !== MODE_NES || nesResetPointer !== null) return;
+        nesResetPointer=e.pointerId;
+        nesReset.setPointerCapture(e.pointerId);
+        nesReset.classList.remove('sent');
+        // Restart the CSS fill animation even after consecutive resets.
+        nesReset.classList.remove('holding');
+        void nesReset.offsetWidth;
+        nesReset.classList.add('holding');
+        nesReset.querySelector('span').textContent='KEEP HOLDING';
+        nesResetTimer=setTimeout(() => {
+          nesResetTimer=null;
+          nesReset.classList.remove('holding');
+          nesReset.classList.add('sent');
+          if(sendNesReset()) {
+            nesReset.querySelector('span').textContent='RESET SENT';
+            if(navigator.vibrate) navigator.vibrate([25,35,25]);
+          } else {
+            nesReset.querySelector('span').textContent='LINK LOST';
+          }
+        },1000);
+      });
+      const release=e => {
+        if(nesResetPointer !== e.pointerId) return;
+        e.preventDefault();
+        cancelNesReset();
+      };
+      nesReset.addEventListener('pointerup',release);
+      nesReset.addEventListener('pointercancel',release);
+      nesReset.addEventListener('lostpointercapture',release);
     }
 
     function updateModeUI() {
@@ -500,6 +566,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         initJoy('joyL', true);
         initJoy('joyR', false);
         setupNesButtons();
+        setupNesReset();
         updateModeUI();
     }, 100);
 
@@ -646,6 +713,7 @@ void clearNesButtons(const char* reason) {
 }
 
 void setControlMode(ControlMode mode) {
+  nesResetCommandPending = false;
   if(mode == CONTROL_MODE_NES) {
     setJoystickValues(0, 0, 0, 0);
     joystickActive = false;
@@ -683,6 +751,16 @@ void sendNesCommand() {
   Serial1.write(txBuf, sizeof(txBuf));
   nesCommandDirty = false;
   lastNesSendMs = millis();
+}
+
+void sendNesResetCommand() {
+  const uint8_t txBuf[] = {
+    HEADER_1, HEADER_2, 0x07, UART_DEV_NES, 0x03,
+    nesResetSequence, FRAME_END
+  };
+
+  Serial1.write(txBuf, sizeof(txBuf));
+  nesResetCommandPending = false;
 }
 
 void stopJoystick(const char* reason) {
@@ -737,6 +815,12 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
          (payload[1] <= (uint8_t)CONTROL_MODE_NES)) {
         setControlMode((ControlMode)payload[1]);
         activeWebSocketClient = client;
+      } else if((length == 2U) && (payload[0] == WS_TYPE_NES_RESET)) {
+        if(controlMode == CONTROL_MODE_NES) {
+          nesResetSequence = payload[1];
+          nesResetCommandPending = true;
+          activeWebSocketClient = client;
+        }
       } else if((length == 3U) && (payload[0] == WS_TYPE_NES)) {
         if(controlMode == CONTROL_MODE_NES) {
           setNesButtons(payload[1], payload[2]);
@@ -1067,6 +1151,9 @@ void loop() {
      ((controlMode == CONTROL_MODE_NES) &&
       (now - lastNesSendMs >= NES_KEEPALIVE_MS))) {
     sendNesCommand();
+  }
+  if(nesResetCommandPending) {
+    sendNesResetCommand();
   }
 
   /* ON/OFF is event driven and latched by STM32. No periodic gyro heartbeat:
