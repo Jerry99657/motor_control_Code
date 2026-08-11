@@ -52,5 +52,7 @@ eulerian_angles_t imu_update_eulerian_angles(float gx, float gy, float gz,
                                              float ax, float ay, float az,
                                              float dt_seconds);
 void imu_data_calibration(short *gx, short *gy, short *gz, short *ax, short *ay, short *az);
+void imu_adapt_gyro_bias(short raw_gx, short raw_gy, short raw_gz,
+                         float gain);
 
 #endif

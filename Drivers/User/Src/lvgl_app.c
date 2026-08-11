@@ -8,6 +8,7 @@
 #include "ui_font.h"
 #include "ui_page.h"
 #include "ui_perf_diag.h"
+#include "ui_settings.h"
 #include "ui_theme.h"
 #include "dc_motor_ol.h"
 #include "mjpeg_player.h"
@@ -42,7 +43,7 @@ static lv_obj_t *s_adc_label = NULL;
 volatile uint8_t g_adc_update_flag = 0;
 volatile float g_adc_voltage = 0.0f;
 static lv_group_t *s_group = NULL;
-static char s_status_text[640] = "Up/Down move, Right enter, Left back, OK play";
+static char s_status_text[640] = "Up/Down | OK Enter | Left Back";
 static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 
 #define LVGL_APP_MAX_BROWSER_ENTRIES 48U
@@ -61,6 +62,7 @@ static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
 #define LVGL_APP_MENU_ID_FOC         7U
 #define LVGL_APP_MENU_ID_DIAGNOSTICS 8U
 #define LVGL_APP_MENU_ID_CAMERA      9U
+#define LVGL_APP_MENU_ID_DISPLAY     10U
 #define LVGL_APP_MOTOR_SUB_ID_BACK   0U
 #define LVGL_APP_MOTOR_SUB_ID_SPEED  1U
 #define LVGL_APP_MOTOR_SUB_ID_SERVO  2U
@@ -140,6 +142,7 @@ typedef enum
     LVGL_APP_SCREEN_REQ_FOC,
     LVGL_APP_SCREEN_REQ_DIAGNOSTICS,
     LVGL_APP_SCREEN_REQ_CAMERA,
+    LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS,
     LVGL_APP_SCREEN_REQ_GIF
 } lvgl_app_screen_req_t;
 
@@ -191,6 +194,7 @@ static uint8_t s_lvfs_registered = 0U;
 static lvgl_app_ctrl_page_t s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
 static lvgl_app_screen_req_t s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
 static lvgl_app_screen_req_t s_current_screen = LVGL_APP_SCREEN_REQ_NONE;
+static uint8_t s_main_menu_selected_id = LVGL_APP_MENU_ID_MANUAL;
 static ui_page_t s_page;
 static ui_feedback_t s_feedback;
 static lv_obj_t *s_page_root = NULL;
@@ -256,6 +260,12 @@ static uint32_t s_nes_cache_last_completed = UINT32_MAX;
 static uint8_t s_nes_cache_last_read_errors = UINT8_MAX;
 static lvgl_app_activity_t s_header_activity = (lvgl_app_activity_t)0xFFU;
 static uint32_t s_header_activity_tick = 0U;
+static lv_obj_t *s_settings_rows[3] = {NULL, NULL, NULL};
+static lv_obj_t *s_settings_labels[3] = {NULL, NULL, NULL};
+static lv_obj_t *s_settings_rotation_value = NULL;
+static lv_obj_t *s_settings_sound_switch = NULL;
+static lv_obj_t *s_settings_language_switch = NULL;
+static uint8_t s_settings_selected_row = 0U;
 
 static void lvgl_app_update_header_activity(void)
 {
@@ -401,6 +411,7 @@ static void lvgl_app_diagnostics_refresh(void);
 static void lvgl_app_show_camera_test(void);
 static void lvgl_app_camera_process(void);
 static void lvgl_app_camera_exit(const char *reason);
+static void lvgl_app_show_display_settings(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
@@ -425,6 +436,16 @@ static uint8_t lvgl_app_screen_depth(lvgl_app_screen_req_t screen)
     }
 
     return 1U;
+}
+
+static uint8_t lvgl_app_chinese_enabled(void)
+{
+    return UI_Settings_GetChineseEnabled();
+}
+
+static const char *lvgl_app_tr(const char *english, const char *chinese)
+{
+    return (lvgl_app_chinese_enabled() != 0U) ? chinese : english;
 }
 
 static void lvgl_app_page_begin(lvgl_app_screen_req_t target, const char *title)
@@ -464,15 +485,53 @@ static void lvgl_app_page_begin(lvgl_app_screen_req_t target, const char *title)
         lv_label_set_text(s_page.title_label, title);
     }
 
+    if ((s_page.title_label != NULL) &&
+        (lv_obj_is_valid(s_page.title_label) != false))
+    {
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lv_obj_set_style_text_font(s_page.title_label, UI_FONT_CJK,
+                                       LV_PART_MAIN);
+        }
+        else
+        {
+            (void)lv_obj_remove_local_style_prop(s_page.title_label,
+                                                 LV_STYLE_TEXT_FONT,
+                                                 LV_PART_MAIN);
+        }
+    }
+
     s_page_root = s_page.root;
     s_page_content = UI_Page_CreateContentLayer(&s_page);
     s_status_label = s_page.status_label;
     if (s_status_label != NULL)
     {
-        /* Page-specific font overrides must not leak into the next page. */
-        (void)lv_obj_remove_local_style_prop(s_status_label,
-                                             LV_STYLE_TEXT_FONT,
-                                             LV_PART_MAIN);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lv_obj_set_style_text_font(s_status_label, UI_FONT_CJK,
+                                       LV_PART_MAIN);
+            /* The external Chinese font is 16 px (19 px line height), while
+             * the fixed footer is only 30 px high. Keep Chinese hints on one
+             * compact line so a wrapped second line can never be clipped. */
+            lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_DOT);
+            lv_obj_set_size(s_status_label, 236, 20);
+            lv_obj_set_style_text_letter_space(s_status_label, -1,
+                                               LV_PART_MAIN);
+            lv_obj_center(s_status_label);
+        }
+        else
+        {
+            /* Page-specific font overrides must not leak into the next page. */
+            (void)lv_obj_remove_local_style_prop(s_status_label,
+                                                 LV_STYLE_TEXT_FONT,
+                                                 LV_PART_MAIN);
+            (void)lv_obj_remove_local_style_prop(s_status_label,
+                                                 LV_STYLE_TEXT_LETTER_SPACE,
+                                                 LV_PART_MAIN);
+            lv_label_set_long_mode(s_status_label, LV_LABEL_LONG_WRAP);
+            lv_obj_set_size(s_status_label, 228, 28);
+            lv_obj_center(s_status_label);
+        }
     }
     if (s_page_content == NULL)
     {
@@ -506,6 +565,31 @@ static void lvgl_app_group_add_obj(lv_obj_t *obj)
 
     UI_Anim_AttachFocus(obj);
     lv_group_add_obj(s_group, obj);
+}
+
+static lv_obj_t *lvgl_app_list_add_btn(lv_obj_t *list,
+                                       const char *icon,
+                                       const char *text)
+{
+    lv_obj_t *btn = lv_list_add_btn(list, icon, text);
+
+    UI_Theme_ApplyListItem(btn);
+    lv_obj_set_height(btn, 40);
+    lv_obj_set_flex_align(btn,
+                          LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    if ((lvgl_app_chinese_enabled() != 0U) &&
+        (lv_obj_get_child_cnt(btn) != 0U))
+    {
+        lv_obj_t *text_label = lv_obj_get_child(
+            btn, (int32_t)(lv_obj_get_child_cnt(btn) - 1U));
+        if (text_label != NULL)
+        {
+            lv_obj_set_style_text_font(text_label, UI_FONT_CJK, LV_PART_MAIN);
+        }
+    }
+    return btn;
 }
 
 static void lvgl_app_set_status(const char *fmt, ...)
@@ -881,7 +965,14 @@ static uint16_t lvgl_app_scan_browser_entries(void)
     if (fr != FR_OK)
     {
         s_browser_scan_result = fr;
-        lvgl_app_set_status("SD mount failed (%d)", (int)fr);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status("SD卡挂载失败 (%d)", (int)fr);
+        }
+        else
+        {
+            lvgl_app_set_status("SD mount failed (%d)", (int)fr);
+        }
         return 0U;
     }
 
@@ -896,7 +987,14 @@ static uint16_t lvgl_app_scan_browser_entries(void)
             if (fr != FR_OK)
             {
                 s_browser_scan_result = fr;
-                lvgl_app_set_status("Read dir fail (%d)", (int)fr);
+                if (lvgl_app_chinese_enabled() != 0U)
+                {
+                    lvgl_app_set_status("目录读取失败 (%d)", (int)fr);
+                }
+                else
+                {
+                    lvgl_app_set_status("Read dir fail (%d)", (int)fr);
+                }
                 break;
             }
 
@@ -946,7 +1044,8 @@ static uint16_t lvgl_app_scan_browser_entries(void)
 
             if (s_browser_entry_count >= LVGL_APP_MAX_BROWSER_ENTRIES)
             {
-                lvgl_app_set_status("Too many files");
+                lvgl_app_set_status(lvgl_app_tr("Too many files",
+                                                "文件数量过多"));
                 break;
             }
         }
@@ -956,7 +1055,14 @@ static uint16_t lvgl_app_scan_browser_entries(void)
     else
     {
         s_browser_scan_result = fr;
-        lvgl_app_set_status("Open dir fail (%d)", (int)fr);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status("打开目录失败 (%d)", (int)fr);
+        }
+        else
+        {
+            lvgl_app_set_status("Open dir fail (%d)", (int)fr);
+        }
     }
 
     (void)f_mount(NULL, (TCHAR const *)SDPath, 1U);
@@ -1245,6 +1351,10 @@ static void lvgl_app_process_pending_screen(void)
     else if (req == LVGL_APP_SCREEN_REQ_CAMERA)
     {
         lvgl_app_show_camera_test();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS)
+    {
+        lvgl_app_show_display_settings();
     }
 }
 
@@ -2222,7 +2332,8 @@ static void lvgl_app_show_foc_control(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_FOC, "FOC Control");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_FOC,
+                        lvgl_app_tr("FOC Control", "FOC控制"));
 
     status_card = lv_obj_create(s_page_content);
     lv_obj_set_size(status_card, 220, 38);
@@ -2400,21 +2511,26 @@ static void lvgl_app_show_motor_control_menu(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MOTOR_MENU, "Motor Control");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MOTOR_MENU,
+                        lvgl_app_tr("Motor Control", "电机控制"));
 
     list = lv_list_create(s_page_content);
-    lv_obj_set_size(list, 224, 160);
+    lv_obj_set_size(list, 232, 180);
     lv_obj_center(list);
-    UI_Theme_ApplyPanel(list);
+    UI_Theme_ApplyList(list);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "1 Motor Speed");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_SETTINGS,
+        lvgl_app_tr("1 Motor Speed", "1 电机转速"));
     first_btn = btn;
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SPEED);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 0U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "2 Servo Angle (Disabled)");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_REFRESH,
+        lvgl_app_tr("2 Servo Angle", "2 舵机角度"));
 #if LVGL_APP_SERVO_HW_ENABLED
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_SERVO);
@@ -2424,14 +2540,17 @@ static void lvgl_app_show_motor_control_menu(void)
 #endif
     UI_Anim_StaggerIn(btn, 1U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back to Main Menu");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_LEFT,
+        lvgl_app_tr("Back to Main Menu", "返回主菜单"));
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
     lv_obj_add_event_cb(btn, lvgl_app_motor_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MOTOR_SUB_ID_BACK);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 2U);
     lv_group_focus_obj(first_btn);
 
-    lvgl_app_set_status("Motor first, Left to go back");
+    lvgl_app_set_status(lvgl_app_tr("OK Enter | Left Back",
+                                    "OK进入 | Left返回"));
     lvgl_app_page_finish();
 }
 
@@ -2445,17 +2564,26 @@ static void lvgl_app_sd_enter_dir_by_index(uint16_t index)
     enter_ok = lvgl_app_browser_enter_dir(s_browser_entries[index].name);
     if (enter_ok == 0U)
     {
-        lvgl_app_set_status("Path too long");
+        lvgl_app_set_status(lvgl_app_tr("Path too long", "路径过长"));
         (void)snprintf(s_browser_path, sizeof(s_browser_path), "%s", prev_path);
     }
     else
     {
         (void)lvgl_app_cp936_to_utf8(s_browser_path, display_path,
                                      sizeof(display_path));
-        lvgl_app_set_status("Path: %s", display_path);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status("路径: %s", display_path);
+        }
+        else
+        {
+            lvgl_app_set_status("Path: %s", display_path);
+        }
     }
 
-    lvgl_app_show_sd_browser();
+    /* Rebuild after the current LVGL event has returned.  Recreating the
+     * browser synchronously can invalidate the button that owns the event. */
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
 }
 
 static void lvgl_app_gif_render_current(void)
@@ -2713,13 +2841,15 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
           lvgl_app_set_status("Failed to build path");
-        lvgl_app_show_sd_browser();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
         return;
     }
 
     (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name, played_name,
                                  sizeof(played_name));
-    lvgl_app_set_status("BIN: OK pause, Left/Right seek, KEY3 return");
+    lvgl_app_set_status(lvgl_app_tr(
+        "BIN: OK pause, Left/Right seek, KEY3 return",
+        "BIN: OK暂停 | 左右跳转 | K3返回"));
     lv_refr_now(NULL);
     (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
 
@@ -2733,17 +2863,26 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
     lvgl_app_show_sd_browser();
     if (play_status == SD_START_ANIM_OK)
     {
-          lvgl_app_set_status("Done: %s", played_name);
+          if (lvgl_app_chinese_enabled() != 0U)
+          {
+              lvgl_app_set_status("播放完成: %s", played_name);
+          }
+          else
+          {
+              lvgl_app_set_status("Done: %s", played_name);
+          }
           lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Playback complete");
     }
     else if (play_status == SD_START_ANIM_ERR_BACK)
     {
-          lvgl_app_set_status("Returned by KEY3");
+          lvgl_app_set_status(lvgl_app_tr("Returned by KEY3",
+                                          "已通过KEY3返回"));
           lvgl_app_show_toast(UI_NOTICE_INFO, "Returned by KEY3");
     }
     else if (play_status == SD_START_ANIM_ERR_STOPPED)
     {
-          lvgl_app_set_status("Stopped by KEY2");
+          lvgl_app_set_status(lvgl_app_tr("Stopped by KEY2",
+                                          "已通过KEY2停止"));
           lvgl_app_show_toast(UI_NOTICE_WARNING, "Stopped by KEY2");
     }
     else
@@ -2780,9 +2919,18 @@ static void lvgl_app_gif_event_cb(lv_event_t *e)
                 LV_PART_MAIN);
             UI_Anim_StateBounce(s_gif_control_card);
         }
-        lvgl_app_set_status((s_gif_paused != 0U) ?
-                            "Paused - OK plays, KEY3 returns" :
-                            "Playing - OK pauses, Left/Right seek");
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status((s_gif_paused != 0U) ?
+                                "已暂停 | OK播放 | KEY3返回" :
+                                "播放中 | OK暂停 | Left/Right跳转");
+        }
+        else
+        {
+            lvgl_app_set_status((s_gif_paused != 0U) ?
+                                "Paused - OK plays, KEY3 returns" :
+                                "Playing - OK pauses, Left/Right seek");
+        }
         return;
     }
 
@@ -2872,7 +3020,8 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_GIF, "Media Player");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_GIF,
+                        lvgl_app_tr("Media Player", "媒体播放器"));
     if (s_status_label != NULL)
     {
         lv_obj_set_style_text_font(s_status_label, UI_FONT_CJK,
@@ -2931,11 +3080,18 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name)
 
     if (name != NULL)
     {
-        lvgl_app_set_status("Playing %s - OK pauses", name);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status("正在播放 %s | OK暂停", name);
+        }
+        else
+        {
+            lvgl_app_set_status("Playing %s - OK pauses", name);
+        }
     }
     else
     {
-        lvgl_app_set_status("Playing GIF");
+        lvgl_app_set_status(lvgl_app_tr("Playing GIF", "正在播放GIF"));
     }
 
     s_gif_playing = 1U;
@@ -3026,7 +3182,9 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
 
     (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name, played_name,
                                  sizeof(played_name));
-    lvgl_app_set_status("Video: OK pause, Left/Right seek, KEY3 return");
+    lvgl_app_set_status(lvgl_app_tr(
+        "Video: OK pause, Left/Right seek, KEY3 return",
+        "视频: OK暂停 | 左右跳转 | K3返回"));
     lv_refr_now(NULL);
     (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
 
@@ -3052,17 +3210,26 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
 
     if (play_status == MJPEG_PLAYER_OK)
     {
-          lvgl_app_set_status("Done: %s", played_name);
+          if (lvgl_app_chinese_enabled() != 0U)
+          {
+              lvgl_app_set_status("播放完成: %s", played_name);
+          }
+          else
+          {
+              lvgl_app_set_status("Done: %s", played_name);
+          }
           lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Playback complete");
     }
     else if (play_status == MJPEG_PLAYER_ERR_BACK)
     {
-          lvgl_app_set_status("Returned by KEY3");
+          lvgl_app_set_status(lvgl_app_tr("Returned by KEY3",
+                                          "已通过KEY3返回"));
           lvgl_app_show_toast(UI_NOTICE_INFO, "Returned by KEY3");
     }
     else if (play_status == MJPEG_PLAYER_ERR_STOPPED)
     {
-          lvgl_app_set_status("Stopped by KEY2");
+          lvgl_app_set_status(lvgl_app_tr("Stopped by KEY2",
+                                          "已通过KEY2停止"));
           lvgl_app_show_toast(UI_NOTICE_WARNING, "Stopped by KEY2");
     }
     else
@@ -3406,7 +3573,8 @@ static void lvgl_app_show_nes_cache(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_NES_CACHE, "NES ROM Cache");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_NES_CACHE,
+                        lvgl_app_tr("NES ROM Cache", "NES ROM缓存"));
 
     name_label = lv_label_create(s_page_content);
     lv_obj_set_width(name_label, 216);
@@ -3515,9 +3683,10 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     {
         if (lvgl_app_browser_go_parent() == 0U)
         {
-            lvgl_app_set_status("Already at root directory");
+            lvgl_app_set_status(lvgl_app_tr("Already at root directory",
+                                            "已经位于根目录"));
         }
-        lvgl_app_show_sd_browser();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
         return;
     }
 
@@ -3552,7 +3721,14 @@ static void lvgl_app_sd_select_id(uintptr_t id)
         char display_name[LVGL_APP_ENTRY_UTF8_LEN];
         (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name,
                                      display_name, sizeof(display_name));
-        lvgl_app_set_status("File: %s", display_name);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status("文件: %s", display_name);
+        }
+        else
+        {
+            lvgl_app_set_status("File: %s", display_name);
+        }
     }
 }
 
@@ -3560,11 +3736,11 @@ static void lvgl_app_sd_left_action(void)
 {
     if (lvgl_app_browser_go_parent() != 0U)
     {
-        lvgl_app_show_sd_browser();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
         return;
     }
 
-    lvgl_app_set_status("Back to main menu");
+    lvgl_app_set_status(lvgl_app_tr("Back to main menu", "返回主菜单"));
     lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
 }
 
@@ -3589,7 +3765,8 @@ static void lvgl_app_sd_right_action(uintptr_t id)
     }
     else
     {
-        lvgl_app_set_status("Right key enters folders only");
+        lvgl_app_set_status(lvgl_app_tr("Right key enters folders only",
+                                        "Right键仅用于进入文件夹"));
     }
 }
 
@@ -3605,7 +3782,7 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
         key = lvgl_app_event_get_key(e);
         if (key == LV_KEY_ESC)
         {
-            lvgl_app_set_status("Main menu");
+            lvgl_app_set_status(lvgl_app_tr("Main menu", "主菜单"));
             lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
             return;
         }
@@ -3621,6 +3798,12 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     }
 
     id = (uintptr_t)lv_event_get_user_data(e);
+    if ((id >= LVGL_APP_MENU_ID_MANUAL) &&
+        (id <= LVGL_APP_MENU_ID_DISPLAY))
+    {
+        s_main_menu_selected_id = (uint8_t)id;
+    }
+
     if (id == LVGL_APP_MENU_ID_MANUAL)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MOTOR_MENU);
@@ -3658,6 +3841,10 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     {
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_CAMERA);
     }
+    else if (id == LVGL_APP_MENU_ID_DISPLAY)
+    {
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS);
+    }
 }
 
 static void lvgl_app_sd_file_event_cb(lv_event_t *e)
@@ -3675,8 +3862,17 @@ static void lvgl_app_sd_file_event_cb(lv_event_t *e)
 
         if (key == LV_KEY_ESC)
         {
-            lvgl_app_set_status("Global exit");
-            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+            lv_port_indev_suppress_all_keys_until_release();
+            if (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET)
+            {
+                s_main_menu_selected_id = LVGL_APP_MENU_ID_MANUAL;
+                lvgl_app_set_status(lvgl_app_tr("Global exit", "全局退出"));
+                lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+            }
+            else
+            {
+                lvgl_app_sd_left_action();
+            }
             return;
         }
 
@@ -3860,7 +4056,8 @@ static void lvgl_app_show_diagnostics(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_DIAGNOSTICS, "UI Diagnostics");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_DIAGNOSTICS,
+                        lvgl_app_tr("UI Diagnostics", "UI性能诊断"));
 
     s_diag_status_card = lv_obj_create(s_page_content);
     lv_obj_set_size(s_diag_status_card, 220, 28);
@@ -3917,7 +4114,9 @@ static void lvgl_app_show_diagnostics(void)
     s_diag_last_status = (ui_perf_status_t)0xFFU;
     s_diag_last_refresh_tick = HAL_GetTick();
     lvgl_app_diagnostics_refresh();
-    lvgl_app_set_status("Left/Right pages - KEY2/KEY3 exits");
+    lvgl_app_set_status(lvgl_app_tr(
+        "Left/Right pages - KEY2/KEY3 exits",
+        "左右翻页 | K2/K3退出"));
     lvgl_app_page_finish();
 }
 
@@ -3958,7 +4157,9 @@ static void lvgl_app_camera_release_preview(void)
         (lv_obj_is_valid(s_camera_placeholder_label) != false))
     {
         lv_obj_clear_flag(s_camera_placeholder_label, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(s_camera_placeholder_label, LV_SYMBOL_IMAGE "\nCamera ready");
+        lv_label_set_text(s_camera_placeholder_label,
+                          lvgl_app_tr(LV_SYMBOL_IMAGE "\nCamera ready",
+                                      LV_SYMBOL_IMAGE "\n摄像头已就绪"));
     }
 
     MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
@@ -4021,7 +4222,15 @@ static void lvgl_app_camera_show_error(Camera_Result result)
                                  (int)result,
                                  (unsigned long)diagnostics.dcmi_error);
     }
-    lvgl_app_set_status("Camera failed (%d) - OK retries, KEY3 returns", (int)result);
+    if (lvgl_app_chinese_enabled() != 0U)
+    {
+        lvgl_app_set_status("摄像头失败 (%d) | OK重试 | KEY3返回", (int)result);
+    }
+    else
+    {
+        lvgl_app_set_status("Camera failed (%d) - OK retries, KEY3 returns",
+                            (int)result);
+    }
     lvgl_app_show_toast(UI_NOTICE_ERROR, "Camera test failed");
 }
 
@@ -4041,7 +4250,9 @@ static void lvgl_app_camera_start_capture(void)
     s_camera_phase = LVGL_APP_CAMERA_PHASE_CAPTURING;
     lvgl_app_camera_set_info("ID 0x%04X\nCapturing 320x240 JPEG...",
                              CAMERA_OV5640_SENSOR_ID);
-    lvgl_app_set_status("Capturing... KEY3 cancels and returns");
+    lvgl_app_set_status(lvgl_app_tr(
+        "Capturing... KEY3 cancels and returns",
+        "正在采集图像 | KEY3取消并返回"));
 }
 
 static void lvgl_app_camera_request_capture(void)
@@ -4065,7 +4276,8 @@ static void lvgl_app_camera_request_capture(void)
     s_camera_phase_tick = HAL_GetTick();
     s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
     lvgl_app_camera_set_info("Powering OV5640...\nPlease wait");
-    lvgl_app_set_status("Initializing camera...");
+    lvgl_app_set_status(lvgl_app_tr("Initializing camera...",
+                                    "正在初始化摄像头..."));
 }
 
 static void lvgl_app_camera_event_cb(lv_event_t *e)
@@ -4121,7 +4333,9 @@ static void lvgl_app_camera_process(void)
         s_camera_phase = LVGL_APP_CAMERA_PHASE_READY;
         lvgl_app_camera_set_info("OV5640 ID 0x%04lX\n320x240 JPEG ready",
                                  (unsigned long)diagnostics.sensor_id);
-        lvgl_app_set_status("OK captures - Left/KEY3 returns");
+        lvgl_app_set_status(lvgl_app_tr(
+            "OK captures - Left/KEY3 returns",
+            "OK拍照 | Left/KEY3返回"));
         lvgl_app_show_toast(UI_NOTICE_SUCCESS, "OV5640 ready");
         if (s_camera_capture_after_init != 0U)
         {
@@ -4149,7 +4363,8 @@ static void lvgl_app_camera_process(void)
             lvgl_app_camera_set_info("JPEG %lu B  Capture %lu ms\nDecoding...",
                                      (unsigned long)jpeg_size,
                                      (unsigned long)s_camera_capture_elapsed_ms);
-            lvgl_app_set_status("JPEG captured - decoding...");
+            lvgl_app_set_status(lvgl_app_tr(
+                "JPEG captured - decoding...", "JPEG采集完成 | 正在解码"));
         }
         else if (camera_state == CAMERA_STATE_ERROR)
         {
@@ -4196,7 +4411,16 @@ static void lvgl_app_camera_process(void)
         lvgl_app_camera_set_info("JPEG %lu B\nDecode failed (%d)",
                                  (unsigned long)jpeg_size,
                                  (int)decode_result);
-        lvgl_app_set_status("JPEG decode failed (%d) - OK retries", (int)decode_result);
+        if (lvgl_app_chinese_enabled() != 0U)
+        {
+            lvgl_app_set_status("JPEG解码失败 (%d) | OK重试",
+                                (int)decode_result);
+        }
+        else
+        {
+            lvgl_app_set_status("JPEG decode failed (%d) - OK retries",
+                                (int)decode_result);
+        }
         lvgl_app_show_toast(UI_NOTICE_ERROR, "JPEG decode failed");
         s_camera_phase = LVGL_APP_CAMERA_PHASE_ERROR;
         return;
@@ -4228,7 +4452,9 @@ static void lvgl_app_camera_process(void)
                              (unsigned long)jpeg_size,
                              (unsigned long)s_camera_capture_elapsed_ms,
                              (unsigned long)(HAL_GetTick() - decode_started));
-    lvgl_app_set_status("OK captures again - Left/KEY3 returns");
+    lvgl_app_set_status(lvgl_app_tr(
+        "OK captures again - Left/KEY3 returns",
+        "OK再次拍照 | Left/KEY3返回"));
     lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Camera frame ready");
 }
 
@@ -4267,7 +4493,8 @@ static void lvgl_app_show_camera_test(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_CAMERA, "Camera Test");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_CAMERA,
+                        lvgl_app_tr("Camera Test", "摄像头测试"));
 
     s_camera_preview_card = lv_obj_create(s_page_content);
     lv_obj_set_size(s_camera_preview_card, 208, 154);
@@ -4280,12 +4507,18 @@ static void lvgl_app_show_camera_test(void)
     lv_obj_add_flag(s_camera_preview_image, LV_OBJ_FLAG_HIDDEN);
 
     s_camera_placeholder_label = lv_label_create(s_camera_preview_card);
+    if (lvgl_app_chinese_enabled() != 0U)
+    {
+        lv_obj_set_style_text_font(s_camera_placeholder_label, UI_FONT_CJK,
+                                   LV_PART_MAIN);
+    }
     lv_obj_set_style_text_align(s_camera_placeholder_label,
                                 LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_camera_placeholder_label,
                                 lv_color_hex(0x6B7280), LV_PART_MAIN);
     lv_label_set_text(s_camera_placeholder_label,
-                      LV_SYMBOL_IMAGE "\nPowering OV5640...");
+                      lvgl_app_tr(LV_SYMBOL_IMAGE "\nPowering OV5640...",
+                                  LV_SYMBOL_IMAGE "\n正在启动OV5640..."));
     lv_obj_center(s_camera_placeholder_label);
 
     s_camera_info_label = lv_label_create(s_page_content);
@@ -4314,9 +4547,377 @@ static void lvgl_app_show_camera_test(void)
     s_camera_capture_elapsed_ms = 0U;
     s_camera_phase_tick = HAL_GetTick();
     s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
-    lvgl_app_set_status("Initializing OV5640...");
+    lvgl_app_set_status(lvgl_app_tr("Initializing OV5640...",
+                                    "正在初始化OV5640..."));
     UI_Anim_StaggerIn(s_camera_preview_card, 0U);
     UI_Anim_StaggerIn(s_camera_info_label, 1U);
+    lvgl_app_page_finish();
+}
+
+static void lvgl_app_display_settings_refresh(void)
+{
+    static const char *english_names[3] =
+        {"Display Rotation", "Key Sound", "Language"};
+    static const char *chinese_names[3] =
+        {"屏幕旋转", "按键声音", "界面语言"};
+    char rotation_text[20];
+    uint8_t i;
+
+    (void)snprintf(rotation_text, sizeof(rotation_text), "< %u\xC2\xB0 >",
+                   (unsigned int)UI_Settings_GetRotationDegrees());
+    if ((s_settings_rotation_value != NULL) &&
+        (lv_obj_is_valid(s_settings_rotation_value) != false))
+    {
+        (void)UI_LabelSetTextIfChanged(s_settings_rotation_value, rotation_text);
+    }
+
+    if ((s_settings_sound_switch != NULL) &&
+        (lv_obj_is_valid(s_settings_sound_switch) != false))
+    {
+        if (UI_Settings_GetKeySoundEnabled() != 0U)
+        {
+            lv_obj_add_state(s_settings_sound_switch, LV_STATE_CHECKED);
+        }
+        else
+        {
+            lv_obj_clear_state(s_settings_sound_switch, LV_STATE_CHECKED);
+        }
+    }
+
+    if ((s_settings_language_switch != NULL) &&
+        (lv_obj_is_valid(s_settings_language_switch) != false))
+    {
+        if (UI_Settings_GetChineseEnabled() != 0U)
+        {
+            lv_obj_add_state(s_settings_language_switch, LV_STATE_CHECKED);
+        }
+        else
+        {
+            lv_obj_clear_state(s_settings_language_switch, LV_STATE_CHECKED);
+        }
+    }
+
+    for (i = 0U; i < 3U; ++i)
+    {
+        if ((s_settings_labels[i] != NULL) &&
+            (lv_obj_is_valid(s_settings_labels[i]) != false))
+        {
+            (void)UI_LabelSetTextIfChanged(
+                s_settings_labels[i],
+                (lvgl_app_chinese_enabled() != 0U) ?
+                    chinese_names[i] : english_names[i]);
+            lv_obj_set_style_text_font(
+                s_settings_labels[i],
+                (lvgl_app_chinese_enabled() != 0U) ?
+                    UI_FONT_CJK : &lv_font_montserrat_14,
+                LV_PART_MAIN);
+        }
+        if ((s_settings_rows[i] != NULL) &&
+            (lv_obj_is_valid(s_settings_rows[i]) != false))
+        {
+            UI_Theme_SetVisualState(
+                s_settings_rows[i],
+                ((s_settings_labels[i] != NULL) &&
+                 (lv_obj_is_valid(s_settings_labels[i]) != false)) ?
+                    s_settings_labels[i] : NULL,
+                (lv_obj_has_state(s_settings_rows[i], LV_STATE_FOCUSED) != false) ?
+                    UI_VISUAL_FOCUSED : UI_VISUAL_NORMAL);
+        }
+    }
+}
+
+static void lvgl_app_display_settings_clear_refs(void)
+{
+    uint8_t i;
+
+    for (i = 0U; i < 3U; ++i)
+    {
+        s_settings_rows[i] = NULL;
+        s_settings_labels[i] = NULL;
+    }
+    s_settings_rotation_value = NULL;
+    s_settings_sound_switch = NULL;
+    s_settings_language_switch = NULL;
+}
+
+static void lvgl_app_display_settings_change_rotation(int8_t step)
+{
+    int16_t rotation = (int16_t)UI_Settings_GetRotation() + step;
+
+    if (rotation < 0)
+    {
+        rotation = (int16_t)UI_SETTINGS_ROTATION_COUNT - 1;
+    }
+    else if (rotation >= (int16_t)UI_SETTINGS_ROTATION_COUNT)
+    {
+        rotation = 0;
+    }
+
+    UI_Settings_SetRotation((uint8_t)rotation);
+    /* Do not reinterpret the still-held physical direction under the newly
+     * rotated key map.  The next logical key begins after release. */
+    lv_port_indev_suppress_all_keys_until_release();
+    lvgl_app_display_settings_refresh();
+    lv_obj_invalidate(lv_scr_act());
+    if (lvgl_app_chinese_enabled() != 0U)
+    {
+        lvgl_app_set_status("屏幕旋转 %u° | 按键方向已同步",
+                            (unsigned int)UI_Settings_GetRotationDegrees());
+    }
+    else
+    {
+        lvgl_app_set_status("Rotation %u deg | Keys follow display",
+                            (unsigned int)UI_Settings_GetRotationDegrees());
+    }
+}
+
+static void lvgl_app_display_settings_toggle_sound(uint8_t explicit_value,
+                                                   uint8_t use_explicit)
+{
+    uint8_t enabled = UI_Settings_GetKeySoundEnabled();
+
+    enabled = (use_explicit != 0U) ? ((explicit_value != 0U) ? 1U : 0U) :
+                                     ((enabled == 0U) ? 1U : 0U);
+    UI_Settings_SetKeySoundEnabled(enabled);
+    if (enabled != 0U)
+    {
+        /* The OK press happened while sound was disabled, so provide one
+         * immediate confirmation chirp after enabling it. */
+        UI_Settings_NotifyKeyPress();
+    }
+    lvgl_app_display_settings_refresh();
+    if (s_settings_sound_switch != NULL)
+    {
+        UI_Anim_StateBounce(s_settings_sound_switch);
+    }
+    if (lvgl_app_chinese_enabled() != 0U)
+    {
+        lvgl_app_set_status((enabled != 0U) ?
+                            "按键声音已开启 | 正在保存" :
+                            "按键声音已关闭 | 正在保存");
+    }
+    else
+    {
+        lvgl_app_set_status((enabled != 0U) ?
+                            "Key Sound ON | saving to W25Q64" :
+                            "Key Sound OFF | saving to W25Q64");
+    }
+}
+
+static void lvgl_app_display_settings_toggle_language(uint8_t explicit_value,
+                                                       uint8_t use_explicit)
+{
+    uint8_t enabled = UI_Settings_GetChineseEnabled();
+
+    enabled = (use_explicit != 0U) ? ((explicit_value != 0U) ? 1U : 0U) :
+                                     ((enabled == 0U) ? 1U : 0U);
+    if (enabled == UI_Settings_GetChineseEnabled())
+    {
+        return;
+    }
+
+    UI_Settings_SetChineseEnabled(enabled);
+    UI_Settings_RequestSaveNow();
+    s_settings_selected_row = 2U;
+    /* Rebuild the same page so its header, footer, fonts and all row labels
+     * switch language atomically. Clear refs before group deletion to retain
+     * the second-entry HardFault protection. */
+    lvgl_app_display_settings_clear_refs();
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS);
+}
+
+static void lvgl_app_display_settings_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    uint8_t row = (uint8_t)(uintptr_t)lv_event_get_user_data(e);
+    uint32_t key;
+
+    if ((code == LV_EVENT_FOCUSED) || (code == LV_EVENT_DEFOCUSED))
+    {
+        if (code == LV_EVENT_FOCUSED)
+        {
+            s_settings_selected_row = row;
+        }
+        lvgl_app_display_settings_refresh();
+        return;
+    }
+
+    if (code == LV_EVENT_CLICKED)
+    {
+        if (row == 0U)
+        {
+            lvgl_app_display_settings_change_rotation(1);
+        }
+        else if (row == 1U)
+        {
+            lvgl_app_display_settings_toggle_sound(0U, 0U);
+        }
+        else
+        {
+            lvgl_app_display_settings_toggle_language(0U, 0U);
+        }
+        return;
+    }
+
+    if (code != LV_EVENT_KEY)
+    {
+        return;
+    }
+
+    key = lvgl_app_event_get_key(e);
+    if (key == LV_KEY_ESC)
+    {
+        UI_Settings_RequestSaveNow();
+        /* The content layer is deleted after the transition.  Drop all page
+         * references now so a later automatic focus event can never observe
+         * objects belonging to this old settings page. */
+        lvgl_app_display_settings_clear_refs();
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+        return;
+    }
+
+    if (row == 0U)
+    {
+        if (key == LV_KEY_LEFT)
+        {
+            lvgl_app_display_settings_change_rotation(-1);
+        }
+        else if (key == LV_KEY_RIGHT)
+        {
+            lvgl_app_display_settings_change_rotation(1);
+        }
+    }
+    else if (row == 1U)
+    {
+        if (key == LV_KEY_LEFT)
+        {
+            lvgl_app_display_settings_toggle_sound(0U, 1U);
+        }
+        else if (key == LV_KEY_RIGHT)
+        {
+            lvgl_app_display_settings_toggle_sound(1U, 1U);
+        }
+    }
+    else if (row == 2U)
+    {
+        if (key == LV_KEY_LEFT)
+        {
+            lvgl_app_display_settings_toggle_language(0U, 1U);
+        }
+        else if (key == LV_KEY_RIGHT)
+        {
+            lvgl_app_display_settings_toggle_language(1U, 1U);
+        }
+    }
+}
+
+static void lvgl_app_show_display_settings(void)
+{
+    lv_obj_t *row;
+    lv_obj_t *label;
+    uint8_t i;
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
+    /* lv_group_add_obj() focuses the first object immediately.  Clear every
+     * reference before that event so a second visit cannot touch controls
+     * deleted with the previous content layer. */
+    lvgl_app_display_settings_clear_refs();
+
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS,
+                        lvgl_app_tr("Display Settings", "显示设置"));
+
+    for (i = 0U; i < 3U; ++i)
+    {
+        row = lv_btn_create(s_page_content);
+        s_settings_rows[i] = row;
+        lv_obj_set_size(row, 220, 52);
+        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 6 + (lv_coord_t)i * 58);
+        UI_Theme_ApplyDataCard(row);
+        lv_obj_set_style_radius(row, 12, LV_PART_MAIN);
+        lv_obj_set_style_pad_left(row, 14, LV_PART_MAIN);
+        lv_obj_set_style_pad_right(row, 12, LV_PART_MAIN);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(row, lvgl_app_display_settings_event_cb,
+                            LV_EVENT_FOCUSED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row, lvgl_app_display_settings_event_cb,
+                            LV_EVENT_DEFOCUSED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row, lvgl_app_display_settings_event_cb,
+                            LV_EVENT_CLICKED, (void *)(uintptr_t)i);
+        lv_obj_add_event_cb(row, lvgl_app_display_settings_event_cb,
+                            LV_EVENT_KEY, (void *)(uintptr_t)i);
+        label = lv_label_create(row);
+        s_settings_labels[i] = label;
+        lv_label_set_text(label, "");
+        lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(label, 120);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_14,
+                                   LV_PART_MAIN);
+        lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
+
+        /* Add the fully constructed row last: the first add can synchronously
+         * emit LV_EVENT_FOCUSED and call the settings refresh routine. */
+        lvgl_app_group_add_obj(row);
+        UI_Anim_StaggerIn(row, i);
+    }
+
+    s_settings_rotation_value = lv_label_create(s_settings_rows[0]);
+    lv_label_set_long_mode(s_settings_rotation_value, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(s_settings_rotation_value, 64);
+    lv_obj_set_style_text_font(s_settings_rotation_value,
+                               &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_settings_rotation_value,
+                                LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_settings_rotation_value,
+                                lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_obj_align(s_settings_rotation_value, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    s_settings_sound_switch = lv_switch_create(s_settings_rows[1]);
+    lv_obj_set_size(s_settings_sound_switch, 52, 28);
+    lv_obj_align(s_settings_sound_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_clear_flag(s_settings_sound_switch,
+                      LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_set_style_bg_color(s_settings_sound_switch,
+                              lv_color_hex(0xCBD5E1), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_settings_sound_switch, LV_OPA_COVER,
+                            LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_settings_sound_switch,
+                              lv_color_hex(0x16A8E5),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(s_settings_sound_switch, LV_OPA_COVER,
+                            LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(s_settings_sound_switch, lv_color_white(),
+                              LV_PART_KNOB);
+
+    s_settings_language_switch = lv_switch_create(s_settings_rows[2]);
+    lv_obj_set_size(s_settings_language_switch, 52, 28);
+    lv_obj_align(s_settings_language_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_clear_flag(s_settings_language_switch,
+                      LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_set_style_bg_color(s_settings_language_switch,
+                              lv_color_hex(0xCBD5E1), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_settings_language_switch, LV_OPA_COVER,
+                            LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_settings_language_switch,
+                              lv_color_hex(0x16A8E5),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(s_settings_language_switch, LV_OPA_COVER,
+                            LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(s_settings_language_switch, lv_color_white(),
+                              LV_PART_KNOB);
+
+    if (s_settings_selected_row >= 3U)
+    {
+        s_settings_selected_row = 0U;
+    }
+    lv_group_focus_obj(s_settings_rows[s_settings_selected_row]);
+    lvgl_app_display_settings_refresh();
+    lvgl_app_set_status(lvgl_app_tr(
+        "Up/Down select | Left/Right adjust | OK toggle | KEY3 back",
+        "上下选择 | 左右调节 | OK切换 | K3返回"));
     lvgl_app_page_finish();
 }
 
@@ -4324,7 +4925,8 @@ static void lvgl_app_show_main_menu(void)
 {
     lv_obj_t *list;
     lv_obj_t *btn;
-    lv_obj_t *first_btn;
+    lv_obj_t *focus_btn;
+    lv_obj_t *menu_btns[LVGL_APP_MENU_ID_DISPLAY + 1U] = {NULL};
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     s_ctrl_editing = 0U;
@@ -4337,68 +4939,117 @@ static void lvgl_app_show_main_menu(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MAIN, "Main Menu");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MAIN,
+                        lvgl_app_tr("Main Menu", "主菜单"));
 
     list = lv_list_create(s_page_content);
-    lv_obj_set_size(list, 224, 172);
+    lv_obj_set_size(list, 232, 180);
     lv_obj_center(list);
-    UI_Theme_ApplyPanel(list);
+    UI_Theme_ApplyList(list);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_PLAY, "1 Motor Control");
-    first_btn = btn;
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_PLAY,
+        lvgl_app_tr("1 Motor Control", "1 电机控制"));
+    menu_btns[LVGL_APP_MENU_ID_MANUAL] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MANUAL);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 0U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_SETTINGS, "2 Command Control");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_SETTINGS,
+        lvgl_app_tr("2 Command Control", "2 指令控制"));
+    menu_btns[LVGL_APP_MENU_ID_COMMAND] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_COMMAND);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 1U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, "3 SD Card Files");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_VIDEO,
+        lvgl_app_tr("3 SD Card Files", "3 SD卡文件"));
+    menu_btns[LVGL_APP_MENU_ID_SD_BROWSER] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_SD_BROWSER);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 2U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_SHUFFLE, "4 Mecanum Control");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_SHUFFLE,
+        lvgl_app_tr("4 Mecanum Control", "4 麦轮控制"));
+    menu_btns[LVGL_APP_MENU_ID_MECANUM] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MECANUM);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MECANUM);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 3U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_LOOP, "5 MPU6500 Data");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_LOOP,
+        lvgl_app_tr("5 MPU6500 Data", "5 MPU6500数据"));
+    menu_btns[LVGL_APP_MENU_ID_MPU6500] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_MPU6500);
     lvgl_app_group_add_obj(btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_EDIT, "6 WS2812 Control");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_EDIT,
+        lvgl_app_tr("6 WS2812 Control", "6 灯光控制"));
+    menu_btns[LVGL_APP_MENU_ID_WS2812] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_WS2812);
     lvgl_app_group_add_obj(btn);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_REFRESH, "7 FOC Control");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_REFRESH,
+        lvgl_app_tr("7 FOC Control", "7 FOC控制"));
+    menu_btns[LVGL_APP_MENU_ID_FOC] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_FOC);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_FOC);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 6U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_EYE_OPEN, "8 UI Diagnostics");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_EYE_OPEN,
+        lvgl_app_tr("8 UI Diagnostics", "8 UI性能诊断"));
+    menu_btns[LVGL_APP_MENU_ID_DIAGNOSTICS] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_DIAGNOSTICS);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 7U);
 
-    btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, "9 Camera Test");
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_IMAGE,
+        lvgl_app_tr("9 Camera Test", "9 摄像头测试"));
+    menu_btns[LVGL_APP_MENU_ID_CAMERA] = btn;
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_MENU_ID_CAMERA);
     lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_MENU_ID_CAMERA);
     lvgl_app_group_add_obj(btn);
     UI_Anim_StaggerIn(btn, 8U);
 
-    lv_group_focus_obj(first_btn);
+    btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_SETTINGS,
+        lvgl_app_tr("10 Display Settings", "10 显示设置"));
+    menu_btns[LVGL_APP_MENU_ID_DISPLAY] = btn;
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)LVGL_APP_MENU_ID_DISPLAY);
+    lv_obj_add_event_cb(btn, lvgl_app_menu_event_cb, LV_EVENT_KEY,
+                        (void *)(uintptr_t)LVGL_APP_MENU_ID_DISPLAY);
+    lvgl_app_group_add_obj(btn);
+    UI_Anim_StaggerIn(btn, 9U);
 
+    focus_btn = menu_btns[s_main_menu_selected_id];
+    if (focus_btn == NULL)
+    {
+        s_main_menu_selected_id = LVGL_APP_MENU_ID_MANUAL;
+        focus_btn = menu_btns[LVGL_APP_MENU_ID_MANUAL];
+    }
+    lv_group_focus_obj(focus_btn);
+    lv_obj_update_layout(list);
+    lv_obj_scroll_to_view(focus_btn, LV_ANIM_OFF);
+
+    lvgl_app_set_status(lvgl_app_tr(
+        "Up/Down select | OK enter | Left back",
+        "上下选择 | OK进入 | 左键返回"));
     lvgl_app_page_finish();
 }
 
@@ -5014,7 +5665,8 @@ static void lvgl_app_show_command_control(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_COMMAND, "Command Control");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_COMMAND,
+                        lvgl_app_tr("Command Control", "指令控制"));
 
     status_card = lv_obj_create(s_page_content);
     lv_obj_set_size(status_card, 220, 28);
@@ -5058,7 +5710,9 @@ static void lvgl_app_show_command_control(void)
     lv_group_add_obj(s_group, key_receiver);
     lv_group_focus_obj(key_receiver);
 
-    lvgl_app_set_status("Commands active; FOC bridge on UART4");
+    lvgl_app_set_status(lvgl_app_tr(
+        "Commands active; FOC bridge on UART4",
+        "指令已启用 | UART4 FOC桥接"));
 
     lvgl_app_motor_speed_sync_actual();
     lvgl_app_motor_speed_reset_followers();
@@ -5075,7 +5729,9 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_t *up_btn;
     lv_obj_t *focus_obj;
     char path_line[LVGL_APP_PATH_UTF8_LEN + 8U];
-    char *display_path = &path_line[sizeof("Path: ") - 1U];
+    const char *path_prefix;
+    char *display_path;
+    size_t path_prefix_len;
     uint16_t i;
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
@@ -5085,17 +5741,20 @@ static void lvgl_app_show_sd_browser(void)
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_SD_BROWSER, "SD Card Files");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_SD_BROWSER,
+                        lvgl_app_tr("SD Card Files", "SD卡文件"));
     if (s_status_label != NULL)
     {
         lv_obj_set_style_text_font(s_status_label, UI_FONT_CJK,
                                    LV_PART_MAIN);
     }
 
-    (void)snprintf(path_line, sizeof(path_line), "Path: ");
+    path_prefix = lvgl_app_tr("Path: ", "路径: ");
+    path_prefix_len = strlen(path_prefix);
+    (void)snprintf(path_line, sizeof(path_line), "%s", path_prefix);
+    display_path = &path_line[path_prefix_len];
     (void)lvgl_app_cp936_to_utf8(s_browser_path, display_path,
-                                 sizeof(path_line) -
-                                     (sizeof("Path: ") - 1U));
+                                 sizeof(path_line) - path_prefix_len);
     btn = lv_label_create(s_page_content);
     lv_label_set_long_mode(btn, LV_LABEL_LONG_DOT);
     lv_obj_set_width(btn, 224);
@@ -5104,17 +5763,19 @@ static void lvgl_app_show_sd_browser(void)
     lv_obj_align(btn, LV_ALIGN_TOP_MID, 0, 2);
 
     list = lv_list_create(s_page_content);
-    lv_obj_set_size(list, 224, 154);
+    lv_obj_set_size(list, 232, 156);
     lv_obj_align(list, LV_ALIGN_BOTTOM_MID, 0, -2);
-    UI_Theme_ApplyPanel(list);
+    UI_Theme_ApplyList(list);
 
-    back_btn = lv_list_add_btn(list, LV_SYMBOL_LEFT, "Back");
+    back_btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_LEFT, lvgl_app_tr("Back", "返回"));
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lv_obj_add_event_cb(back_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_BACK);
     lvgl_app_group_add_obj(back_btn);
     UI_Anim_StaggerIn(back_btn, 0U);
 
-    up_btn = lv_list_add_btn(list, LV_SYMBOL_UP, "Parent");
+    up_btn = lvgl_app_list_add_btn(
+        list, LV_SYMBOL_UP, lvgl_app_tr("Parent", "上一级"));
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_CLICKED, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lv_obj_add_event_cb(up_btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)LVGL_APP_SD_ID_UP);
     lvgl_app_group_add_obj(up_btn);
@@ -5126,14 +5787,33 @@ static void lvgl_app_show_sd_browser(void)
     {
         if (s_browser_scan_result == FR_OK)
         {
-            btn = lv_list_add_btn(list, LV_SYMBOL_CLOSE, "No folders or media");
-            lvgl_app_set_status("Empty: %s", display_path);
+            btn = lvgl_app_list_add_btn(
+                list, LV_SYMBOL_CLOSE,
+                lvgl_app_tr("No folders or media", "无文件夹或媒体文件"));
+            if (lvgl_app_chinese_enabled() != 0U)
+            {
+                lvgl_app_set_status("空目录: %s", display_path);
+            }
+            else
+            {
+                lvgl_app_set_status("Empty: %s", display_path);
+            }
         }
         else
         {
-            btn = lv_list_add_btn(list, LV_SYMBOL_WARNING, "SD read failed");
-            lvgl_app_set_status("SD scan failed (%d): %s",
-                                (int)s_browser_scan_result, display_path);
+            btn = lvgl_app_list_add_btn(
+                list, LV_SYMBOL_WARNING,
+                lvgl_app_tr("SD read failed", "SD卡读取失败"));
+            if (lvgl_app_chinese_enabled() != 0U)
+            {
+                lvgl_app_set_status("SD卡扫描失败 (%d): %s",
+                                    (int)s_browser_scan_result, display_path);
+            }
+            else
+            {
+                lvgl_app_set_status("SD scan failed (%d): %s",
+                                    (int)s_browser_scan_result, display_path);
+            }
         }
         lv_obj_clear_flag(btn, LV_OBJ_FLAG_CLICKABLE);
         lv_group_focus_obj(up_btn);
@@ -5151,23 +5831,23 @@ static void lvgl_app_show_sd_browser(void)
             {
                 char line[LVGL_APP_ENTRY_UTF8_LEN + 4U];
                 (void)snprintf(line, sizeof(line), "[%s]", display_name);
-                btn = lv_list_add_btn(list, LV_SYMBOL_RIGHT, line);
+                btn = lvgl_app_list_add_btn(list, LV_SYMBOL_RIGHT, line);
             }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_GIF)
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_IMAGE, display_name);
+                btn = lvgl_app_list_add_btn(list, LV_SYMBOL_IMAGE, display_name);
             }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_MJPEG)
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_VIDEO, display_name);
+                btn = lvgl_app_list_add_btn(list, LV_SYMBOL_VIDEO, display_name);
             }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_NES)
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, display_name);
+                btn = lvgl_app_list_add_btn(list, LV_SYMBOL_FILE, display_name);
             }
             else
             {
-                btn = lv_list_add_btn(list, LV_SYMBOL_FILE, display_name);
+                btn = lvgl_app_list_add_btn(list, LV_SYMBOL_FILE, display_name);
             }
 
             lvgl_app_apply_browser_text_font(btn);
@@ -5202,6 +5882,9 @@ static void lvgl_app_process_global_stop_key(void)
     }
 
     s_key2_latched = 1U;
+    /* KEY2 is the global return path.  Unlike hierarchical Left/KEY3 back,
+     * the next Main Menu must start from the first item. */
+    s_main_menu_selected_id = LVGL_APP_MENU_ID_MANUAL;
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
     {
@@ -5308,7 +5991,9 @@ void LVGL_App_Init(void)
 
     if (font_storage_status == UI_FONT_STORAGE_OK)
     {
-        lvgl_app_set_status("Up/Down move, Right enters, Left goes back, KEY2 exits");
+        lvgl_app_set_status(lvgl_app_tr(
+            "Up/Down | OK Enter | Left Back",
+            "上下选择 | OK进入 | 左键返回"));
     }
     else
     {
@@ -5338,6 +6023,7 @@ void LVGL_App_Process(void)
     NES_RomCache_Process();
     if (NES_RomCache_IsBusy() == 0U)
     {
+        UI_Settings_Process();
         /* Normal pages use the cached QSPI memory window.  NES cache Start()
          * exits mapped mode before erase/write; while it is busy, glyph reads
          * automatically use safe indirect QSPI access instead. */
@@ -5401,7 +6087,10 @@ void LVGL_App_Process(void)
         {
             s_adc_label = lv_label_create(lv_layer_sys());
             lv_obj_align(s_adc_label, LV_ALIGN_TOP_RIGHT, -10, 10);
-            lv_obj_set_style_text_color(s_adc_label, lv_color_make(255, 0, 0), 0);
+            lv_obj_set_style_text_font(s_adc_label, &lv_font_montserrat_14,
+                                       LV_PART_MAIN);
+            lv_obj_set_style_text_color(s_adc_label, lv_color_hex(0xFFD166),
+                                        LV_PART_MAIN);
         }
         char buf[16];
         int v_int = (int)g_adc_voltage;
@@ -5428,13 +6117,15 @@ void LVGL_App_Process(void)
 #include "mpu6500_reg.h"
 #include "imu.h"
 
-static lv_obj_t *s_mpu_label = NULL;
+static lv_obj_t *s_mpu_angle_labels[3] = {NULL, NULL, NULL};
+static lv_obj_t *s_mpu_raw_labels[2] = {NULL, NULL};
 static lv_timer_t *s_mpu_timer = NULL;
 static lv_obj_t *s_mpu_chart = NULL;
 static lv_chart_series_t *s_mpu_pitch_series = NULL;
 static lv_chart_series_t *s_mpu_roll_series = NULL;
 static ui_value_follower_t s_mpu_angle_followers[3];
 static uint32_t s_mpu_last_chart_tick = 0U;
+static uint8_t s_mpu_sample_valid = 0xFFU;
 
 static void lvgl_app_format_centi(char *buffer, size_t size, int32_t value)
 {
@@ -5468,9 +6159,10 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
     ImuServiceSnapshot_t snapshot;
     uint32_t now;
     int32_t angles[3];
-    char pitch_text[20];
-    char roll_text[20];
-    char yaw_text[20];
+    char centi_text[20];
+    char angle_text[24];
+    char raw_text[64];
+    uint8_t i;
 
     (void)timer;
     if (s_ctrl_page != LVGL_APP_CTRL_PAGE_MPU6500) {
@@ -5478,10 +6170,28 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
     }
 
     if (IMU_Service_GetSnapshot(&snapshot) == 0U) {
-        if (s_mpu_label) {
-            char errmsg[64];
-            snprintf(errmsg, sizeof(errmsg), "IIC Error! No valid IMU sample");
-            (void)UI_LabelSetTextIfChanged(s_mpu_label, errmsg);
+        for (i = 0U; i < 3U; ++i)
+        {
+            if ((s_mpu_angle_labels[i] != NULL) &&
+                (lv_obj_is_valid(s_mpu_angle_labels[i]) != false))
+            {
+                (void)UI_LabelSetTextIfChanged(s_mpu_angle_labels[i], "--.--\xC2\xB0");
+            }
+        }
+        for (i = 0U; i < 2U; ++i)
+        {
+            if ((s_mpu_raw_labels[i] != NULL) &&
+                (lv_obj_is_valid(s_mpu_raw_labels[i]) != false))
+            {
+                (void)UI_LabelSetTextIfChanged(s_mpu_raw_labels[i],
+                                               "No valid sample");
+            }
+        }
+        if (s_mpu_sample_valid != 0U)
+        {
+            s_mpu_sample_valid = 0U;
+            lvgl_app_set_status(lvgl_app_tr(
+                "Waiting for a valid IMU sample", "等待有效IMU数据"));
         }
         return;
     }
@@ -5497,9 +6207,32 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
     angles[1] = UI_ValueFollower_Update(&s_mpu_angle_followers[1], now, 160U);
     angles[2] = UI_ValueFollower_Update(&s_mpu_angle_followers[2], now, 160U);
 
-    lvgl_app_format_centi(pitch_text, sizeof(pitch_text), angles[0]);
-    lvgl_app_format_centi(roll_text, sizeof(roll_text), angles[1]);
-    lvgl_app_format_centi(yaw_text, sizeof(yaw_text), angles[2]);
+    for (i = 0U; i < 3U; ++i)
+    {
+        lvgl_app_format_centi(centi_text, sizeof(centi_text), angles[i]);
+        (void)snprintf(angle_text, sizeof(angle_text), "%s\xC2\xB0",
+                       centi_text);
+        if ((s_mpu_angle_labels[i] != NULL) &&
+            (lv_obj_is_valid(s_mpu_angle_labels[i]) != false))
+        {
+            (void)UI_LabelSetTextIfChanged(s_mpu_angle_labels[i], angle_text);
+        }
+    }
+
+    (void)snprintf(raw_text, sizeof(raw_text), "X%+6d  Y%+6d  Z%+6d",
+                   snapshot.ax, snapshot.ay, snapshot.az);
+    if ((s_mpu_raw_labels[0] != NULL) &&
+        (lv_obj_is_valid(s_mpu_raw_labels[0]) != false))
+    {
+        (void)UI_LabelSetTextIfChanged(s_mpu_raw_labels[0], raw_text);
+    }
+    (void)snprintf(raw_text, sizeof(raw_text), "X%+6d  Y%+6d  Z%+6d",
+                   snapshot.gx, snapshot.gy, snapshot.gz);
+    if ((s_mpu_raw_labels[1] != NULL) &&
+        (lv_obj_is_valid(s_mpu_raw_labels[1]) != false))
+    {
+        (void)UI_LabelSetTextIfChanged(s_mpu_raw_labels[1], raw_text);
+    }
 
     if ((s_mpu_chart != NULL) && (lv_obj_is_valid(s_mpu_chart) != false) &&
         (s_mpu_pitch_series != NULL) && (s_mpu_roll_series != NULL) &&
@@ -5512,17 +6245,12 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
                                 (lv_coord_t)(angles[1] / 100));
     }
 
-    char buf[160];
-    snprintf(buf, sizeof(buf),
-             "Pitch: %s   Roll: %s\n"
-             "Yaw: %s\n"
-             "Acc: %d, %d, %d\n"
-             "Gyro: %d, %d, %d",
-             pitch_text, roll_text, yaw_text,
-             snapshot.ax, snapshot.ay, snapshot.az,
-             snapshot.gx, snapshot.gy, snapshot.gz);
-    if (s_mpu_label) {
-        (void)UI_LabelSetTextIfChanged(s_mpu_label, buf);
+    if (s_mpu_sample_valid != 1U)
+    {
+        s_mpu_sample_valid = 1U;
+        lvgl_app_set_status(lvgl_app_tr(
+            "Live attitude | Left or KEY2 returns",
+            "实时姿态 | 左键或K2返回"));
     }
 }
 
@@ -5541,7 +6269,13 @@ static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
             s_mpu_chart = NULL;
             s_mpu_pitch_series = NULL;
             s_mpu_roll_series = NULL;
-            lvgl_app_set_status("Global exit");
+            s_mpu_angle_labels[0] = NULL;
+            s_mpu_angle_labels[1] = NULL;
+            s_mpu_angle_labels[2] = NULL;
+            s_mpu_raw_labels[0] = NULL;
+            s_mpu_raw_labels[1] = NULL;
+            lvgl_app_set_status(lvgl_app_tr("Back to main menu",
+                                            "返回主菜单"));
             lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
         }
     }
@@ -5570,7 +6304,8 @@ static void lvgl_app_show_mecanum_control(void)
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MECANUM, "Mecanum Control");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MECANUM,
+                        lvgl_app_tr("Mecanum Control", "麦轮控制"));
 
     for (i = 0U; i < 7U; ++i)
     {
@@ -5612,64 +6347,200 @@ static void lvgl_app_show_mecanum_control(void)
 
     lvgl_app_control_refresh_rows();
     s_ctrl_last_actual_refresh_tick = HAL_GetTick();
-    lvgl_app_set_status("OK to edit/exec, Left returns");
+    lvgl_app_set_status(lvgl_app_tr(
+        "OK to edit/exec, Left returns", "OK编辑/执行 | 左键返回"));
     lvgl_app_page_finish();
 }
 
 static void lvgl_app_show_mpu6500_data(void)
 {
+    static const char *angle_names[3] = {"PITCH", "ROLL", "YAW"};
+    static const uint32_t angle_colors[3] =
+        {0x2563EBU, 0xF59E0BU, 0x0F9D8DU};
+    static const uint32_t card_colors[3] =
+        {0xEAF2FFU, 0xFFF4DCU, 0xE7F7F4U};
+    lv_obj_t *angle_card;
+    lv_obj_t *name_label;
+    lv_obj_t *accent;
+    lv_obj_t *raw_card;
+    lv_obj_t *raw_name;
+    lv_obj_t *chart_card;
+    lv_obj_t *chart_title;
+    lv_obj_t *legend;
+    lv_obj_t *legend_roll;
+    lv_obj_t *key_receiver;
     uint8_t i;
 
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MPU6500, "MPU6500 Data");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_MPU6500,
+                        lvgl_app_tr("MPU6500 Data", "MPU6500数据"));
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_MPU6500;
 
-    s_mpu_label = lv_label_create(s_page_content);
-    lv_label_set_long_mode(s_mpu_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_mpu_label, 228);
-    lv_obj_set_style_text_align(s_mpu_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_label_set_text(s_mpu_label, "Loading...");
-    lv_obj_align(s_mpu_label, LV_ALIGN_TOP_MID, 0, 5);
-    UI_Anim_StaggerIn(s_mpu_label, 0U);
+    for (i = 0U; i < 3U; ++i)
+    {
+        angle_card = lv_obj_create(s_page_content);
+        lv_obj_set_size(angle_card, 70, 54);
+        lv_obj_set_pos(angle_card, 8 + (lv_coord_t)i * 77, 4);
+        UI_Theme_ApplyDataCard(angle_card);
+        lv_obj_set_style_bg_color(angle_card, lv_color_hex(card_colors[i]),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_outline_color(angle_card,
+                                       lv_color_hex(angle_colors[i]),
+                                       LV_PART_MAIN);
+        lv_obj_set_style_outline_opa(angle_card, LV_OPA_30, LV_PART_MAIN);
+        lv_obj_set_style_radius(angle_card, 10, LV_PART_MAIN);
+        lv_obj_clear_flag(angle_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_mpu_chart = lv_chart_create(s_page_content);
-    lv_obj_set_size(s_mpu_chart, 220, 70);
-    lv_obj_align(s_mpu_chart, LV_ALIGN_BOTTOM_MID, 0, -2);
-    lv_obj_set_style_bg_opa(s_mpu_chart, LV_OPA_20, LV_PART_MAIN);
+        name_label = lv_label_create(angle_card);
+        lv_label_set_text(name_label, angle_names[i]);
+        lv_obj_set_style_text_font(name_label, &lv_font_montserrat_12,
+                                   LV_PART_MAIN);
+        lv_obj_set_style_text_color(name_label,
+                                    lv_color_hex(angle_colors[i]),
+                                    LV_PART_MAIN);
+        lv_obj_align(name_label, LV_ALIGN_TOP_MID, 0, 5);
+
+        s_mpu_angle_labels[i] = lv_label_create(angle_card);
+        lv_label_set_long_mode(s_mpu_angle_labels[i], LV_LABEL_LONG_CLIP);
+        lv_obj_set_size(s_mpu_angle_labels[i], 66, 19);
+        lv_obj_set_style_text_font(s_mpu_angle_labels[i],
+                                   &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_align(s_mpu_angle_labels[i],
+                                    LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_mpu_angle_labels[i],
+                                    lv_color_hex(0x172B4D), LV_PART_MAIN);
+        lv_label_set_text(s_mpu_angle_labels[i], "--.--\xC2\xB0");
+        lv_obj_align(s_mpu_angle_labels[i], LV_ALIGN_CENTER, 0, 6);
+
+        accent = lv_obj_create(angle_card);
+        lv_obj_remove_style_all(accent);
+        lv_obj_set_size(accent, 34, 3);
+        lv_obj_set_style_bg_color(accent, lv_color_hex(angle_colors[i]),
+                                  LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_radius(accent, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_align(accent, LV_ALIGN_BOTTOM_MID, 0, -4);
+        UI_Anim_StaggerIn(angle_card, i);
+    }
+
+    raw_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(raw_card, 224, 38);
+    lv_obj_set_pos(raw_card, 8, 63);
+    UI_Theme_ApplyDataCard(raw_card);
+    lv_obj_set_style_bg_color(raw_card, lv_color_hex(0xF8FAFC), LV_PART_MAIN);
+    lv_obj_set_style_radius(raw_card, 9, LV_PART_MAIN);
+    lv_obj_clear_flag(raw_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (i = 0U; i < 2U; ++i)
+    {
+        raw_name = lv_label_create(raw_card);
+        lv_label_set_text(raw_name, (i == 0U) ? "ACC" : "GYR");
+        lv_obj_set_style_text_font(raw_name, &lv_font_montserrat_12,
+                                   LV_PART_MAIN);
+        lv_obj_set_style_text_color(raw_name,
+                                    lv_color_hex((i == 0U) ?
+                                                 0x2563EB : 0xF59E0B),
+                                    LV_PART_MAIN);
+        lv_obj_set_pos(raw_name, 8, 4 + (lv_coord_t)i * 17);
+
+        s_mpu_raw_labels[i] = lv_label_create(raw_card);
+        lv_label_set_long_mode(s_mpu_raw_labels[i], LV_LABEL_LONG_CLIP);
+        lv_obj_set_size(s_mpu_raw_labels[i], 180, 14);
+        lv_obj_set_style_text_font(s_mpu_raw_labels[i],
+                                   &lv_font_montserrat_12, LV_PART_MAIN);
+        lv_obj_set_style_text_align(s_mpu_raw_labels[i],
+                                    LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_mpu_raw_labels[i],
+                                    lv_color_hex(0x344054), LV_PART_MAIN);
+        lv_label_set_text(s_mpu_raw_labels[i], "X     0  Y     0  Z     0");
+        lv_obj_set_pos(s_mpu_raw_labels[i], 36,
+                       4 + (lv_coord_t)i * 17);
+    }
+    UI_Anim_StaggerIn(raw_card, 3U);
+
+    chart_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(chart_card, 224, 72);
+    lv_obj_set_pos(chart_card, 8, 105);
+    UI_Theme_ApplyDataCard(chart_card);
+    lv_obj_set_style_bg_color(chart_card, lv_color_hex(0xF8FAFC),
+                              LV_PART_MAIN);
+    lv_obj_set_style_radius(chart_card, 9, LV_PART_MAIN);
+    lv_obj_clear_flag(chart_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    chart_title = lv_label_create(chart_card);
+    lv_label_set_text(chart_title, "ATTITUDE TREND");
+    lv_obj_set_style_text_font(chart_title, &lv_font_montserrat_12,
+                               LV_PART_MAIN);
+    lv_obj_set_style_text_color(chart_title, lv_color_hex(0x667085),
+                                LV_PART_MAIN);
+    lv_obj_set_pos(chart_title, 7, 4);
+
+    legend = lv_label_create(chart_card);
+    lv_label_set_text(legend, "P");
+    lv_obj_set_style_text_font(legend, &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_set_style_text_color(legend, lv_color_hex(0x2563EB), LV_PART_MAIN);
+    lv_obj_align(legend, LV_ALIGN_TOP_RIGHT, -25, 4);
+
+    legend_roll = lv_label_create(chart_card);
+    lv_label_set_text(legend_roll, "R");
+    lv_obj_set_style_text_font(legend_roll, &lv_font_montserrat_12,
+                               LV_PART_MAIN);
+    lv_obj_set_style_text_color(legend_roll, lv_color_hex(0xF59E0B),
+                                LV_PART_MAIN);
+    lv_obj_align(legend_roll, LV_ALIGN_TOP_RIGHT, -7, 4);
+
+    s_mpu_chart = lv_chart_create(chart_card);
+    lv_obj_set_size(s_mpu_chart, 212, 48);
+    lv_obj_align(s_mpu_chart, LV_ALIGN_BOTTOM_MID, 0, -3);
+    lv_obj_set_style_bg_opa(s_mpu_chart, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_mpu_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_mpu_chart, 0, LV_PART_MAIN);
+    lv_obj_set_style_line_color(s_mpu_chart, lv_color_hex(0xD8E3EE),
+                                LV_PART_MAIN);
+    lv_obj_set_style_line_opa(s_mpu_chart, LV_OPA_70, LV_PART_MAIN);
+    lv_obj_set_style_line_width(s_mpu_chart, 1, LV_PART_MAIN);
     lv_obj_set_style_line_width(s_mpu_chart, 2, LV_PART_ITEMS);
     lv_chart_set_type(s_mpu_chart, LV_CHART_TYPE_LINE);
-    lv_chart_set_point_count(s_mpu_chart, 32U);
+    lv_chart_set_point_count(s_mpu_chart, 36U);
     lv_chart_set_range(s_mpu_chart, LV_CHART_AXIS_PRIMARY_Y, -180, 180);
     lv_chart_set_div_line_count(s_mpu_chart, 3U, 4U);
     s_mpu_pitch_series = lv_chart_add_series(s_mpu_chart,
                                              lv_color_hex(0x2563EB),
                                              LV_CHART_AXIS_PRIMARY_Y);
     s_mpu_roll_series = lv_chart_add_series(s_mpu_chart,
-                                            lv_color_hex(0xF59E0B),
-                                            LV_CHART_AXIS_PRIMARY_Y);
+                                             lv_color_hex(0xF59E0B),
+                                             LV_CHART_AXIS_PRIMARY_Y);
     lv_obj_clear_flag(s_mpu_chart, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    UI_Anim_StaggerIn(s_mpu_chart, 1U);
+    UI_Anim_StaggerIn(chart_card, 4U);
 
     for (i = 0U; i < 3U; ++i)
     {
         UI_ValueFollower_Reset(&s_mpu_angle_followers[i], 0);
     }
     s_mpu_last_chart_tick = HAL_GetTick();
+    s_mpu_sample_valid = 0xFFU;
 
-    lv_obj_t *btn = lv_btn_create(s_page_content);
-    lv_obj_set_size(btn, 0, 0); 
-    lv_obj_add_event_cb(btn, lvgl_app_mpu6500_event_cb, LV_EVENT_KEY, NULL);
-    lvgl_app_group_add_obj(btn);
-    lv_group_focus_obj(btn);
+    key_receiver = lv_btn_create(s_page_content);
+    lv_obj_set_size(key_receiver, 1, 1);
+    lv_obj_set_style_opa(key_receiver, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(key_receiver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(key_receiver,
+                      LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(key_receiver, lvgl_app_mpu6500_event_cb,
+                        LV_EVENT_KEY, NULL);
+    lvgl_app_group_add_obj(key_receiver);
+    lv_group_focus_obj(key_receiver);
 
-    if (s_mpu_timer == NULL) {
+    if (s_mpu_timer == NULL)
+    {
         s_mpu_timer = lv_timer_create(mpu6500_timer_cb, 50, NULL);
     }
 
-    lvgl_app_set_status("KEY2 or Left to go back");
+    lvgl_app_set_status(lvgl_app_tr(
+        "Live attitude | Left or KEY2 returns",
+        "实时姿态 | 左键或K2返回"));
     lvgl_app_page_finish();
 }
 
@@ -5751,7 +6622,8 @@ static void lvgl_app_show_ws2812_control(void)
 {
     lvgl_app_group_reset();
     s_status_label = NULL;
-    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_WS2812, "WS2812 RGB Control");
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_WS2812,
+                        lvgl_app_tr("WS2812 RGB Control", "WS2812灯光"));
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_WS2812;
 
@@ -5814,7 +6686,8 @@ static void lvgl_app_show_ws2812_control(void)
 
     lv_group_focus_obj(s_ws2812_slider_r);
 
-    lvgl_app_set_status("Select to edit, KEY2 to return");
+    lvgl_app_set_status(lvgl_app_tr(
+        "Select to edit, KEY2 to return", "选择后编辑 | K2返回"));
     lvgl_app_page_finish();
 }
 

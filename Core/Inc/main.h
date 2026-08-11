@@ -79,8 +79,8 @@ void Boot_DebugFlushStageLogsViaCdc(void);
 #define LED1_GPIO_Port GPIOC
 #define LED2_Pin GPIO_PIN_3
 #define LED2_GPIO_Port GPIOC
-#define OV_RESET_Pin GPIO_PIN_4
-#define OV_RESET_GPIO_Port GPIOC
+#define BUZZER_Pin GPIO_PIN_4
+#define BUZZER_GPIO_Port GPIOC
 #define SD_Pin GPIO_PIN_0
 #define SD_GPIO_Port GPIOB
 #define OV_PWDN_Pin GPIO_PIN_13

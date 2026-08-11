@@ -24,8 +24,8 @@
 #define UI_CAROUSEL_DISTANCE       18
 #define UI_CAROUSEL_TIME_MS       180U
 #define UI_SHARED_TIME_MS         190U
-#define UI_FOCUS_INDICATOR_WIDTH 5
-#define UI_FOCUS_SHIFT_X          3
+#define UI_FOCUS_INDICATOR_WIDTH 4
+#define UI_FOCUS_SHIFT_X          2
 #define UI_PRESS_SHIFT_Y          2
 #define UI_PRESS_BOUNCE_Y        -1
 #define UI_PRESS_OPA             LV_OPA_90

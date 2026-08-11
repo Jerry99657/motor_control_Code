@@ -66,7 +66,8 @@ typedef struct
   uint8_t sccb_nack_phase;
 } Camera_Diagnostics;
 
-/* Keep OV_RESET asserted and OV_PWDN enabled. Safe to call once GPIO is ready. */
+/* Keep OV_PWDN enabled. OV_RESET is owned by the camera carrier because PC4
+ * is assigned to the buzzer. Safe to call once GPIO is ready. */
 void Camera_Service_BootHold(void);
 
 /* Power up and configure OV5640 for 320x240 JPEG parallel output. */

@@ -29,6 +29,8 @@ void UI_Theme_ApplyFooter(lv_obj_t *obj);
 void UI_Theme_ApplyTitle(lv_obj_t *obj);
 void UI_Theme_ApplyStatus(lv_obj_t *obj);
 void UI_Theme_ApplyPanel(lv_obj_t *obj);
+void UI_Theme_ApplyList(lv_obj_t *obj);
+void UI_Theme_ApplyListItem(lv_obj_t *obj);
 void UI_Theme_ApplyControlRow(lv_obj_t *obj);
 void UI_Theme_ApplyDataCard(lv_obj_t *obj);
 void UI_Theme_ApplyValueBar(lv_obj_t *obj);

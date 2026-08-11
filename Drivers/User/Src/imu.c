@@ -2,26 +2,38 @@
 #include "mpu6500.h"
 
 #include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #define IMU_PI                         3.14159265358979323846f
 #define IMU_RAD_TO_DEG                 (180.0f / IMU_PI)
-#define IMU_GYRO_LSB_PER_DPS           16.4f
-#define IMU_ACCEL_1G_LSB               2048.0f
-#define IMU_ACCEL_LPF_ALPHA            0.35f
-#define IMU_ACCEL_TRUST_MIN_G          0.75f
-#define IMU_ACCEL_TRUST_MAX_G          1.25f
+#define IMU_DEG_TO_RAD                 (IMU_PI / 180.0f)
+#define IMU_ACCEL_LPF_CUTOFF_HZ        8.0f
+#define IMU_ACCEL_TRUST_FULL_ERROR_G   0.04f
+#define IMU_ACCEL_TRUST_ZERO_ERROR_G   0.20f
+#define IMU_INNOVATION_FULL_TRUST      0.035f
+#define IMU_INNOVATION_ZERO_TRUST      0.20f
 #define IMU_DEFAULT_DT_SECONDS         0.010f
 #define IMU_MIN_DT_SECONDS             0.001f
 #define IMU_MAX_DT_SECONDS             0.050f
 #define IMU_INTEGRAL_LIMIT             0.5f
+#define IMU_INTEGRAL_TRUST_MIN         0.75f
+#define IMU_CALIBRATION_SAMPLES        300U
+#define IMU_CALIBRATION_DELAY_MS       5U
+#define IMU_CALIBRATION_MIN_SAMPLES    80U
+#define IMU_CALIBRATION_MAX_GYRO_DPS   10.0f
+#define IMU_CALIBRATION_ACCEL_MIN_G    0.75f
+#define IMU_CALIBRATION_ACCEL_MAX_G    1.25f
+#define IMU_GYRO_ZERO_DEADBAND_DPS     0.10f
+#define IMU_ACCEL_ZERO_DEADBAND_G      0.020f
 
 quater_info_t g_q_info = {1.0f, 0.0f, 0.0f, 0.0f};
 
-float g_param_kp = 10.0f;
-float g_param_ki = 0.02f;
+float g_param_kp = 4.5f;
+float g_param_ki = 0.03f;
 
-short g_acc_avg[3] = {0, 0, 0};
-short g_gyro_avg[3] = {0, 0, 0};
+static float s_accel_offset[3] = {0.0f, 0.0f, 0.0f};
+static float s_gyro_bias[3] = {0.0f, 0.0f, 0.0f};
 
 static float s_accel_lpf[3] = {0.0f, 0.0f, 0.0f};
 static float s_integral_error[3] = {0.0f, 0.0f, 0.0f};
@@ -44,6 +56,13 @@ static float imu_clampf(float value, float minimum, float maximum)
     return value;
 }
 
+static int16_t imu_float_to_i16(float value)
+{
+    if (value > 32767.0f) return 32767;
+    if (value < -32768.0f) return -32768;
+    return (int16_t)lroundf(value);
+}
+
 static void imu_reset_fusion_state(void)
 {
     g_q_info.q0 = 1.0f;
@@ -61,9 +80,35 @@ static void imu_reset_fusion_state(void)
     s_last_wrapper_tick = 0U;
 }
 
-static void imu_data_transform(float *gx, float *gy, float *gz,
-                               float *ax, float *ay, float *az)
+static float imu_data_transform(float *gx, float *gy, float *gz,
+                                float *ax, float *ay, float *az,
+                                float dt_seconds)
 {
+    float accel_norm;
+    float accel_error_g;
+    float accel_trust;
+    float filter_tau;
+    float alpha;
+
+    accel_norm = sqrtf((*ax * *ax) + (*ay * *ay) + (*az * *az));
+    accel_error_g = fabsf((accel_norm / MPU6500_ACCEL_LSB_PER_G) - 1.0f);
+    if (accel_error_g <= IMU_ACCEL_TRUST_FULL_ERROR_G)
+    {
+        accel_trust = 1.0f;
+    }
+    else if (accel_error_g >= IMU_ACCEL_TRUST_ZERO_ERROR_G)
+    {
+        accel_trust = 0.0f;
+    }
+    else
+    {
+        accel_trust = (IMU_ACCEL_TRUST_ZERO_ERROR_G - accel_error_g) /
+                      (IMU_ACCEL_TRUST_ZERO_ERROR_G -
+                       IMU_ACCEL_TRUST_FULL_ERROR_G);
+    }
+
+    filter_tau = 1.0f / (2.0f * IMU_PI * IMU_ACCEL_LPF_CUTOFF_HZ);
+    alpha = imu_clampf(dt_seconds / (filter_tau + dt_seconds), 0.05f, 1.0f);
     if (s_accel_lpf_initialized == 0U)
     {
         s_accel_lpf[0] = *ax;
@@ -73,36 +118,37 @@ static void imu_data_transform(float *gx, float *gy, float *gz,
     }
     else
     {
-        s_accel_lpf[0] += IMU_ACCEL_LPF_ALPHA * (*ax - s_accel_lpf[0]);
-        s_accel_lpf[1] += IMU_ACCEL_LPF_ALPHA * (*ay - s_accel_lpf[1]);
-        s_accel_lpf[2] += IMU_ACCEL_LPF_ALPHA * (*az - s_accel_lpf[2]);
+        s_accel_lpf[0] += alpha * (*ax - s_accel_lpf[0]);
+        s_accel_lpf[1] += alpha * (*ay - s_accel_lpf[1]);
+        s_accel_lpf[2] += alpha * (*az - s_accel_lpf[2]);
     }
 
     *ax = s_accel_lpf[0];
     *ay = s_accel_lpf[1];
     *az = s_accel_lpf[2];
 
-    *gx = (*gx / IMU_GYRO_LSB_PER_DPS) * (IMU_PI / 180.0f);
-    *gy = (*gy / IMU_GYRO_LSB_PER_DPS) * (IMU_PI / 180.0f);
-    *gz = (*gz / IMU_GYRO_LSB_PER_DPS) * (IMU_PI / 180.0f);
+    *gx = (*gx / MPU6500_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD;
+    *gy = (*gy / MPU6500_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD;
+    *gz = (*gz / MPU6500_GYRO_LSB_PER_DPS) * IMU_DEG_TO_RAD;
+    return accel_trust;
 }
 
 static void imu_ahrsupdate_nomagnetic(float gx, float gy, float gz,
                                       float ax, float ay, float az,
-                                      float dt_seconds)
+                                      float dt_seconds,
+                                      float accel_trust)
 {
     float q0 = g_q_info.q0;
     float q1 = g_q_info.q1;
     float q2 = g_q_info.q2;
     float q3 = g_q_info.q3;
     float accel_norm_sq = ax * ax + ay * ay + az * az;
-    const float accel_min = IMU_ACCEL_1G_LSB * IMU_ACCEL_TRUST_MIN_G;
-    const float accel_max = IMU_ACCEL_1G_LSB * IMU_ACCEL_TRUST_MAX_G;
     float norm;
 
-    /* Acceleration is a gravity reference only while its magnitude is near 1 g. */
-    if ((accel_norm_sq >= accel_min * accel_min) &&
-        (accel_norm_sq <= accel_max * accel_max))
+    /* Fade gravity feedback continuously as linear acceleration grows. A hard
+     * trust window makes a vehicle attitude jump when acceleration crosses a
+     * threshold. */
+    if ((accel_trust > 0.0f) && (accel_norm_sq > 1.0f))
     {
         float vx;
         float vy;
@@ -110,6 +156,9 @@ static void imu_ahrsupdate_nomagnetic(float gx, float gy, float gz,
         float ex;
         float ey;
         float ez;
+        float innovation;
+        float innovation_trust;
+        float feedback_trust;
 
         norm = imu_inv_sqrt(accel_norm_sq);
         ax *= norm;
@@ -125,23 +174,57 @@ static void imu_ahrsupdate_nomagnetic(float gx, float gy, float gz,
         ey = az * vx - ax * vz;
         ez = ax * vy - ay * vx;
 
-        s_integral_error[0] = imu_clampf(s_integral_error[0] + dt_seconds * ex,
-                                        -IMU_INTEGRAL_LIMIT, IMU_INTEGRAL_LIMIT);
-        s_integral_error[1] = imu_clampf(s_integral_error[1] + dt_seconds * ey,
-                                        -IMU_INTEGRAL_LIMIT, IMU_INTEGRAL_LIMIT);
-        s_integral_error[2] = imu_clampf(s_integral_error[2] + dt_seconds * ez,
-                                        -IMU_INTEGRAL_LIMIT, IMU_INTEGRAL_LIMIT);
+        /* Magnitude gating alone misses horizontal vehicle acceleration: the
+         * norm of gravity plus 0.1 g sideways changes by only about 0.5%.
+         * Also fade correction when the measured and predicted gravity
+         * directions disagree, while retaining gyro propagation. */
+        innovation = sqrtf((ex * ex) + (ey * ey) + (ez * ez));
+        if (innovation <= IMU_INNOVATION_FULL_TRUST)
+        {
+            innovation_trust = 1.0f;
+        }
+        else if (innovation >= IMU_INNOVATION_ZERO_TRUST)
+        {
+            innovation_trust = 0.0f;
+        }
+        else
+        {
+            innovation_trust = (IMU_INNOVATION_ZERO_TRUST - innovation) /
+                (IMU_INNOVATION_ZERO_TRUST - IMU_INNOVATION_FULL_TRUST);
+        }
+        feedback_trust = accel_trust * innovation_trust * innovation_trust;
 
-        gx += g_param_kp * ex + g_param_ki * s_integral_error[0];
-        gy += g_param_kp * ey + g_param_ki * s_integral_error[1];
-        gz += g_param_kp * ez + g_param_ki * s_integral_error[2];
+        if (feedback_trust >= IMU_INTEGRAL_TRUST_MIN)
+        {
+            s_integral_error[0] = imu_clampf(
+                s_integral_error[0] + dt_seconds * feedback_trust * ex,
+                -IMU_INTEGRAL_LIMIT, IMU_INTEGRAL_LIMIT);
+            s_integral_error[1] = imu_clampf(
+                s_integral_error[1] + dt_seconds * feedback_trust * ey,
+                -IMU_INTEGRAL_LIMIT, IMU_INTEGRAL_LIMIT);
+        }
+        else
+        {
+            s_integral_error[0] *= (1.0f - dt_seconds);
+            s_integral_error[1] *= (1.0f - dt_seconds);
+        }
+        /* Gravity alone cannot observe heading. Never integrate a synthetic
+         * Z correction into yaw when no magnetometer is present. */
+        s_integral_error[2] = 0.0f;
+
+        gx += g_param_kp * feedback_trust * ex +
+              g_param_ki * s_integral_error[0];
+        gy += g_param_kp * feedback_trust * ey +
+              g_param_ki * s_integral_error[1];
+        gz += g_param_kp * feedback_trust * ez;
     }
     else
     {
         /* Do not tilt the attitude toward transient linear acceleration. */
-        s_integral_error[0] *= 0.98f;
-        s_integral_error[1] *= 0.98f;
-        s_integral_error[2] *= 0.98f;
+        float decay = imu_clampf(1.0f - (2.0f * dt_seconds), 0.0f, 1.0f);
+        s_integral_error[0] *= decay;
+        s_integral_error[1] *= decay;
+        s_integral_error[2] = 0.0f;
     }
 
     {
@@ -181,14 +264,17 @@ eulerian_angles_t imu_update_eulerian_angles(float gx, float gy, float gz,
     float q2;
     float q3;
     float pitch_sine;
+    float accel_trust;
 
     if ((dt_seconds < IMU_MIN_DT_SECONDS) || (dt_seconds > IMU_MAX_DT_SECONDS))
     {
         dt_seconds = IMU_DEFAULT_DT_SECONDS;
     }
 
-    imu_data_transform(&gx, &gy, &gz, &ax, &ay, &az);
-    imu_ahrsupdate_nomagnetic(gx, gy, gz, ax, ay, az, dt_seconds);
+    accel_trust = imu_data_transform(&gx, &gy, &gz, &ax, &ay, &az,
+                                     dt_seconds);
+    imu_ahrsupdate_nomagnetic(gx, gy, gz, ax, ay, az, dt_seconds,
+                              accel_trust);
 
     q0 = g_q_info.q0;
     q1 = g_q_info.q1;
@@ -223,62 +309,134 @@ eulerian_angles_t imu_get_eulerian_angles(float gx, float gy, float gz,
 void imu_data_calibration(short *gx, short *gy, short *gz,
                           short *ax, short *ay, short *az)
 {
-    *gx -= g_gyro_avg[0];
-    *gy -= g_gyro_avg[1];
-    *gz -= g_gyro_avg[2];
-    *ax -= g_acc_avg[0];
-    *ay -= g_acc_avg[1];
-    *az -= (g_acc_avg[2] - (short)IMU_ACCEL_1G_LSB);
+    const int16_t gyro_deadband = (int16_t)
+        (MPU6500_GYRO_LSB_PER_DPS * IMU_GYRO_ZERO_DEADBAND_DPS + 0.5f);
+    const int16_t accel_deadband = (int16_t)
+        (MPU6500_ACCEL_LSB_PER_G * IMU_ACCEL_ZERO_DEADBAND_G + 0.5f);
 
-    if ((*gx >= -15) && (*gx <= 15)) *gx = 0;
-    if ((*gy >= -15) && (*gy <= 15)) *gy = 0;
-    if ((*gz >= -15) && (*gz <= 15)) *gz = 0;
+    *gx = imu_float_to_i16((float)*gx - s_gyro_bias[0]);
+    *gy = imu_float_to_i16((float)*gy - s_gyro_bias[1]);
+    *gz = imu_float_to_i16((float)*gz - s_gyro_bias[2]);
+    *ax = imu_float_to_i16((float)*ax - s_accel_offset[0]);
+    *ay = imu_float_to_i16((float)*ay - s_accel_offset[1]);
+    *az = imu_float_to_i16((float)*az - s_accel_offset[2]);
+
+    /* Express the deadbands in physical units so changing sensor range never
+     * changes their real meaning. The previous implementation removed this
+     * step, allowing 2-3 raw gyro counts to accumulate into visible yaw. */
+    if (abs((int)*gx) <= gyro_deadband) *gx = 0;
+    if (abs((int)*gy) <= gyro_deadband) *gy = 0;
+    if (abs((int)*gz) <= gyro_deadband) *gz = 0;
+
+    /* The robot is calibrated around its boot-time chassis plane. Suppress
+     * residual acceleration below 0.02 g (about 1.1 degrees) in the published
+     * raw channels; larger tilt/acceleration remains fully measurable. */
+    if (abs((int)*ax) <= accel_deadband) *ax = 0;
+    if (abs((int)*ay) <= accel_deadband) *ay = 0;
+    if (abs((int)*az - MPU6500_ACCEL_1G_LSB) <= accel_deadband)
+    {
+        *az = MPU6500_ACCEL_1G_LSB;
+    }
+}
+
+void imu_adapt_gyro_bias(short raw_gx, short raw_gy, short raw_gz,
+                         float gain)
+{
+    gain = imu_clampf(gain, 0.0f, 0.01f);
+    s_gyro_bias[0] += gain * ((float)raw_gx - s_gyro_bias[0]);
+    s_gyro_bias[1] += gain * ((float)raw_gy - s_gyro_bias[1]);
+    s_gyro_bias[2] += gain * ((float)raw_gz - s_gyro_bias[2]);
 }
 
 void imu_init(void)
 {
     uint16_t i;
     uint16_t sample_count = 0U;
-    int32_t acc_sum[3] = {0, 0, 0};
-    int32_t gyro_sum[3] = {0, 0, 0};
+    int64_t acc_sum[3] = {0, 0, 0};
+    int64_t gyro_sum[3] = {0, 0, 0};
+    int16_t acc_min[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
+    int16_t acc_max[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
+    int16_t gyro_min[3] = {INT16_MAX, INT16_MAX, INT16_MAX};
+    int16_t gyro_max[3] = {INT16_MIN, INT16_MIN, INT16_MIN};
     short acc_data[3];
     short gyro_data[3];
+    int64_t accel_norm_sq;
+    const int32_t accel_min =
+        (int32_t)(MPU6500_ACCEL_LSB_PER_G * IMU_CALIBRATION_ACCEL_MIN_G);
+    const int32_t accel_max =
+        (int32_t)(MPU6500_ACCEL_LSB_PER_G * IMU_CALIBRATION_ACCEL_MAX_G);
+    const int32_t gyro_limit =
+        (int32_t)(MPU6500_GYRO_LSB_PER_DPS * IMU_CALIBRATION_MAX_GYRO_DPS);
+    uint8_t axis;
 
-    g_acc_avg[0] = 0;
-    g_acc_avg[1] = 0;
-    g_acc_avg[2] = 0;
-    g_gyro_avg[0] = 0;
-    g_gyro_avg[1] = 0;
-    g_gyro_avg[2] = 0;
+    s_accel_offset[0] = 0.0f;
+    s_accel_offset[1] = 0.0f;
+    s_accel_offset[2] = 0.0f;
+    s_gyro_bias[0] = 0.0f;
+    s_gyro_bias[1] = 0.0f;
+    s_gyro_bias[2] = 0.0f;
     imu_reset_fusion_state();
 
     HAL_Delay(100U);
-    for (i = 0U; i < 250U; ++i)
+    for (i = 0U; i < IMU_CALIBRATION_SAMPLES; ++i)
     {
         if (MPU6500_GetData(&acc_data[0], &acc_data[1], &acc_data[2],
                             &gyro_data[0], &gyro_data[1], &gyro_data[2]) != HAL_OK)
         {
-            HAL_Delay(5U);
+            HAL_Delay(IMU_CALIBRATION_DELAY_MS);
             continue;
         }
 
-        acc_sum[0] += acc_data[0];
-        acc_sum[1] += acc_data[1];
-        acc_sum[2] += acc_data[2];
-        gyro_sum[0] += gyro_data[0];
-        gyro_sum[1] += gyro_data[1];
-        gyro_sum[2] += gyro_data[2];
+        accel_norm_sq = (int64_t)acc_data[0] * acc_data[0] +
+                        (int64_t)acc_data[1] * acc_data[1] +
+                        (int64_t)acc_data[2] * acc_data[2];
+        if ((accel_norm_sq < ((int64_t)accel_min * accel_min)) ||
+            (accel_norm_sq > ((int64_t)accel_max * accel_max)) ||
+            ((int32_t)abs(gyro_data[0]) > gyro_limit) ||
+            ((int32_t)abs(gyro_data[1]) > gyro_limit) ||
+            ((int32_t)abs(gyro_data[2]) > gyro_limit))
+        {
+            HAL_Delay(IMU_CALIBRATION_DELAY_MS);
+            continue;
+        }
+
+        for (axis = 0U; axis < 3U; ++axis)
+        {
+            acc_sum[axis] += acc_data[axis];
+            gyro_sum[axis] += gyro_data[axis];
+            if (acc_data[axis] < acc_min[axis]) acc_min[axis] = acc_data[axis];
+            if (acc_data[axis] > acc_max[axis]) acc_max[axis] = acc_data[axis];
+            if (gyro_data[axis] < gyro_min[axis]) gyro_min[axis] = gyro_data[axis];
+            if (gyro_data[axis] > gyro_max[axis]) gyro_max[axis] = gyro_data[axis];
+        }
         sample_count++;
-        HAL_Delay(5U);
+        HAL_Delay(IMU_CALIBRATION_DELAY_MS);
     }
 
-    if (sample_count != 0U)
+    if (sample_count >= IMU_CALIBRATION_MIN_SAMPLES)
     {
-        g_acc_avg[0] = (short)(acc_sum[0] / sample_count);
-        g_acc_avg[1] = (short)(acc_sum[1] / sample_count);
-        g_acc_avg[2] = (short)(acc_sum[2] / sample_count);
-        g_gyro_avg[0] = (short)(gyro_sum[0] / sample_count);
-        g_gyro_avg[1] = (short)(gyro_sum[1] / sample_count);
-        g_gyro_avg[2] = (short)(gyro_sum[2] / sample_count);
+        uint16_t divisor = sample_count;
+
+        /* Remove one high and one low sample per axis. This inexpensive
+         * trimmed mean prevents a single vibration spike from becoming a
+         * permanent boot-time offset. */
+        if (sample_count > 2U)
+        {
+            divisor = (uint16_t)(sample_count - 2U);
+            for (axis = 0U; axis < 3U; ++axis)
+            {
+                acc_sum[axis] -= (int64_t)acc_min[axis] + acc_max[axis];
+                gyro_sum[axis] -= (int64_t)gyro_min[axis] + gyro_max[axis];
+            }
+        }
+
+        for (axis = 0U; axis < 3U; ++axis)
+        {
+            s_gyro_bias[axis] = (float)gyro_sum[axis] / (float)divisor;
+        }
+        s_accel_offset[0] = (float)acc_sum[0] / (float)divisor;
+        s_accel_offset[1] = (float)acc_sum[1] / (float)divisor;
+        s_accel_offset[2] = ((float)acc_sum[2] / (float)divisor) -
+                            MPU6500_ACCEL_LSB_PER_G;
     }
 }

@@ -35,10 +35,11 @@ uint8_t MPU6500_Init(void) {
     MPU6500_WriteReg(MPU6500_PWR_MGMT_1, 0x01); // Wakeup, clock=x gyro
     HAL_Delay(10);
     MPU6500_WriteReg(MPU6500_PWR_MGMT_2, 0x00);
-    MPU6500_WriteReg(MPU6500_SMPLRT_DIV, 0x09); // 100Hz
-    MPU6500_WriteReg(MPU6500_CONFIG, 0x06);     // LPF
-    MPU6500_WriteReg(MPU6500_GYRO_CONFIG, 0x18);// 2000dps
-    MPU6500_WriteReg(MPU6500_ACCEL_CONFIG, 0x18);// 16g
+    MPU6500_WriteReg(MPU6500_SMPLRT_DIV, 0x09);  // 1 kHz / 10 = 100 Hz
+    MPU6500_WriteReg(MPU6500_CONFIG, 0x03);      // Gyro DLPF about 41 Hz
+    MPU6500_WriteReg(MPU6500_GYRO_CONFIG, 0x08); // +/-500 dps, 65.5 LSB/dps
+    MPU6500_WriteReg(MPU6500_ACCEL_CONFIG, 0x08);// +/-4 g, 8192 LSB/g
+    MPU6500_WriteReg(MPU6500_ACCEL_CONFIG_2, 0x03); // Accel DLPF about 44.8 Hz
     MPU6500_WriteReg(0x37, 0x02); // INT_PIN_CFG: BYPASS_EN=1 (often needed to stabilize I2C access on ICM20608)
     return who_am_i; // Return the ID
 }

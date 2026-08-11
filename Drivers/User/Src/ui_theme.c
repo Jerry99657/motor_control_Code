@@ -7,6 +7,11 @@ static lv_style_t s_footer_style;
 static lv_style_t s_title_style;
 static lv_style_t s_status_style;
 static lv_style_t s_panel_style;
+static lv_style_t s_list_style;
+static lv_style_t s_list_item_style;
+static lv_style_t s_list_item_focused_style;
+static lv_style_t s_list_item_pressed_style;
+static lv_style_t s_list_item_disabled_style;
 static lv_style_t s_control_row_style;
 static lv_style_t s_data_card_style;
 static lv_style_t s_value_bar_style;
@@ -40,9 +45,11 @@ void UI_Theme_Init(lv_disp_t *disp)
     lv_style_set_pad_all(&s_page_style, 0);
 
     lv_style_init(&s_header_style);
-    lv_style_set_bg_color(&s_header_style, lv_color_hex(0x173B67));
+    lv_style_set_bg_color(&s_header_style, lv_color_hex(0x477A9C));
     lv_style_set_bg_opa(&s_header_style, LV_OPA_COVER);
-    lv_style_set_border_width(&s_header_style, 0);
+    lv_style_set_border_color(&s_header_style, lv_color_hex(0x8FB7D1));
+    lv_style_set_border_width(&s_header_style, 1);
+    lv_style_set_border_side(&s_header_style, LV_BORDER_SIDE_BOTTOM);
     lv_style_set_radius(&s_header_style, 0);
     lv_style_set_pad_all(&s_header_style, 0);
 
@@ -63,7 +70,8 @@ void UI_Theme_Init(lv_disp_t *disp)
     lv_style_set_pad_all(&s_footer_style, 0);
 
     lv_style_init(&s_title_style);
-    lv_style_set_text_color(&s_title_style, lv_color_white());
+    lv_style_set_text_color(&s_title_style, lv_color_hex(0xF7FBFF));
+    lv_style_set_text_font(&s_title_style, &lv_font_montserrat_16);
     lv_style_set_text_align(&s_title_style, LV_TEXT_ALIGN_LEFT);
 
     lv_style_init(&s_status_style);
@@ -76,8 +84,64 @@ void UI_Theme_Init(lv_disp_t *disp)
     lv_style_set_bg_opa(&s_panel_style, LV_OPA_COVER);
     lv_style_set_border_color(&s_panel_style, lv_color_hex(0xCBD5E1));
     lv_style_set_border_width(&s_panel_style, 1);
-    lv_style_set_radius(&s_panel_style, 7);
+    lv_style_set_radius(&s_panel_style, 10);
     lv_style_set_pad_all(&s_panel_style, 2);
+
+    lv_style_init(&s_list_style);
+    lv_style_set_bg_opa(&s_list_style, LV_OPA_TRANSP);
+    lv_style_set_border_width(&s_list_style, 0);
+    lv_style_set_outline_width(&s_list_style, 0);
+    lv_style_set_shadow_width(&s_list_style, 0);
+    lv_style_set_radius(&s_list_style, 0);
+    lv_style_set_pad_all(&s_list_style, 4);
+    lv_style_set_pad_row(&s_list_style, 4);
+
+    lv_style_init(&s_list_item_style);
+    lv_style_set_bg_color(&s_list_item_style, lv_color_white());
+    lv_style_set_bg_opa(&s_list_item_style, LV_OPA_COVER);
+    lv_style_set_text_color(&s_list_item_style, lv_color_hex(0x24364B));
+    lv_style_set_text_font(&s_list_item_style, &lv_font_montserrat_16);
+    lv_style_set_border_width(&s_list_item_style, 0);
+    lv_style_set_radius(&s_list_item_style, 8);
+    lv_style_set_outline_color(&s_list_item_style, lv_color_hex(0xD8E3EE));
+    lv_style_set_outline_width(&s_list_item_style, 1);
+    lv_style_set_outline_pad(&s_list_item_style, 0);
+    lv_style_set_shadow_width(&s_list_item_style, 0);
+    lv_style_set_pad_left(&s_list_item_style, 8);
+    lv_style_set_pad_right(&s_list_item_style, 8);
+    lv_style_set_pad_top(&s_list_item_style, 7);
+    lv_style_set_pad_bottom(&s_list_item_style, 7);
+    lv_style_set_transform_width(&s_list_item_style, 0);
+    lv_style_set_transform_height(&s_list_item_style, 0);
+
+    lv_style_init(&s_list_item_focused_style);
+    lv_style_set_bg_color(&s_list_item_focused_style, lv_color_hex(0xC9E5FA));
+    lv_style_set_bg_opa(&s_list_item_focused_style, LV_OPA_COVER);
+    lv_style_set_text_color(&s_list_item_focused_style, lv_color_hex(0x123A5A));
+    lv_style_set_outline_color(&s_list_item_focused_style, lv_color_hex(0x70B7E8));
+    lv_style_set_outline_width(&s_list_item_focused_style, 1);
+    lv_style_set_outline_pad(&s_list_item_focused_style, 0);
+    lv_style_set_shadow_width(&s_list_item_focused_style, 0);
+    lv_style_set_transform_width(&s_list_item_focused_style, 0);
+    lv_style_set_transform_height(&s_list_item_focused_style, 0);
+
+    lv_style_init(&s_list_item_pressed_style);
+    lv_style_set_bg_color(&s_list_item_pressed_style, lv_color_hex(0xB8DDF8));
+    lv_style_set_bg_opa(&s_list_item_pressed_style, LV_OPA_COVER);
+    lv_style_set_text_color(&s_list_item_pressed_style, lv_color_hex(0x102A43));
+    lv_style_set_outline_color(&s_list_item_pressed_style, lv_color_hex(0x4E9FD8));
+    lv_style_set_outline_width(&s_list_item_pressed_style, 1);
+    lv_style_set_shadow_width(&s_list_item_pressed_style, 0);
+    lv_style_set_transform_width(&s_list_item_pressed_style, 0);
+    lv_style_set_transform_height(&s_list_item_pressed_style, 0);
+
+    lv_style_init(&s_list_item_disabled_style);
+    lv_style_set_bg_color(&s_list_item_disabled_style, lv_color_hex(0xEEF2F6));
+    lv_style_set_bg_opa(&s_list_item_disabled_style, LV_OPA_COVER);
+    lv_style_set_text_color(&s_list_item_disabled_style, lv_color_hex(0x98A2B3));
+    lv_style_set_outline_color(&s_list_item_disabled_style, lv_color_hex(0xD8E0E8));
+    lv_style_set_outline_width(&s_list_item_disabled_style, 1);
+    lv_style_set_shadow_width(&s_list_item_disabled_style, 0);
 
     lv_style_init(&s_control_row_style);
     lv_style_set_bg_color(&s_control_row_style, lv_color_white());
@@ -85,14 +149,14 @@ void UI_Theme_Init(lv_disp_t *disp)
     lv_style_set_border_width(&s_control_row_style, 0);
     lv_style_set_shadow_width(&s_control_row_style, 0);
     lv_style_set_outline_width(&s_control_row_style, 0);
-    lv_style_set_radius(&s_control_row_style, 5);
+    lv_style_set_radius(&s_control_row_style, 8);
     lv_style_set_pad_all(&s_control_row_style, 0);
 
     lv_style_init(&s_data_card_style);
     lv_style_set_bg_color(&s_data_card_style, lv_color_white());
     lv_style_set_bg_opa(&s_data_card_style, LV_OPA_COVER);
     lv_style_set_border_width(&s_data_card_style, 0);
-    lv_style_set_radius(&s_data_card_style, 6);
+    lv_style_set_radius(&s_data_card_style, 8);
     lv_style_set_shadow_width(&s_data_card_style, 0);
     lv_style_set_outline_color(&s_data_card_style, lv_color_hex(0xD6DFEA));
     lv_style_set_outline_width(&s_data_card_style, 1);
@@ -147,6 +211,39 @@ void UI_Theme_ApplyStatus(lv_obj_t *obj)
 void UI_Theme_ApplyPanel(lv_obj_t *obj)
 {
     lv_obj_add_style(obj, &s_panel_style, LV_PART_MAIN);
+}
+
+void UI_Theme_ApplyList(lv_obj_t *obj)
+{
+    lv_obj_add_style(obj, &s_list_style, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(obj, lv_color_hex(0xAFC4D8), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_50, LV_PART_SCROLLBAR);
+    lv_obj_set_style_radius(obj, LV_RADIUS_CIRCLE, LV_PART_SCROLLBAR);
+    lv_obj_set_style_width(obj, 3, LV_PART_SCROLLBAR);
+    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_AUTO);
+}
+
+void UI_Theme_ApplyListItem(lv_obj_t *obj)
+{
+    lv_obj_add_style(obj, &s_list_item_style, LV_PART_MAIN);
+    lv_obj_add_style(obj, &s_list_item_focused_style,
+                     LV_PART_MAIN | LV_STATE_FOCUSED);
+    /* Keypad/encoder focus adds FOCUS_KEY in addition to FOCUSED.  The
+     * default theme has a saturated-blue list style on that state, so cover
+     * both the standalone and combined selectors explicitly. */
+    lv_obj_add_style(obj, &s_list_item_focused_style,
+                     LV_PART_MAIN | LV_STATE_FOCUS_KEY);
+    lv_obj_add_style(obj, &s_list_item_focused_style,
+                     LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_FOCUS_KEY);
+    lv_obj_add_style(obj, &s_list_item_pressed_style,
+                     LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_add_style(obj, &s_list_item_pressed_style,
+                     LV_PART_MAIN | LV_STATE_FOCUSED | LV_STATE_PRESSED);
+    lv_obj_add_style(obj, &s_list_item_pressed_style,
+                     LV_PART_MAIN | LV_STATE_FOCUSED |
+                         LV_STATE_FOCUS_KEY | LV_STATE_PRESSED);
+    lv_obj_add_style(obj, &s_list_item_disabled_style,
+                     LV_PART_MAIN | LV_STATE_DISABLED);
 }
 
 void UI_Theme_ApplyControlRow(lv_obj_t *obj)

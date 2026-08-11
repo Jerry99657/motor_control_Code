@@ -46,6 +46,7 @@
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
 #include "lvgl_app.h"
+#include "ui_settings.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -1176,6 +1177,9 @@ int main(void)
   Boot_LogStatus("BOOT: TIM7 init=", g_tim7_init_ok);
   QSPI_BootInit();
   Boot_LogStatus("BOOT: QSPI init=", g_qspi_init_status);
+  /* USER CODE: persistent display/key settings live in two reserved W25Q64
+   * sectors.  Apply rotation before any direct LCD animation is shown. */
+  UI_Settings_Init((g_qspi_init_status == QSPI_W25QXX_OK) ? 1U : 0U);
   if (Boot_ShouldEnterAnimDownloadMode() == 1U)
   {
     LCD_ShowDownloadScreen();
@@ -2568,7 +2572,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, LED1_Pin|LED2_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OV_PWDN_GPIO_Port, OV_PWDN_Pin, GPIO_PIN_SET);
@@ -2595,12 +2599,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : OV_RESET_Pin */
-  GPIO_InitStruct.Pin = OV_RESET_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+  /*Configure GPIO pin : BUZZER_Pin */
+  GPIO_InitStruct.Pin = BUZZER_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OV_RESET_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(BUZZER_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : SD_Pin Key2_Pin Key3_Pin */
   GPIO_InitStruct.Pin = SD_Pin|Key2_Pin|Key3_Pin;
@@ -2653,6 +2657,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   if (htim->Instance == TIM6)
   {
     lv_tick_inc(1);
+    UI_Settings_BuzzerTick1ms();
   }
   else if (htim->Instance == TIM7)
   {

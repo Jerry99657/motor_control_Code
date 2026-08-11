@@ -7,9 +7,8 @@
 #include <string.h>
 
 #define CAMERA_OV5640_I2C_ADDRESS       0x78U
-#define CAMERA_RESET_ASSERT_MS          2U
 #define CAMERA_PWDN_RELEASE_MS          10U
-#define CAMERA_RESET_RELEASE_MS         20U
+#define CAMERA_SENSOR_WAKE_MS           20U
 #define CAMERA_AE_SETTLE_MS             100U
 #define CAMERA_DMA_WORD_COUNT           (CAMERA_JPEG_BUFFER_CAPACITY / sizeof(uint32_t))
 #define CAMERA_SCCB_SCL_PIN              GPIO_PIN_14
@@ -69,8 +68,6 @@ static uint8_t Camera_SCCB_WriteByte(uint8_t value);
 static uint8_t Camera_SCCB_ReadByte(void);
 static void Camera_SCCB_SendAck(uint8_t nack);
 static void Camera_RecordSCCBStatus(uint8_t success);
-static void Camera_ResetAssert(void);
-static void Camera_ResetRelease(void);
 static void Camera_HoldPins(void);
 static void Camera_StopHardware(void);
 static Camera_Result Camera_FinishCapture(void);
@@ -97,36 +94,6 @@ static void Camera_RecordSCCBStatus(uint8_t success)
                                  CAMERA_SCCB_SCL_PIN) == GPIO_PIN_SET) ? 1U : 0U;
   s_sda_level = (HAL_GPIO_ReadPin(CAMERA_SCCB_GPIO_PORT,
                                  CAMERA_SCCB_SDA_PIN) == GPIO_PIN_SET) ? 1U : 0U;
-}
-
-static void Camera_ResetAssert(void)
-{
-  GPIO_InitTypeDef gpio = {0};
-
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  /* PC4 is wired directly to the sensor-side OV_RESET net.  Assert it only by
-     sinking current; the camera board supplies the high level from DOVDD_2V8. */
-  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_RESET);
-  gpio.Pin = OV_RESET_Pin;
-  gpio.Mode = GPIO_MODE_OUTPUT_OD;
-  gpio.Pull = GPIO_NOPULL;
-  gpio.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OV_RESET_GPIO_Port, &gpio);
-}
-
-static void Camera_ResetRelease(void)
-{
-  GPIO_InitTypeDef gpio = {0};
-
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  /* Writing SET to an open-drain output releases PC4.  R3 on the camera board
-     must then pull OV_RESET to DOVDD_2V8; do not inject a 3.3 V high level. */
-  HAL_GPIO_WritePin(OV_RESET_GPIO_Port, OV_RESET_Pin, GPIO_PIN_SET);
-  gpio.Pin = OV_RESET_Pin;
-  gpio.Mode = GPIO_MODE_OUTPUT_OD;
-  gpio.Pull = GPIO_NOPULL;
-  gpio.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(OV_RESET_GPIO_Port, &gpio);
 }
 
 static void Camera_SCCB_DelayUs(uint32_t delay_us)
@@ -501,9 +468,10 @@ static int32_t Camera_Bus_GetTick(void)
 
 static void Camera_HoldPins(void)
 {
-  /* Power-down first, then assert the sensor's active-low OV_RESET net. */
+  /* PC4 is now the buzzer output.  The camera carrier owns OV_RESET through
+   * its 2.8 V pull-up/RC network, so software sleep is controlled only with
+   * the dedicated PWDN signal. */
   HAL_GPIO_WritePin(OV_PWDN_GPIO_Port, OV_PWDN_Pin, GPIO_PIN_SET);
-  Camera_ResetAssert();
 }
 
 void Camera_Service_BootHold(void)
@@ -561,7 +529,7 @@ Camera_Result Camera_Service_Init(void)
   }
 
   Camera_HoldPins();
-  HAL_Delay(CAMERA_RESET_ASSERT_MS);
+  HAL_Delay(2U);
   if (Camera_I2C_Recover() != HAL_OK)
   {
     s_last_result = CAMERA_RESULT_I2C;
@@ -569,31 +537,17 @@ Camera_Result Camera_Service_Init(void)
     return s_last_result;
   }
 
-  /* Leave power-down, then release RESET to the board's 2.8 V pull-up. */
+  /* Leave power-down. RESET is owned by the camera carrier's 2.8 V RC reset
+   * circuit and must no longer be driven through PC4 (the buzzer output). */
   HAL_GPIO_WritePin(OV_PWDN_GPIO_Port, OV_PWDN_Pin, GPIO_PIN_RESET);
   HAL_Delay(CAMERA_PWDN_RELEASE_MS);
-  Camera_ResetRelease();
-  HAL_Delay(CAMERA_RESET_RELEASE_MS);
+  HAL_Delay(CAMERA_SENSOR_WAKE_MS);
   s_pwdn_active_level =
     (HAL_GPIO_ReadPin(OV_PWDN_GPIO_Port, OV_PWDN_Pin) == GPIO_PIN_SET) ? 1U : 0U;
-  s_reset_release_level =
-    (HAL_GPIO_ReadPin(OV_RESET_GPIO_Port, OV_RESET_Pin) == GPIO_PIN_SET) ? 1U : 0U;
+  /* Diagnostic R1 now means the carrier-managed RESET is assumed released. */
+  s_reset_release_level = 1U;
   s_sensor_active = 1U;
   s_init_stage = CAMERA_INIT_STAGE_I2C_PROBE;
-
-  /* Do not attempt SCCB while RESET is physically low.  Preserve the sampled
-     P/R levels so the UI reports the electrical cause after hardware is put
-     back into its safe sleep state. */
-  if (s_reset_release_level == 0U)
-  {
-    s_i2c_error = HAL_I2C_ERROR_AF;
-    s_i2c_state = HAL_I2C_STATE_READY;
-    s_sccb_nack_phase = 0U;
-    s_last_result = CAMERA_RESULT_I2C;
-    Camera_StopHardware();
-    s_state = CAMERA_STATE_ERROR;
-    return s_last_result;
-  }
 
   io.Init = Camera_Bus_Init;
   io.DeInit = Camera_Bus_DeInit;
