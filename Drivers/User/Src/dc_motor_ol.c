@@ -1,4 +1,7 @@
 #include "dc_motor_ol.h"
+#include "safety_manager.h"
+
+#include <string.h>
 
 extern TIM_HandleTypeDef htim1;
 extern TIM_HandleTypeDef htim2;
@@ -18,6 +21,10 @@ extern TIM_HandleTypeDef htim5;
 #define DC_MOTOR_ENCODER_LEARN_MIN_DUTY     3
 #define DC_MOTOR_ENCODER_LEARN_MIN_DELTA    1L
 #define DC_MOTOR_ENCODER_LEARN_CYCLES       3U
+#define DC_MOTOR_DIAG_MIN_TARGET_RPM         60
+#define DC_MOTOR_DIAG_MIN_DUTY_PERCENT       15
+#define DC_MOTOR_DIAG_MAX_STILL_RPM          5
+#define DC_MOTOR_DIAG_SUSPECT_TICKS          50U
 
 #define DC_MOTOR_POS_KP                     0.5f
 #define DC_MOTOR_POS_KI                     0.0f
@@ -80,6 +87,15 @@ static volatile uint8_t s_pending_stop_all = 0U;
 static int8_t s_encoder_polarity[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static int8_t s_encoder_polarity_candidate[DC_MOTOR_COUNT] = {0, 0, 0, 0};
 static uint8_t s_encoder_polarity_confidence[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static uint16_t s_encoder_suspect_ticks[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static uint32_t s_encoder_suspect_events[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static uint32_t s_max_speed_error_rpm[DC_MOTOR_COUNT] = {0, 0, 0, 0};
+static uint8_t s_encoder_suspect_mask = 0U;
+
+static uint32_t dc_motor_abs_i32(int32_t value)
+{
+    return (value < 0) ? (uint32_t)(-(int64_t)value) : (uint32_t)value;
+}
 
 static int16_t dc_motor_clamp_speed(int16_t speed)
 {
@@ -231,6 +247,13 @@ static void dc_motor_apply_output(uint8_t index, int16_t speed)
     uint32_t compare;
 
     speed = dc_motor_clamp_speed(speed);
+    /* Last software barrier before TIM1 CCR is modified.  High-level state or
+     * a stale queued command can never bypass a latched safety stop. */
+    if ((speed != 0) && (Safety_IsMotionAllowed() == 0U))
+    {
+        Safety_RecordOutputBlocked();
+        speed = 0;
+    }
     s_applied_duty_percent[index] = speed;
 
     if (speed >= 0)
@@ -350,6 +373,9 @@ HAL_StatusTypeDef DCMotor_OL_Init(void)
         s_encoder_polarity[i] = 0;
         s_encoder_polarity_candidate[i] = 0;
         s_encoder_polarity_confidence[i] = 0U;
+        s_encoder_suspect_ticks[i] = 0U;
+        s_encoder_suspect_events[i] = 0U;
+        s_max_speed_error_rpm[i] = 0U;
         s_pos_pid_integral[i] = 0.0f;
         s_pos_pid_prev_error[i] = 0.0f;
         s_control_mode[i] = DCMOTOR_CONTROL_MODE_SPEED;
@@ -422,6 +448,8 @@ void DCMotor_OL_StopAll(void)
         s_target_pulses[i] = s_measured_pulses[i];
         dc_motor_apply_output(i, 0);
     }
+
+    s_encoder_suspect_mask = 0U;
 
     s_pending_speed_mask = 0U;
     s_pending_stop_all = 0U;
@@ -543,6 +571,51 @@ void DCMotor_OL_Tick10ms(void)
         s_filtered_rpm[i] = DC_MOTOR_SPEED_LPF_ALPHA * (float)measured_rpm
                           + (1.0f - DC_MOTOR_SPEED_LPF_ALPHA) * s_filtered_rpm[i];
 
+        {
+            uint32_t speed_error = dc_motor_abs_i32(
+                s_target_rpm[i] - (int32_t)s_filtered_rpm[i]);
+            uint8_t suspect = 0U;
+
+            if (speed_error > s_max_speed_error_rpm[i])
+            {
+                s_max_speed_error_rpm[i] = speed_error;
+            }
+
+            /* Observation only: no fault is raised until real vehicle data
+             * has established reliable thresholds. */
+            if ((dc_motor_abs_i32(s_target_rpm[i]) >= DC_MOTOR_DIAG_MIN_TARGET_RPM) &&
+                (dc_motor_abs_i32((int32_t)s_filtered_rpm[i]) <= DC_MOTOR_DIAG_MAX_STILL_RPM) &&
+                (dc_motor_abs_i32(s_applied_duty_percent[i]) >=
+                 DC_MOTOR_DIAG_MIN_DUTY_PERCENT))
+            {
+                if (s_encoder_suspect_ticks[i] < UINT16_MAX)
+                {
+                    s_encoder_suspect_ticks[i]++;
+                }
+                if (s_encoder_suspect_ticks[i] >= DC_MOTOR_DIAG_SUSPECT_TICKS)
+                {
+                    suspect = 1U;
+                    if (s_encoder_suspect_ticks[i] == DC_MOTOR_DIAG_SUSPECT_TICKS)
+                    {
+                        s_encoder_suspect_events[i]++;
+                    }
+                }
+            }
+            else
+            {
+                s_encoder_suspect_ticks[i] = 0U;
+            }
+
+            if (suspect != 0U)
+            {
+                s_encoder_suspect_mask |= (uint8_t)(1U << i);
+            }
+            else
+            {
+                s_encoder_suspect_mask &= (uint8_t)~(uint8_t)(1U << i);
+            }
+        }
+
         if (s_control_mode[i] == DCMOTOR_CONTROL_MODE_POSITION)
         {
             s_target_rpm[i] = dc_motor_pos_pid_update(i, s_target_pulses[i], s_measured_pulses[i]);
@@ -642,4 +715,32 @@ int8_t DCMotor_OL_GetEncoderPolarity(uint8_t motor_index)
     }
 
     return s_encoder_polarity[motor_index - 1U];
+}
+
+void DCMotor_OL_GetDiagnostics(DCMotorDiagnostics *diagnostics)
+{
+    uint8_t i;
+    uint32_t primask;
+
+    if (diagnostics == NULL)
+    {
+        return;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    diagnostics->encoder_suspect_mask = s_encoder_suspect_mask;
+    for (i = 0U; i < DC_MOTOR_COUNT; ++i)
+    {
+        diagnostics->target_rpm[i] = s_target_rpm[i];
+        diagnostics->measured_rpm[i] = s_measured_rpm[i];
+        diagnostics->applied_duty_percent[i] = s_applied_duty_percent[i];
+        diagnostics->encoder_suspect_events[i] = s_encoder_suspect_events[i];
+        diagnostics->max_speed_error_rpm[i] = s_max_speed_error_rpm[i];
+    }
+    __DMB();
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
 }

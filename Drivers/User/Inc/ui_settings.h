@@ -36,10 +36,12 @@ uint8_t UI_Settings_GetRotation(void);
 uint16_t UI_Settings_GetRotationDegrees(void);
 uint8_t UI_Settings_GetKeySoundEnabled(void);
 uint8_t UI_Settings_GetChineseEnabled(void);
+uint8_t UI_Settings_GetLowBatteryAlarmEnabled(void);
 
 void UI_Settings_SetRotation(uint8_t rotation);
 void UI_Settings_SetKeySoundEnabled(uint8_t enabled);
 void UI_Settings_SetChineseEnabled(uint8_t enabled);
+void UI_Settings_SetLowBatteryAlarmEnabled(uint8_t enabled);
 UI_SettingsDirection UI_Settings_MapDirection(UI_SettingsDirection physical);
 
 /* Settings writes are delayed so key-repeat cannot wear one flash sector.
@@ -52,6 +54,9 @@ int8_t UI_Settings_GetLastSaveResult(void);
 /* Non-blocking active-high buzzer service.  NotifyKeyPress starts one short
  * chirp; BuzzerTick1ms must be called by the existing 1 kHz TIM6 callback. */
 void UI_Settings_NotifyKeyPress(void);
+/* The low-battery alarm has priority over key chirps.  The persisted user
+ * option defaults to off; SetLowBatteryAlert applies the current live state. */
+void UI_Settings_SetLowBatteryAlert(uint8_t active);
 void UI_Settings_BuzzerTick1ms(void);
 
 #endif /* UI_SETTINGS_H */

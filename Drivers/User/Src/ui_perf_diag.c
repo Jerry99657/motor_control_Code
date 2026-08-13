@@ -2,6 +2,11 @@
 
 #include "lvgl.h"
 #include "safety_manager.h"
+#include "runtime_monitor.h"
+#include "battery_monitor.h"
+#include "dc_motor_ol.h"
+#include "mecanum_odometry.h"
+#include "mecanum.h"
 #include <string.h>
 
 #define UI_PERF_SAMPLE_PERIOD_MS        1000U
@@ -159,6 +164,11 @@ void UI_PerfDiag_Process(void)
     uint32_t elapsed_ms = now - s_last_sample_tick;
     lv_mem_monitor_t memory;
     ui_perf_status_t status = UI_PERF_STATUS_GOOD;
+    RuntimeMonitorSnapshot runtime;
+    BatteryMonitorSnapshot battery;
+    DCMotorDiagnostics motor;
+    MecanumOdometrySnapshot odometry;
+    MecanumHeadingDiagnostics heading;
 
     if (elapsed_ms < UI_PERF_SAMPLE_PERIOD_MS)
     {
@@ -217,13 +227,74 @@ void UI_PerfDiag_Process(void)
     s_snapshot.lv_mem_frag_pct = memory.frag_pct;
     s_snapshot.control_max_us = ui_perf_cycles_to_us(Safety_GetControlMaxCycles());
     s_snapshot.control_overrun_count = Safety_GetControlOverrunCount();
+    s_snapshot.safety_faults = Safety_GetFaults();
+    s_snapshot.safety_warnings = Safety_GetWarnings();
+    s_snapshot.output_blocked_count = Safety_GetOutputBlockedCount();
+    BatteryMonitor_GetSnapshot(&battery);
+    s_snapshot.battery_raw_adc = battery.raw_adc;
+    s_snapshot.battery_sample_age_ms = battery.sample_age_ms;
+    s_snapshot.battery_low_entry_count = battery.low_entry_count;
+    s_snapshot.battery_stale_entry_count = battery.stale_entry_count;
+    s_snapshot.battery_voltage = battery.filtered_voltage;
+    s_snapshot.battery_state = (uint8_t)battery.state;
+    s_snapshot.battery_sample_valid = battery.sample_valid;
+    DCMotor_OL_GetDiagnostics(&motor);
+    memcpy(s_snapshot.motor_target_rpm, motor.target_rpm,
+           sizeof(s_snapshot.motor_target_rpm));
+    memcpy(s_snapshot.motor_measured_rpm, motor.measured_rpm,
+           sizeof(s_snapshot.motor_measured_rpm));
+    memcpy(s_snapshot.motor_duty_percent, motor.applied_duty_percent,
+           sizeof(s_snapshot.motor_duty_percent));
+    memcpy(s_snapshot.motor_max_error_rpm, motor.max_speed_error_rpm,
+           sizeof(s_snapshot.motor_max_error_rpm));
+    memcpy(s_snapshot.motor_encoder_suspect_events,
+           motor.encoder_suspect_events,
+           sizeof(s_snapshot.motor_encoder_suspect_events));
+    s_snapshot.motor_encoder_suspect_mask = motor.encoder_suspect_mask;
+    MecanumOdometry_GetSnapshot(&odometry);
+    s_snapshot.odometry_x_mm = odometry.x_mm;
+    s_snapshot.odometry_y_mm = odometry.y_mm;
+    s_snapshot.odometry_heading_deg = odometry.heading_deg;
+    s_snapshot.odometry_body_vx_mm_s = odometry.body_vx_mm_s;
+    s_snapshot.odometry_body_vy_mm_s = odometry.body_vy_mm_s;
+    s_snapshot.odometry_body_wz_deg_s = odometry.body_wz_deg_s;
+    s_snapshot.odometry_travel_distance_mm = odometry.travel_distance_mm;
+    s_snapshot.odometry_update_count = odometry.update_count;
+    s_snapshot.odometry_rejected_count = odometry.rejected_count;
+    s_snapshot.odometry_timing_gap_count = odometry.timing_gap_count;
+    s_snapshot.odometry_encoder_ready_mask = odometry.encoder_ready_mask;
+    s_snapshot.odometry_last_sample_accepted = odometry.last_sample_accepted;
+    Mecanum_GetHeadingDiagnostics(&heading);
+    s_snapshot.heading_reference_deg = heading.reference_deg;
+    s_snapshot.heading_error_deg = heading.error_deg;
+    s_snapshot.heading_requested_wz_dps = heading.requested_wz_dps;
+    s_snapshot.heading_correction_wz_dps = heading.correction_wz_dps;
+    s_snapshot.heading_output_wz_dps = heading.output_wz_dps;
+    s_snapshot.heading_control_active = heading.active;
+    RuntimeMonitor_GetSnapshot(&runtime);
+    s_snapshot.runtime_reset_flags = runtime.reset_flags;
+    s_snapshot.watchdog_feed_count = runtime.watchdog_feed_count;
+    s_snapshot.watchdog_missed_vote_count = runtime.watchdog_missed_vote_count;
+    s_snapshot.watchdog_last_feed_age_ms = runtime.last_feed_age_ms;
+    s_snapshot.foreground_age_ms = runtime.foreground_age_ms;
+    s_snapshot.control_age_ms = runtime.control_age_ms;
+    s_snapshot.stack_total_bytes = runtime.stack_total_bytes;
+    s_snapshot.stack_used_bytes = runtime.stack_used_bytes;
+    s_snapshot.stack_min_free_bytes = runtime.stack_min_free_bytes;
+    s_snapshot.stack_guard_ok = runtime.stack_guard_ok;
+    s_snapshot.last_fault_valid = runtime.last_fault_valid;
+    s_snapshot.runtime_fault_type = (uint8_t)runtime.last_fault_type;
+    s_snapshot.last_fault_pc = runtime.last_fault_pc;
+    s_snapshot.last_fault_lr = runtime.last_fault_lr;
+    s_snapshot.last_fault_cfsr = runtime.last_fault_cfsr;
 
     if ((s_snapshot.refresh_max_ms >= UI_PERF_OVERLOAD_REFRESH_MS) ||
         (s_snapshot.lv_mem_used_pct >= UI_PERF_OVERLOAD_HEAP_PCT) ||
         (s_snapshot.lv_mem_frag_pct >= UI_PERF_OVERLOAD_FRAG_PCT) ||
         ((s_snapshot.lv_mem_biggest_free != 0U) &&
          (s_snapshot.lv_mem_biggest_free < UI_PERF_MIN_BIG_BLOCK_BYTES)) ||
-        (s_window.flush_timeout_count != 0U))
+        (s_window.flush_timeout_count != 0U) ||
+        (s_snapshot.stack_guard_ok == 0U))
     {
         status = UI_PERF_STATUS_OVERLOAD;
     }

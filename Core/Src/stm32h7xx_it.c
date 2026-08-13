@@ -22,6 +22,7 @@
 #include "stm32h7xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "runtime_monitor.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -41,147 +42,26 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
-typedef struct
-{
-  uint32_t valid;
-  uint32_t stacked_r0;
-  uint32_t stacked_r1;
-  uint32_t stacked_r2;
-  uint32_t stacked_r3;
-  uint32_t stacked_r12;
-  uint32_t stacked_lr;
-  uint32_t stacked_pc;
-  uint32_t stacked_psr;
-  uint32_t cfsr;
-  uint32_t hfsr;
-  uint32_t dfsr;
-  uint32_t afsr;
-  uint32_t bfar;
-  uint32_t mmfar;
-  uint32_t fault_type;
-} HardFaultSnapshot_t;
-
-volatile HardFaultSnapshot_t g_hardfault_snapshot;
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN PFP */
-void HardFault_HandlerC(uint32_t *stacked_sp);
+void Fault_HandlerC(uint32_t *stacked_sp, uint32_t exception_lr,
+                    uint32_t fault_type) __attribute__((noreturn));
+void HardFault_Handler(void) __attribute__((naked));
+void MemManage_Handler(void) __attribute__((naked));
+void BusFault_Handler(void) __attribute__((naked));
+void UsageFault_Handler(void) __attribute__((naked));
 
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-void HardFault_HandlerC(uint32_t *stacked_sp)
+void Fault_HandlerC(uint32_t *stacked_sp, uint32_t exception_lr,
+                    uint32_t fault_type)
 {
-  __DSB();
-  __ISB();
-
-  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
-  g_hardfault_snapshot.fault_type = 1U;
-  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
-  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
-  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
-  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
-  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
-  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
-  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
-  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
-  g_hardfault_snapshot.cfsr = SCB->CFSR;
-  g_hardfault_snapshot.hfsr = SCB->HFSR;
-  g_hardfault_snapshot.dfsr = SCB->DFSR;
-  g_hardfault_snapshot.afsr = SCB->AFSR;
-  g_hardfault_snapshot.bfar = SCB->BFAR;
-  g_hardfault_snapshot.mmfar = SCB->MMFAR;
-
-  __DSB();
-  __ISB();
-
-  while (1)
-  {
-  }
-}
-
-void MemManage_HandlerC(uint32_t *stacked_sp)
-{
-  __DSB();
-  __ISB();
-
-  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
-  g_hardfault_snapshot.fault_type = 2U;
-  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
-  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
-  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
-  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
-  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
-  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
-  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
-  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
-  g_hardfault_snapshot.cfsr = SCB->CFSR;
-  g_hardfault_snapshot.hfsr = SCB->HFSR;
-  g_hardfault_snapshot.dfsr = SCB->DFSR;
-  g_hardfault_snapshot.afsr = SCB->AFSR;
-  g_hardfault_snapshot.bfar = SCB->BFAR;
-  g_hardfault_snapshot.mmfar = SCB->MMFAR;
-
-  while (1)
-  {
-  }
-}
-
-void BusFault_HandlerC(uint32_t *stacked_sp)
-{
-  __DSB();
-  __ISB();
-
-  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
-  g_hardfault_snapshot.fault_type = 3U;
-  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
-  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
-  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
-  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
-  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
-  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
-  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
-  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
-  g_hardfault_snapshot.cfsr = SCB->CFSR;
-  g_hardfault_snapshot.hfsr = SCB->HFSR;
-  g_hardfault_snapshot.dfsr = SCB->DFSR;
-  g_hardfault_snapshot.afsr = SCB->AFSR;
-  g_hardfault_snapshot.bfar = SCB->BFAR;
-  g_hardfault_snapshot.mmfar = SCB->MMFAR;
-
-  while (1)
-  {
-  }
-}
-
-void UsageFault_HandlerC(uint32_t *stacked_sp)
-{
-  __DSB();
-  __ISB();
-
-  g_hardfault_snapshot.valid = 0x48464C54UL; /* "HFLT" */
-  g_hardfault_snapshot.fault_type = 4U;
-  g_hardfault_snapshot.stacked_r0 = stacked_sp[0];
-  g_hardfault_snapshot.stacked_r1 = stacked_sp[1];
-  g_hardfault_snapshot.stacked_r2 = stacked_sp[2];
-  g_hardfault_snapshot.stacked_r3 = stacked_sp[3];
-  g_hardfault_snapshot.stacked_r12 = stacked_sp[4];
-  g_hardfault_snapshot.stacked_lr = stacked_sp[5];
-  g_hardfault_snapshot.stacked_pc = stacked_sp[6];
-  g_hardfault_snapshot.stacked_psr = stacked_sp[7];
-  g_hardfault_snapshot.cfsr = SCB->CFSR;
-  g_hardfault_snapshot.hfsr = SCB->HFSR;
-  g_hardfault_snapshot.dfsr = SCB->DFSR;
-  g_hardfault_snapshot.afsr = SCB->AFSR;
-  g_hardfault_snapshot.bfar = SCB->BFAR;
-  g_hardfault_snapshot.mmfar = SCB->MMFAR;
-
-  while (1)
-  {
-  }
+  RuntimeMonitor_CaptureFaultAndReset((RuntimeFaultType)fault_type,
+                                      stacked_sp, exception_lr);
 }
 
 /* USER CODE END 0 */
@@ -240,7 +120,9 @@ void HardFault_Handler(void)
     "ite eq           \n"
     "mrseq r0, msp    \n"
     "mrsne r0, psp    \n"
-    "b HardFault_HandlerC \n"
+    "mov r1, lr       \n"
+    "movs r2, #1      \n"
+    "b Fault_HandlerC \n"
   );
   /* USER CODE END HardFault_IRQn 0 */
   while (1)
@@ -263,7 +145,9 @@ void MemManage_Handler(void)
     "ite eq           \n"
     "mrseq r0, msp    \n"
     "mrsne r0, psp    \n"
-    "b MemManage_HandlerC \n"
+    "mov r1, lr       \n"
+    "movs r2, #2      \n"
+    "b Fault_HandlerC \n"
   );
 
   /* USER CODE END MemoryManagement_IRQn 0 */
@@ -287,7 +171,9 @@ void BusFault_Handler(void)
     "ite eq           \n"
     "mrseq r0, msp    \n"
     "mrsne r0, psp    \n"
-    "b BusFault_HandlerC \n"
+    "mov r1, lr       \n"
+    "movs r2, #3      \n"
+    "b Fault_HandlerC \n"
   );
 
   /* USER CODE END BusFault_IRQn 0 */
@@ -311,7 +197,9 @@ void UsageFault_Handler(void)
     "ite eq           \n"
     "mrseq r0, msp    \n"
     "mrsne r0, psp    \n"
-    "b UsageFault_HandlerC \n"
+    "mov r1, lr       \n"
+    "movs r2, #4      \n"
+    "b Fault_HandlerC \n"
   );
 
   /* USER CODE END UsageFault_IRQn 0 */

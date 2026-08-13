@@ -2,6 +2,7 @@
 
 #include "lcd_spi_154.h"
 #include "main.h"
+#include "runtime_monitor.h"
 
 #define MEDIA_CONTROL_KEY_GUARD_MS     120U
 #define MEDIA_CONTROL_REPEAT_START_MS  500U
@@ -57,6 +58,10 @@ media_control_action_t MediaControl_Poll(void)
     uint8_t right_pressed;
     media_control_action_t seek_action;
     uint32_t now;
+
+    /* Media players own the foreground for long periods. Their input poll is
+     * therefore also the watchdog foreground heartbeat. */
+    RuntimeMonitor_ForegroundHeartbeat();
 
     if (media_key_pressed(Key2_GPIO_Port, Key2_Pin) != 0U)
     {

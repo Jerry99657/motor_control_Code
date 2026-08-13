@@ -36,6 +36,7 @@
 #include "mjpeg_scheduler.h"
 #include "dc_motor_ol.h"
 #include "mecanum.h"
+#include "mecanum_odometry.h"
 #include "imu_service.h"
 #include "safety_manager.h"
 #include "comm_service.h"
@@ -47,6 +48,8 @@
 #include "lv_port_indev.h"
 #include "lvgl_app.h"
 #include "ui_settings.h"
+#include "runtime_monitor.h"
+#include "battery_monitor.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -136,6 +139,8 @@ DMA2D_HandleTypeDef hdma2d;
 I2C_HandleTypeDef hi2c1;
 I2C_HandleTypeDef hi2c2;
 I2C_HandleTypeDef hi2c4;
+
+IWDG_HandleTypeDef hiwdg1;
 
 JPEG_HandleTypeDef hjpeg;
 MDMA_HandleTypeDef hmdma_jpeg_infifo_th;
@@ -232,6 +237,7 @@ static void MX_TIM7_Init(void);
 static void MX_TIM13_Init(void);
 static void MX_TIM16_Init(void);
 static void MX_DCMI_Init(void);
+static void MX_IWDG1_Init(void);
 /* USER CODE BEGIN PFP */
 static void LCD_ShowStartupScreen(void);
 static void LCD_ShowDownloadScreen(void);
@@ -477,7 +483,9 @@ static void VOFA_Task_Process(void)
 
 static void ADC_Service_Process(void)
 {
+  static uint32_t next_start_tick = 0U;
   uint8_t start_requested;
+  uint32_t now = HAL_GetTick();
   uint32_t primask = __get_PRIMASK();
 
   __disable_irq();
@@ -486,6 +494,12 @@ static void ADC_Service_Process(void)
   if (primask == 0U)
   {
     __enable_irq();
+  }
+
+  if ((int32_t)(now - next_start_tick) >= 0)
+  {
+    start_requested = 1U;
+    next_start_tick = now + BATTERY_MONITOR_SAMPLE_PERIOD_MS;
   }
 
   if ((start_requested != 0U) && (HAL_ADC_Start_IT(&hadc1) != HAL_OK))
@@ -1131,6 +1145,7 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  RuntimeMonitor_EarlyInit();
 
   /* USER CODE END SysInit */
 
@@ -1165,7 +1180,11 @@ int main(void)
   MX_TIM13_Init();
   MX_TIM16_Init();
   MX_DCMI_Init();
+  MX_IWDG1_Init();
   /* USER CODE BEGIN 2 */
+  RuntimeMonitor_AttachWatchdog(&hiwdg1);
+  RuntimeMonitor_StackInit();
+  RuntimeMonitor_BootProgress();
   Camera_Service_BootHold();
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   CommService_Init();
@@ -1176,10 +1195,12 @@ int main(void)
   Boot_LogStatus("BOOT: DMA2D init=", g_dma2d_init_ok);
   Boot_LogStatus("BOOT: TIM7 init=", g_tim7_init_ok);
   QSPI_BootInit();
+  RuntimeMonitor_BootProgress();
   Boot_LogStatus("BOOT: QSPI init=", g_qspi_init_status);
   /* USER CODE: persistent display/key settings live in two reserved W25Q64
    * sectors.  Apply rotation before any direct LCD animation is shown. */
   UI_Settings_Init((g_qspi_init_status == QSPI_W25QXX_OK) ? 1U : 0U);
+  RuntimeMonitor_BootProgress();
   if (Boot_ShouldEnterAnimDownloadMode() == 1U)
   {
     LCD_ShowDownloadScreen();
@@ -1207,6 +1228,7 @@ int main(void)
   }
 
   g_sd_start_anim_status = SD_StartAnim_Play();
+  RuntimeMonitor_BootProgress();
   Boot_LogStatus("BOOT: SD status=", g_sd_start_anim_status);
   if (g_sd_start_anim_status == SD_START_ANIM_OK)
   {
@@ -1218,6 +1240,7 @@ int main(void)
     /* Ensure LCD/SPI state is clean before fallback playback. */
     LCD_ResetTransferState();
     g_start_anim_status = QSPI_StartAnim_Play();
+    RuntimeMonitor_BootProgress();
     Boot_LogStatus("BOOT: QSPI status=", g_start_anim_status);
   }
   LCD_ShowStartupScreen();
@@ -1226,13 +1249,17 @@ int main(void)
   lv_port_disp_init();
   lv_port_indev_init();
   LVGL_App_Init();
+  RuntimeMonitor_BootProgress();
   IMU_Service_Init();
+  RuntimeMonitor_BootProgress();
 
   if (DCMotor_OL_Init() != HAL_OK)
   {
     Error_Handler();
   }
+  MecanumOdometry_Init();
   Safety_Init();
+  BatteryMonitor_Init();
 
   if (HAL_TIM_Base_Start_IT(&htim6) != HAL_OK)
   {
@@ -1267,6 +1294,9 @@ int main(void)
   /* Initialize WS2812 - 10% green 1s then off */
   ws2812_Init();
 
+  /* Enable two-vote watchdog feeding (foreground + TIM13 control tick). */
+  RuntimeMonitor_StartRuntime();
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -1283,6 +1313,8 @@ int main(void)
     IMU_Service_Process();
     Camera_Service_Process();
     ADC_Service_Process();
+    BatteryMonitor_Process();
+    UI_Settings_SetLowBatteryAlert(BatteryMonitor_IsLow());
 
 #if SD_SELF_TEST_ENABLE
     if (g_sd_self_test_done == 0U)
@@ -1331,6 +1363,7 @@ int main(void)
 #endif
 #endif
 
+    RuntimeMonitor_MainLoopHeartbeat();
     HAL_Delay(5);
   }
   /* USER CODE END 3 */
@@ -1358,8 +1391,10 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_LSI
+                              |RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
@@ -1725,6 +1760,40 @@ static void MX_I2C4_Init(void)
   /* USER CODE BEGIN I2C4_Init 2 */
 
   /* USER CODE END I2C4_Init 2 */
+
+}
+
+/**
+  * @brief IWDG1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_IWDG1_Init(void)
+{
+
+  /* USER CODE BEGIN IWDG1_Init 0 */
+
+  /* USER CODE END IWDG1_Init 0 */
+
+  /* USER CODE BEGIN IWDG1_Init 1 */
+  /* Use the full reload range as a regular independent watchdog. CubeMX can
+   * otherwise keep a near-reload window value, which rejects early feeds. */
+  hiwdg1.Init.Window = 4095U;
+  /* USER CODE END IWDG1_Init 1 */
+  hiwdg1.Instance = IWDG1;
+  hiwdg1.Init.Prescaler = IWDG_PRESCALER_64;
+  hiwdg1.Init.Window = 4095;
+  hiwdg1.Init.Reload = 3999;
+  if (HAL_IWDG_Init(&hiwdg1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN IWDG1_Init 2 */
+  /* Keep the effective window disabled even if a future .ioc regeneration
+   * restores a generated near-reload value. */
+  IWDG1->WINR = 4095U;
+  __HAL_IWDG_RELOAD_COUNTER(&hiwdg1);
+  /* USER CODE END IWDG1_Init 2 */
 
 }
 
@@ -2668,14 +2737,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   {
     uint32_t control_start = Safety_ControlTimingStart();
 
+    RuntimeMonitor_ControlTickFromISR();
     Safety_ControlTick10ms();
+    FOC_Link_SetSafetyInhibit((Safety_IsMotionAllowed() == 0U) ? 1U : 0U);
     if (Safety_IsMotionAllowed() != 0U)
     {
       Mecanum_Tick10ms();
       if (Safety_IsMotionAllowed() != 0U)
       {
         DCMotor_OL_ApplyPendingCommands();
-        DCMotor_OL_Tick10ms();
       }
       else
       {
@@ -2687,12 +2757,23 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       Mecanum_EmergencyStop();
     }
 
+    /* Always sample encoders, including during a safety stop, so coast-down
+     * motion is not lost from odometry. EmergencyStop has already zeroed all
+     * targets, and the TIM1 software barrier still guards the PWM outputs. */
+    DCMotor_OL_Tick10ms();
+
+    /* Integrate the four encoder samples after the motor loop has published
+     * its new cumulative counts. This remains encoder-only; the uncalibrated
+     * IMU is deliberately not fused into chassis pose. */
+    MecanumOdometry_Update10ms();
+
     Safety_SetMotionActive(
       ((Mecanum_IsMotionActive() != 0U) || (DCMotor_OL_IsMotionActive() != 0U)) ? 1U : 0U);
 
     Safety_ControlTimingFinish(control_start);
     if (Safety_IsMotionAllowed() == 0U)
     {
+      FOC_Link_SetSafetyInhibit(1U);
       Mecanum_EmergencyStop();
     }
   }
@@ -2706,11 +2787,8 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
   if (hadc->Instance == ADC1)
   {
-    extern volatile uint8_t g_adc_update_flag;
-    extern volatile float g_adc_voltage;
     uint32_t val = HAL_ADC_GetValue(hadc);
-    g_adc_voltage = ((float)val / 65535.0f) * 3.3f * 7.0f;
-    g_adc_update_flag = 1;
+    BatteryMonitor_AdcSampleFromISR(val);
   }
 }
 
@@ -2752,12 +2830,7 @@ void MPU_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-    HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin,GPIO_PIN_RESET);
-  }
+  RuntimeMonitor_CaptureFaultAndReset(RUNTIME_FAULT_ERROR_HANDLER, NULL, 0U);
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT

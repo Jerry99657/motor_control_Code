@@ -14,6 +14,16 @@ typedef enum {
     DCMOTOR_CONTROL_MODE_POSITION
 } DCMotorControlMode;
 
+typedef struct
+{
+    int32_t target_rpm[4];
+    int32_t measured_rpm[4];
+    int16_t applied_duty_percent[4];
+    uint32_t encoder_suspect_events[4];
+    uint32_t max_speed_error_rpm[4];
+    uint8_t encoder_suspect_mask;
+} DCMotorDiagnostics;
+
 HAL_StatusTypeDef DCMotor_OL_Init(void);
 void DCMotor_OL_SetSpeed(uint8_t motor_index, int16_t speed_percent);
 void DCMotor_OL_SetTargetPosition(uint8_t motor_index, int64_t target_pulses, int16_t speed_limit_percent);
@@ -28,5 +38,6 @@ int16_t DCMotor_OL_GetDutyPercent(uint8_t motor_index);
 int64_t DCMotor_OL_GetPositionPulses(uint8_t motor_index);
 /* Returns 0 before learning, then +1/-1 for the raw encoder phase mapping. */
 int8_t DCMotor_OL_GetEncoderPolarity(uint8_t motor_index);
+void DCMotor_OL_GetDiagnostics(DCMotorDiagnostics *diagnostics);
 
 #endif /* DC_MOTOR_OL_H */

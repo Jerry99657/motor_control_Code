@@ -29,7 +29,8 @@ typedef enum
   FOC_LINK_OK = 0,
   FOC_LINK_ERR_ARGUMENT = -1,
   FOC_LINK_ERR_QUEUE_FULL = -2,
-  FOC_LINK_ERR_FORMAT = -3
+  FOC_LINK_ERR_FORMAT = -3,
+  FOC_LINK_ERR_SAFETY = -4
 } FOC_LinkResult;
 
 typedef enum
@@ -61,6 +62,7 @@ typedef struct
 
 void FOC_Link_Init(void);
 void FOC_Link_Process(void);
+void FOC_Link_SetSafetyInhibit(uint8_t inhibit);
 
 int8_t FOC_Link_SendSpeed(float value);
 int8_t FOC_Link_SendAngle(float value);

@@ -8,12 +8,14 @@
 #include "ui_font.h"
 #include "ui_page.h"
 #include "ui_perf_diag.h"
+#include "runtime_monitor.h"
 #include "ui_settings.h"
 #include "ui_theme.h"
 #include "dc_motor_ol.h"
 #include "mjpeg_player.h"
 #include "sd_start_anim.h"
 #include "mecanum.h"
+#include "mecanum_odometry.h"
 #include "main.h"
 #include "lvgl.h"
 #include "src/extra/libs/gif/gifdec.h"
@@ -30,6 +32,7 @@
 #include "nes_runtime.h"
 #include "qspi_partition.h"
 #include "safety_manager.h"
+#include "battery_monitor.h"
 #include <stdlib.h>
 #include <ctype.h>
 #include <math.h>
@@ -40,8 +43,6 @@
 
 static lv_obj_t *s_status_label = NULL;
 static lv_obj_t *s_adc_label = NULL;
-volatile uint8_t g_adc_update_flag = 0;
-volatile float g_adc_voltage = 0.0f;
 static lv_group_t *s_group = NULL;
 static char s_status_text[640] = "Up/Down | OK Enter | Left Back";
 static uint32_t s_last_safety_faults = SAFETY_FAULT_NONE;
@@ -220,6 +221,7 @@ static uint8_t s_foc_active_loop = 0U;
 static lv_obj_t *s_foc_status_label = NULL;
 static uint8_t s_mecanum_executing = 0;
 static lv_timer_t *s_mecanum_timer = NULL;
+static uint8_t s_mecanum_countdown = 0U;
 
 static lv_obj_t *s_ctrl_row_btns[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
 static lv_obj_t *s_ctrl_row_labels[7] = {NULL, NULL, NULL, NULL, NULL, NULL, NULL};
@@ -260,11 +262,12 @@ static uint32_t s_nes_cache_last_completed = UINT32_MAX;
 static uint8_t s_nes_cache_last_read_errors = UINT8_MAX;
 static lvgl_app_activity_t s_header_activity = (lvgl_app_activity_t)0xFFU;
 static uint32_t s_header_activity_tick = 0U;
-static lv_obj_t *s_settings_rows[3] = {NULL, NULL, NULL};
-static lv_obj_t *s_settings_labels[3] = {NULL, NULL, NULL};
+static lv_obj_t *s_settings_rows[4] = {NULL, NULL, NULL, NULL};
+static lv_obj_t *s_settings_labels[4] = {NULL, NULL, NULL, NULL};
 static lv_obj_t *s_settings_rotation_value = NULL;
 static lv_obj_t *s_settings_sound_switch = NULL;
 static lv_obj_t *s_settings_language_switch = NULL;
+static lv_obj_t *s_settings_battery_alarm_switch = NULL;
 static uint8_t s_settings_selected_row = 0U;
 
 static void lvgl_app_update_header_activity(void)
@@ -416,6 +419,7 @@ static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
 static void lvgl_app_control_event_cb(lv_event_t *e);
+static void lvgl_app_mecanum_stop(void);
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req);
 static void lvgl_app_process_pending_screen(void);
 
@@ -1290,6 +1294,15 @@ static void lvgl_app_servo_angle_send_cmd(uint8_t servo_index, int16_t angle)
 
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
 {
+    /* Mecanum Control owns its motion command only while its page is active.
+     * Put the guard at the common transition boundary so Left, KEY2/KEY3 and
+     * future navigation paths cannot leave a background command running. */
+    if ((s_current_screen == LVGL_APP_SCREEN_REQ_MECANUM) &&
+        (req != LVGL_APP_SCREEN_REQ_NONE) &&
+        (req != LVGL_APP_SCREEN_REQ_MECANUM))
+    {
+        lvgl_app_mecanum_stop();
+    }
     s_pending_screen_req = req;
 }
 
@@ -1504,7 +1517,8 @@ static void lvgl_app_control_refresh_rows(void)
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
     {
-        mecanum_active = ((s_mecanum_executing != 0U) ||
+        mecanum_active = ((s_mecanum_countdown != 0U) ||
+                          (s_mecanum_executing != 0U) ||
                           (Mecanum_IsMotionActive() != 0U)) ? 1U : 0U;
     }
 
@@ -1710,7 +1724,19 @@ static void lvgl_app_control_refresh_rows(void)
             else if (i == 5)
                 (void)snprintf(line, sizeof(line), "Z Speed     %5d", (int)s_mec_speed_z);
             else if (i == 6)
-                (void)snprintf(line, sizeof(line), "[ %s ]", mecanum_active ? "STOP ACTIVE" : "EXECUTE");
+            {
+                if (s_mecanum_countdown != 0U)
+                {
+                    (void)snprintf(line, sizeof(line),
+                                   "[ START IN %u ]",
+                                   (unsigned int)s_mecanum_countdown);
+                }
+                else
+                {
+                    (void)snprintf(line, sizeof(line), "[ %s ]",
+                                   mecanum_active ? "STOP ACTIVE" : "EXECUTE");
+                }
+            }
         }
         else
         {
@@ -1721,11 +1747,47 @@ static void lvgl_app_control_refresh_rows(void)
     }
 }
 
+static void lvgl_app_mecanum_stop(void)
+{
+    s_mecanum_countdown = 0U;
+    s_mecanum_executing = 0U;
+    if (s_mecanum_timer != NULL)
+    {
+        lv_timer_del(s_mecanum_timer);
+        s_mecanum_timer = NULL;
+    }
+    Mecanum_CancelControl();
+    DCMotor_OL_RequestStopAll();
+}
+
 static void mecanum_start_timer_cb(lv_timer_t *timer)
 {
-    (void)timer;
+    if ((timer != s_mecanum_timer) ||
+        (s_current_screen != LVGL_APP_SCREEN_REQ_MECANUM) ||
+        (s_ctrl_page != LVGL_APP_CTRL_PAGE_MECANUM) ||
+        (s_mecanum_executing == 0U))
+    {
+        lvgl_app_mecanum_stop();
+        return;
+    }
+
+    if (s_mecanum_countdown > 1U)
+    {
+        s_mecanum_countdown--;
+        lvgl_app_set_status("Mecanum starts in %u...",
+                            (unsigned int)s_mecanum_countdown);
+        lvgl_app_show_toast(UI_NOTICE_INFO, "Starting in %u...",
+                            (unsigned int)s_mecanum_countdown);
+        lvgl_app_control_refresh_rows();
+        UI_Anim_StateBounce(s_ctrl_row_btns[6]);
+        return;
+    }
+
+    s_mecanum_countdown = 0U;
     s_mecanum_timer = NULL;
-    if (s_mecanum_executing)
+    lv_timer_del(timer);
+
+    if (s_mecanum_executing != 0U)
     {
         /* Keep the execution path protected as well as the editor. This also
          * sanitises values retained from firmware versions without an upper limit. */
@@ -1755,8 +1817,8 @@ static void mecanum_start_timer_cb(lv_timer_t *timer)
             
             Mecanum_MixedControl(vx, vy, wz, dx, dy, dw);
             s_mecanum_executing = 0;
-            lvgl_app_control_refresh_rows();
         }
+        lvgl_app_control_refresh_rows();
     }
 }
 
@@ -1766,29 +1828,27 @@ static void lvgl_app_control_confirm_selected(void)
     {
         if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM && s_ctrl_selected_row == 6)
         {
-            if ((s_mecanum_executing != 0U) || (Mecanum_IsMotionActive() != 0U))
+            if ((s_mecanum_countdown != 0U) ||
+                (s_mecanum_executing != 0U) ||
+                (Mecanum_IsMotionActive() != 0U))
             {
-                s_mecanum_executing = 0;
-                Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
+                lvgl_app_mecanum_stop();
                 lvgl_app_set_status("Mecanum STOPPED");
                 lvgl_app_show_toast(UI_NOTICE_WARNING, "Mecanum stopped");
-                if (s_mecanum_timer)
-                {
-                    lv_timer_del(s_mecanum_timer);
-                    s_mecanum_timer = NULL;
-                }
             }
             else
             {
                 s_mecanum_executing = 1;
-                lvgl_app_set_status("Mecanum Wait 3s...");
-                lvgl_app_show_toast(UI_NOTICE_INFO, "Starting in 3 seconds");
+                s_mecanum_countdown = 3U;
+                lvgl_app_set_status("Mecanum starts in 3...");
+                lvgl_app_show_toast(UI_NOTICE_INFO, "Starting in 3...");
                 if (s_mecanum_timer == NULL)
                 {
-                    extern void mecanum_start_timer_cb(lv_timer_t *timer); // will define below
-                    s_mecanum_timer = lv_timer_create(mecanum_start_timer_cb, 3000, NULL);
-                    lv_timer_set_repeat_count(s_mecanum_timer, 1);
+                    s_mecanum_timer = lv_timer_create(mecanum_start_timer_cb,
+                                                      1000U, NULL);
+                    lv_timer_set_repeat_count(s_mecanum_timer, -1);
                 }
+                UI_Anim_StateBounce(s_ctrl_row_btns[6]);
             }
             lvgl_app_control_refresh_rows();
             return;
@@ -3904,7 +3964,7 @@ static void lvgl_app_diagnostics_refresh(void)
     const char *page_name;
     const char *status_text;
     lv_color_t status_bg;
-    char text_buf[320];
+    char text_buf[384];
 
     if ((s_diag_page_label == NULL) || (s_diag_data_label == NULL) ||
         (lv_obj_is_valid(s_diag_page_label) == false) ||
@@ -3942,7 +4002,7 @@ static void lvgl_app_diagnostics_refresh(void)
 
     if (s_diag_page_index == 0U)
     {
-        page_name = "1/3  OVERVIEW";
+        page_name = "1/7  OVERVIEW";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -3965,7 +4025,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 1U)
     {
-        page_name = "2/3  DISPLAY";
+        page_name = "2/7  DISPLAY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -3984,24 +4044,142 @@ static void lvgl_app_diagnostics_refresh(void)
             (unsigned long)snapshot.flush_timeout_count,
             (unsigned long)snapshot.flush_error_count);
     }
-    else
+    else if (s_diag_page_index == 2U)
     {
-        page_name = "3/3  MEMORY";
+        page_name = "3/7  MEMORY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
-            "LV heap used          %3u %%\n"
-            "Free bytes          %7lu\n"
-            "Largest block       %7lu\n"
-            "Fragmentation         %3u %%\n"
-            "Peak used           %7lu\n"
+            "LV used/free   %3u%%/%7lu\n"
+            "Largest/frag %7lu/%3u%%\n"
+            "Peak used       %7lu B\n"
+            "Stack used/min %5lu/%5lu B\n"
             "Control overruns    %7lu",
             (unsigned int)snapshot.lv_mem_used_pct,
             (unsigned long)snapshot.lv_mem_free,
             (unsigned long)snapshot.lv_mem_biggest_free,
             (unsigned int)snapshot.lv_mem_frag_pct,
             (unsigned long)snapshot.lv_mem_max_used,
+            (unsigned long)snapshot.stack_used_bytes,
+            (unsigned long)snapshot.stack_min_free_bytes,
             (unsigned long)snapshot.control_overrun_count);
+    }
+    else if (s_diag_page_index == 3U)
+    {
+        page_name = "4/7  RELIABILITY";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "Reset          %s\n"
+            "IWDG feed/miss %6lu/%4lu\n"
+            "Feed/FG/CTL age %4lu/%4lu/%4lu\n"
+            "Stack guard        %s\n"
+            "Last fault         %s\n"
+            "PC %08lX  CFSR %08lX",
+            RuntimeMonitor_ResetReasonText(snapshot.runtime_reset_flags),
+            (unsigned long)snapshot.watchdog_feed_count,
+            (unsigned long)snapshot.watchdog_missed_vote_count,
+            (unsigned long)snapshot.watchdog_last_feed_age_ms,
+            (unsigned long)snapshot.foreground_age_ms,
+            (unsigned long)snapshot.control_age_ms,
+            (snapshot.stack_guard_ok != 0U) ? "OK" : "FAILED",
+            (snapshot.last_fault_valid != 0U) ?
+              RuntimeMonitor_FaultTypeText((RuntimeFaultType)snapshot.runtime_fault_type) :
+              "NONE",
+            (unsigned long)snapshot.last_fault_pc,
+            (unsigned long)snapshot.last_fault_cfsr);
+    }
+    else if (s_diag_page_index == 4U)
+    {
+        int voltage_integer = (int)snapshot.battery_voltage;
+        int voltage_fraction = (int)((snapshot.battery_voltage -
+                                      (float)voltage_integer) * 100.0f + 0.5f);
+        if (voltage_fraction < 0)
+        {
+            voltage_fraction = -voltage_fraction;
+        }
+        page_name = "5/7  SAFETY";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "Battery       %2d.%02d V  %s\n"
+            "ADC raw/age %5lu/%5lu ms\n"
+            "Low/stale     %5lu/%5lu\n"
+            "Fault/warn   %08lX/%02lX\n"
+            "Output blocks      %7lu\n"
+            "Low alarm buzzer       %s",
+            voltage_integer, voltage_fraction,
+            BatteryMonitor_StateText((BatteryMonitorState)snapshot.battery_state),
+            (unsigned long)snapshot.battery_raw_adc,
+            (unsigned long)snapshot.battery_sample_age_ms,
+            (unsigned long)snapshot.battery_low_entry_count,
+            (unsigned long)snapshot.battery_stale_entry_count,
+            (unsigned long)snapshot.safety_faults,
+            (unsigned long)snapshot.safety_warnings,
+            (unsigned long)snapshot.output_blocked_count,
+            (UI_Settings_GetLowBatteryAlarmEnabled() != 0U) ? "ON" : "OFF");
+    }
+    else if (s_diag_page_index == 5U)
+    {
+        page_name = "6/7  MOTION LOOP";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "Target %4ld %4ld %4ld %4ld\n"
+            "Actual %4ld %4ld %4ld %4ld\n"
+            "Duty   %4d %4d %4d %4d\n"
+            "MaxErr %4lu %4lu %4lu %4lu\n"
+            "Encoder suspect       0x%02X\n"
+            "Events %4lu %4lu %4lu %4lu",
+            (long)snapshot.motor_target_rpm[0],
+            (long)snapshot.motor_target_rpm[1],
+            (long)snapshot.motor_target_rpm[2],
+            (long)snapshot.motor_target_rpm[3],
+            (long)snapshot.motor_measured_rpm[0],
+            (long)snapshot.motor_measured_rpm[1],
+            (long)snapshot.motor_measured_rpm[2],
+            (long)snapshot.motor_measured_rpm[3],
+            (int)snapshot.motor_duty_percent[0],
+            (int)snapshot.motor_duty_percent[1],
+            (int)snapshot.motor_duty_percent[2],
+            (int)snapshot.motor_duty_percent[3],
+            (unsigned long)snapshot.motor_max_error_rpm[0],
+            (unsigned long)snapshot.motor_max_error_rpm[1],
+            (unsigned long)snapshot.motor_max_error_rpm[2],
+            (unsigned long)snapshot.motor_max_error_rpm[3],
+            (unsigned int)snapshot.motor_encoder_suspect_mask,
+            (unsigned long)snapshot.motor_encoder_suspect_events[0],
+            (unsigned long)snapshot.motor_encoder_suspect_events[1],
+            (unsigned long)snapshot.motor_encoder_suspect_events[2],
+            (unsigned long)snapshot.motor_encoder_suspect_events[3]);
+    }
+    else
+    {
+        page_name = "7/7  CHASSIS ODOM";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "Pose X/Y     %+7ld/%+7ld mm\n"
+            "Head A/R/E  %+5ld/%+5ld/%+4ld\n"
+            "Body Vx/Vy   %+6ld/%+6ld mm/s\n"
+            "Wz cmd/cor/out %+4ld/%+4ld/%+4ld\n"
+            "Travel / reject %7lu/%5lu\n"
+            "Enc 0x%02X Gap %5lu  HC %s",
+            (long)snapshot.odometry_x_mm,
+            (long)snapshot.odometry_y_mm,
+            (long)snapshot.odometry_heading_deg,
+            (long)snapshot.heading_reference_deg,
+            (long)snapshot.heading_error_deg,
+            (long)snapshot.odometry_body_vx_mm_s,
+            (long)snapshot.odometry_body_vy_mm_s,
+            (long)snapshot.heading_requested_wz_dps,
+            (long)snapshot.heading_correction_wz_dps,
+            (long)snapshot.heading_output_wz_dps,
+            (unsigned long)snapshot.odometry_travel_distance_mm,
+            (unsigned long)snapshot.odometry_rejected_count,
+            (unsigned int)snapshot.odometry_encoder_ready_mask,
+            (unsigned long)snapshot.odometry_timing_gap_count,
+            (snapshot.heading_control_active != 0U) ? "ON" : "OFF");
     }
 
     (void)UI_LabelSetTextIfChanged(s_diag_page_label, page_name);
@@ -4030,15 +4208,30 @@ static void lvgl_app_diagnostics_event_cb(lv_event_t *e)
     key = lvgl_app_event_get_key(e);
     if (key == LV_KEY_RIGHT)
     {
-        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 3U);
+        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 7U);
         lvgl_app_diagnostics_refresh();
         UI_Anim_CarouselIn(s_diag_data_panel, 1);
     }
     else if (key == LV_KEY_LEFT)
     {
-        s_diag_page_index = (s_diag_page_index == 0U) ? 2U : (uint8_t)(s_diag_page_index - 1U);
+        s_diag_page_index = (s_diag_page_index == 0U) ? 6U : (uint8_t)(s_diag_page_index - 1U);
         lvgl_app_diagnostics_refresh();
         UI_Anim_CarouselIn(s_diag_data_panel, -1);
+    }
+    else if ((key == LV_KEY_ENTER) && (s_diag_page_index == 6U))
+    {
+        if ((Mecanum_IsMotionActive() != 0U) ||
+            (DCMotor_OL_IsMotionActive() != 0U))
+        {
+            lvgl_app_show_toast(UI_NOTICE_WARNING,
+                                "Stop chassis before odometry reset");
+        }
+        else
+        {
+            MecanumOdometry_RequestReset();
+            lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Odometry origin reset");
+            lvgl_app_set_status("Odometry reset | Left/Right pages");
+        }
     }
     else if (key == LV_KEY_ESC)
     {
@@ -4115,7 +4308,7 @@ static void lvgl_app_show_diagnostics(void)
     s_diag_last_refresh_tick = HAL_GetTick();
     lvgl_app_diagnostics_refresh();
     lvgl_app_set_status(lvgl_app_tr(
-        "Left/Right pages - KEY2/KEY3 exits",
+        "Left/Right pages | OK resets ODOM",
         "左右翻页 | K2/K3退出"));
     lvgl_app_page_finish();
 }
@@ -4556,10 +4749,10 @@ static void lvgl_app_show_camera_test(void)
 
 static void lvgl_app_display_settings_refresh(void)
 {
-    static const char *english_names[3] =
-        {"Display Rotation", "Key Sound", "Language"};
-    static const char *chinese_names[3] =
-        {"屏幕旋转", "按键声音", "界面语言"};
+    static const char *english_names[4] =
+        {"Display Rotation", "Key Sound", "Language", "Low Battery Alarm"};
+    static const char *chinese_names[4] =
+        {"屏幕旋转", "按键声音", "界面语言", "低压蜂鸣报警"};
     char rotation_text[20];
     uint8_t i;
 
@@ -4597,7 +4790,20 @@ static void lvgl_app_display_settings_refresh(void)
         }
     }
 
-    for (i = 0U; i < 3U; ++i)
+    if ((s_settings_battery_alarm_switch != NULL) &&
+        (lv_obj_is_valid(s_settings_battery_alarm_switch) != false))
+    {
+        if (UI_Settings_GetLowBatteryAlarmEnabled() != 0U)
+        {
+            lv_obj_add_state(s_settings_battery_alarm_switch, LV_STATE_CHECKED);
+        }
+        else
+        {
+            lv_obj_clear_state(s_settings_battery_alarm_switch, LV_STATE_CHECKED);
+        }
+    }
+
+    for (i = 0U; i < 4U; ++i)
     {
         if ((s_settings_labels[i] != NULL) &&
             (lv_obj_is_valid(s_settings_labels[i]) != false))
@@ -4630,7 +4836,7 @@ static void lvgl_app_display_settings_clear_refs(void)
 {
     uint8_t i;
 
-    for (i = 0U; i < 3U; ++i)
+    for (i = 0U; i < 4U; ++i)
     {
         s_settings_rows[i] = NULL;
         s_settings_labels[i] = NULL;
@@ -4638,6 +4844,7 @@ static void lvgl_app_display_settings_clear_refs(void)
     s_settings_rotation_value = NULL;
     s_settings_sound_switch = NULL;
     s_settings_language_switch = NULL;
+    s_settings_battery_alarm_switch = NULL;
 }
 
 static void lvgl_app_display_settings_change_rotation(int8_t step)
@@ -4726,6 +4933,33 @@ static void lvgl_app_display_settings_toggle_language(uint8_t explicit_value,
     lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS);
 }
 
+static void lvgl_app_display_settings_toggle_battery_alarm(
+    uint8_t explicit_value, uint8_t use_explicit)
+{
+    uint8_t enabled = UI_Settings_GetLowBatteryAlarmEnabled();
+
+    enabled = (use_explicit != 0U) ? ((explicit_value != 0U) ? 1U : 0U) :
+                                     ((enabled == 0U) ? 1U : 0U);
+    UI_Settings_SetLowBatteryAlarmEnabled(enabled);
+    lvgl_app_display_settings_refresh();
+    if (s_settings_battery_alarm_switch != NULL)
+    {
+        UI_Anim_StateBounce(s_settings_battery_alarm_switch);
+    }
+    if (lvgl_app_chinese_enabled() != 0U)
+    {
+        lvgl_app_set_status((enabled != 0U) ?
+                            "低压蜂鸣报警已开启 | 正在保存" :
+                            "低压蜂鸣报警已关闭 | 正在保存");
+    }
+    else
+    {
+        lvgl_app_set_status((enabled != 0U) ?
+                            "Low Battery Alarm ON | saving" :
+                            "Low Battery Alarm OFF | saving");
+    }
+}
+
 static void lvgl_app_display_settings_event_cb(lv_event_t *e)
 {
     lv_event_code_t code = lv_event_get_code(e);
@@ -4752,9 +4986,13 @@ static void lvgl_app_display_settings_event_cb(lv_event_t *e)
         {
             lvgl_app_display_settings_toggle_sound(0U, 0U);
         }
-        else
+        else if (row == 2U)
         {
             lvgl_app_display_settings_toggle_language(0U, 0U);
+        }
+        else
+        {
+            lvgl_app_display_settings_toggle_battery_alarm(0U, 0U);
         }
         return;
     }
@@ -4809,6 +5047,17 @@ static void lvgl_app_display_settings_event_cb(lv_event_t *e)
             lvgl_app_display_settings_toggle_language(1U, 1U);
         }
     }
+    else if (row == 3U)
+    {
+        if (key == LV_KEY_LEFT)
+        {
+            lvgl_app_display_settings_toggle_battery_alarm(0U, 1U);
+        }
+        else if (key == LV_KEY_RIGHT)
+        {
+            lvgl_app_display_settings_toggle_battery_alarm(1U, 1U);
+        }
+    }
 }
 
 static void lvgl_app_show_display_settings(void)
@@ -4830,12 +5079,12 @@ static void lvgl_app_show_display_settings(void)
     lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS,
                         lvgl_app_tr("Display Settings", "显示设置"));
 
-    for (i = 0U; i < 3U; ++i)
+    for (i = 0U; i < 4U; ++i)
     {
         row = lv_btn_create(s_page_content);
         s_settings_rows[i] = row;
-        lv_obj_set_size(row, 220, 52);
-        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 6 + (lv_coord_t)i * 58);
+        lv_obj_set_size(row, 220, 40);
+        lv_obj_align(row, LV_ALIGN_TOP_MID, 0, 2 + (lv_coord_t)i * 43);
         UI_Theme_ApplyDataCard(row);
         lv_obj_set_style_radius(row, 12, LV_PART_MAIN);
         lv_obj_set_style_pad_left(row, 14, LV_PART_MAIN);
@@ -4853,7 +5102,7 @@ static void lvgl_app_show_display_settings(void)
         s_settings_labels[i] = label;
         lv_label_set_text(label, "");
         lv_label_set_long_mode(label, LV_LABEL_LONG_CLIP);
-        lv_obj_set_width(label, 120);
+        lv_obj_set_width(label, (i == 0U) ? 125 : 140);
         lv_obj_set_style_text_font(label, &lv_font_montserrat_14,
                                    LV_PART_MAIN);
         lv_obj_align(label, LV_ALIGN_LEFT_MID, 0, 0);
@@ -4876,7 +5125,7 @@ static void lvgl_app_show_display_settings(void)
     lv_obj_align(s_settings_rotation_value, LV_ALIGN_RIGHT_MID, 0, 0);
 
     s_settings_sound_switch = lv_switch_create(s_settings_rows[1]);
-    lv_obj_set_size(s_settings_sound_switch, 52, 28);
+    lv_obj_set_size(s_settings_sound_switch, 46, 24);
     lv_obj_align(s_settings_sound_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_clear_flag(s_settings_sound_switch,
                       LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
@@ -4893,7 +5142,7 @@ static void lvgl_app_show_display_settings(void)
                               LV_PART_KNOB);
 
     s_settings_language_switch = lv_switch_create(s_settings_rows[2]);
-    lv_obj_set_size(s_settings_language_switch, 52, 28);
+    lv_obj_set_size(s_settings_language_switch, 46, 24);
     lv_obj_align(s_settings_language_switch, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_clear_flag(s_settings_language_switch,
                       LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
@@ -4909,7 +5158,24 @@ static void lvgl_app_show_display_settings(void)
     lv_obj_set_style_bg_color(s_settings_language_switch, lv_color_white(),
                               LV_PART_KNOB);
 
-    if (s_settings_selected_row >= 3U)
+    s_settings_battery_alarm_switch = lv_switch_create(s_settings_rows[3]);
+    lv_obj_set_size(s_settings_battery_alarm_switch, 46, 24);
+    lv_obj_align(s_settings_battery_alarm_switch, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_clear_flag(s_settings_battery_alarm_switch,
+                      LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_CLICK_FOCUSABLE);
+    lv_obj_set_style_bg_color(s_settings_battery_alarm_switch,
+                              lv_color_hex(0xCBD5E1), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_settings_battery_alarm_switch, LV_OPA_COVER,
+                            LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_settings_battery_alarm_switch,
+                              lv_color_hex(0x16A8E5),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_opa(s_settings_battery_alarm_switch, LV_OPA_COVER,
+                            LV_PART_INDICATOR | LV_STATE_CHECKED);
+    lv_obj_set_style_bg_color(s_settings_battery_alarm_switch, lv_color_white(),
+                              LV_PART_KNOB);
+
+    if (s_settings_selected_row >= 4U)
     {
         s_settings_selected_row = 0U;
     }
@@ -5888,15 +6154,8 @@ static void lvgl_app_process_global_stop_key(void)
 
     if (s_ctrl_page == LVGL_APP_CTRL_PAGE_MECANUM)
     {
-        // Emergency stop logic for Mecanum specifically
         lvgl_app_motor_speed_force_clear_all();
-        Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
-        s_mecanum_executing = 0U;
-        if (s_mecanum_timer)
-        {
-            lv_timer_del(s_mecanum_timer);
-            s_mecanum_timer = NULL;
-        }
+        lvgl_app_mecanum_stop();
         lvgl_app_set_status("EMERGENCY STOP!");
         lvgl_app_control_refresh_rows();
     }
@@ -6007,6 +6266,9 @@ void LVGL_App_Process(void)
 {
     uint32_t safety_faults = Safety_GetFaults();
     uint32_t ui_handler_start;
+    BatteryMonitorSnapshot battery_snapshot;
+    static uint32_t last_battery_sequence = UINT32_MAX;
+    static uint8_t last_battery_state = 0xFFU;
 
     /* NES owns the physical LCD while active.  Keep LVGL frozen so its flush
      * pipeline cannot overwrite a direct emulator frame.  The surrounding
@@ -6080,24 +6342,40 @@ void LVGL_App_Process(void)
         }
     }
 
-    if (g_adc_update_flag)
+    BatteryMonitor_GetSnapshot(&battery_snapshot);
+    if ((battery_snapshot.sample_sequence != last_battery_sequence) ||
+        ((uint8_t)battery_snapshot.state != last_battery_state))
     {
-        g_adc_update_flag = 0;
+        last_battery_sequence = battery_snapshot.sample_sequence;
+        last_battery_state = (uint8_t)battery_snapshot.state;
         if (s_adc_label == NULL)
         {
             s_adc_label = lv_label_create(lv_layer_sys());
             lv_obj_align(s_adc_label, LV_ALIGN_TOP_RIGHT, -10, 10);
             lv_obj_set_style_text_font(s_adc_label, &lv_font_montserrat_14,
                                        LV_PART_MAIN);
-            lv_obj_set_style_text_color(s_adc_label, lv_color_hex(0xFFD166),
-                                        LV_PART_MAIN);
         }
         char buf[16];
-        int v_int = (int)g_adc_voltage;
-        // Calculate with 2 decimal precision and rounding to avoid truncation errors
-        int v_frac = (int)((g_adc_voltage - v_int) * 100.0f + 0.5f);
-        if (v_frac < 0) v_frac = -v_frac;
-        snprintf(buf, sizeof(buf), "%d.%02dV", v_int, v_frac);
+        if ((battery_snapshot.sample_valid == 0U) ||
+            (battery_snapshot.state == BATTERY_MONITOR_STALE))
+        {
+            (void)snprintf(buf, sizeof(buf), "--.--V");
+            lv_obj_set_style_text_color(s_adc_label, lv_color_hex(0x94A3B8),
+                                        LV_PART_MAIN);
+        }
+        else
+        {
+            int v_int = (int)battery_snapshot.filtered_voltage;
+            int v_frac = (int)((battery_snapshot.filtered_voltage -
+                                (float)v_int) * 100.0f + 0.5f);
+            if (v_frac < 0) v_frac = -v_frac;
+            (void)snprintf(buf, sizeof(buf), "%d.%02dV", v_int, v_frac);
+            lv_obj_set_style_text_color(
+                s_adc_label,
+                (battery_snapshot.state == BATTERY_MONITOR_LOW) ?
+                  lv_color_hex(0xEF4444) : lv_color_hex(0xFFD166),
+                LV_PART_MAIN);
+        }
         (void)UI_LabelSetTextIfChanged(s_adc_label, buf);
     }
 
@@ -6293,13 +6571,7 @@ static void lvgl_app_show_mecanum_control(void)
     s_ctrl_page = LVGL_APP_CTRL_PAGE_MECANUM;
     s_ctrl_selected_row = 0U;
     s_ctrl_editing = 0U;
-    s_mecanum_executing = 0U;
-    if (s_mecanum_timer)
-    {
-        lv_timer_del(s_mecanum_timer);
-        s_mecanum_timer = NULL;
-    }
-    Mecanum_MixedControl(0, 0, 0, 0, 0, 0);
+    lvgl_app_mecanum_stop();
 
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();

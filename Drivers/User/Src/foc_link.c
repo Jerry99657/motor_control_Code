@@ -1,4 +1,5 @@
 #include "foc_link.h"
+#include "safety_manager.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -35,6 +36,8 @@ static uint8_t s_telemetry_window[FOC_LINK_TELEMETRY_SIZE];
 static uint8_t s_telemetry_count = 0U;
 static FOC_LinkTelemetry s_telemetry;
 static FOC_LinkCommandState s_command_state;
+static volatile uint8_t s_safety_inhibit = 0U;
+static volatile uint8_t s_safety_stop_pending = 0U;
 
 _Static_assert(sizeof(float) == 4U, "FOC telemetry requires IEEE-754 float32");
 
@@ -238,6 +241,8 @@ void FOC_Link_Init(void)
   s_telemetry_count = 0U;
   memset(&s_telemetry, 0, sizeof(s_telemetry));
   memset(&s_command_state, 0, sizeof(s_command_state));
+  s_safety_inhibit = 0U;
+  s_safety_stop_pending = 0U;
   foc_link_unlock(primask);
 
   if (HAL_UART_Receive_IT(&huart4, &s_rx_byte, 1U) != HAL_OK)
@@ -249,6 +254,7 @@ void FOC_Link_Init(void)
 void FOC_Link_Process(void)
 {
   uint16_t tail;
+  uint8_t send_safety_stop = 0U;
 
   while (s_rx_tail != s_rx_head)
   {
@@ -261,41 +267,83 @@ void FOC_Link_Process(void)
     }
     s_rx_tail = tail;
   }
+  {
+    uint32_t primask = foc_link_lock();
+    if (s_safety_stop_pending != 0U)
+    {
+      s_safety_stop_pending = 0U;
+      send_safety_stop = 1U;
+    }
+    foc_link_unlock(primask);
+  }
+  if (send_safety_stop != 0U)
+  {
+    (void)FOC_Link_SendStop();
+  }
   foc_link_tx_kick();
+}
+
+void FOC_Link_SetSafetyInhibit(uint8_t inhibit)
+{
+  uint32_t primask = foc_link_lock();
+  inhibit = (inhibit != 0U) ? 1U : 0U;
+  if ((inhibit != 0U) && (s_safety_inhibit == 0U))
+  {
+    s_safety_stop_pending = 1U;
+  }
+  s_safety_inhibit = inhibit;
+  foc_link_unlock(primask);
 }
 
 int8_t FOC_Link_SendSpeed(float value)
 {
+  if ((value != 0.0f) &&
+      ((s_safety_inhibit != 0U) || (Safety_IsMotionAllowed() == 0U)))
+  {
+    return FOC_LINK_ERR_SAFETY;
+  }
   int8_t result = foc_link_format_one("Speed:", value);
 
   if (result == FOC_LINK_OK)
   {
     s_command_state.speed_target = value;
     s_command_state.mode = FOC_LINK_CONTROL_SPEED;
+    Safety_SetExternalMotionActive((value != 0.0f) ? 1U : 0U);
   }
   return result;
 }
 
 int8_t FOC_Link_SendAngle(float value)
 {
+  if ((s_safety_inhibit != 0U) || (Safety_IsMotionAllowed() == 0U))
+  {
+    return FOC_LINK_ERR_SAFETY;
+  }
   int8_t result = foc_link_format_one("Angle:", value);
 
   if (result == FOC_LINK_OK)
   {
     s_command_state.position_target = value;
     s_command_state.mode = FOC_LINK_CONTROL_POSITION;
+    Safety_SetExternalMotionActive(1U);
   }
   return result;
 }
 
 int8_t FOC_Link_SendTorque(float value)
 {
+  if ((value != 0.0f) &&
+      ((s_safety_inhibit != 0U) || (Safety_IsMotionAllowed() == 0U)))
+  {
+    return FOC_LINK_ERR_SAFETY;
+  }
   int8_t result = foc_link_format_one("Torque:", value);
 
   if (result == FOC_LINK_OK)
   {
     s_command_state.torque_target = value;
     s_command_state.mode = FOC_LINK_CONTROL_TORQUE;
+    Safety_SetExternalMotionActive((value != 0.0f) ? 1U : 0U);
   }
   return result;
 }
@@ -306,6 +354,10 @@ int8_t FOC_Link_SendMotor(uint8_t motor_id)
   int length;
   int8_t result;
 
+  if ((s_safety_inhibit != 0U) || (Safety_IsMotionAllowed() == 0U))
+  {
+    return FOC_LINK_ERR_SAFETY;
+  }
   if (motor_id > 1U)
   {
     return FOC_LINK_ERR_ARGUMENT;
@@ -319,6 +371,7 @@ int8_t FOC_Link_SendMotor(uint8_t motor_id)
   if (result == FOC_LINK_OK)
   {
     memset(&s_command_state, 0, sizeof(s_command_state));
+    Safety_SetExternalMotionActive(0U);
   }
   return result;
 }
@@ -326,11 +379,18 @@ int8_t FOC_Link_SendMotor(uint8_t motor_id)
 int8_t FOC_Link_SendSensorless(void)
 {
   static const char line[] = "Sensorless\n";
-  int8_t result = foc_link_queue_line(line, (int)(sizeof(line) - 1U));
+  int8_t result;
+
+  if ((s_safety_inhibit != 0U) || (Safety_IsMotionAllowed() == 0U))
+  {
+    return FOC_LINK_ERR_SAFETY;
+  }
+  result = foc_link_queue_line(line, (int)(sizeof(line) - 1U));
 
   if (result == FOC_LINK_OK)
   {
     memset(&s_command_state, 0, sizeof(s_command_state));
+    Safety_SetExternalMotionActive(0U);
   }
   return result;
 }
@@ -338,6 +398,11 @@ int8_t FOC_Link_SendSensorless(void)
 int8_t FOC_Link_SendLock(void)
 {
   static const char line[] = "Lock\n";
+
+  if ((s_safety_inhibit != 0U) || (Safety_IsMotionAllowed() == 0U))
+  {
+    return FOC_LINK_ERR_SAFETY;
+  }
   return foc_link_queue_line(line, (int)(sizeof(line) - 1U));
 }
 
@@ -352,6 +417,7 @@ int8_t FOC_Link_SendStop(void)
     s_command_state.speed_target = 0.0f;
     s_command_state.torque_target = 0.0f;
     s_command_state.mode = FOC_LINK_CONTROL_IDLE;
+    Safety_SetExternalMotionActive(0U);
   }
   return result;
 }

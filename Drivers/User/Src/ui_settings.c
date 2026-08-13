@@ -18,6 +18,7 @@
 static uint8_t s_rotation = UI_SETTINGS_ROTATION_0;
 static uint8_t s_key_sound_enabled = 1U;
 static uint8_t s_chinese_enabled = 0U;
+static uint8_t s_low_battery_alarm_enabled = 0U;
 static uint8_t s_storage_available = 0U;
 static uint8_t s_dirty = 0U;
 static uint8_t s_active_slot = 0xFFU;
@@ -25,6 +26,7 @@ static uint32_t s_sequence = 0U;
 static uint32_t s_save_due_tick = 0U;
 static int8_t s_last_save_result = UI_SETTINGS_OK;
 static volatile uint16_t s_buzzer_ticks = 0U;
+static volatile uint8_t s_low_battery_alert = 0U;
 
 static uint16_t ui_settings_read_u16(const uint8_t *data)
 {
@@ -77,7 +79,8 @@ static uint8_t ui_settings_record_valid(const uint8_t *record)
       (ui_settings_read_u16(&record[6]) != UI_SETTINGS_RECORD_SIZE) ||
       (record[12] >= UI_SETTINGS_ROTATION_COUNT) ||
       (record[13] > 1U) ||
-      ((record[14] != 0xFFU) && (record[14] > 1U)))
+      ((record[14] != 0xFFU) && (record[14] > 1U)) ||
+      ((record[15] != 0xFFU) && (record[15] > 1U)))
   {
     return 0U;
   }
@@ -96,6 +99,7 @@ static void ui_settings_build_record(uint8_t *record, uint32_t sequence)
   record[12] = s_rotation;
   record[13] = s_key_sound_enabled;
   record[14] = s_chinese_enabled;
+  record[15] = s_low_battery_alarm_enabled;
   ui_settings_write_u32(&record[UI_SETTINGS_CRC_OFFSET],
                         ui_settings_crc32(record, UI_SETTINGS_CRC_OFFSET));
 }
@@ -184,12 +188,14 @@ void UI_Settings_Init(uint8_t qspi_ready)
   s_rotation = UI_SETTINGS_ROTATION_0;
   s_key_sound_enabled = 1U;
   s_chinese_enabled = 0U;
+  s_low_battery_alarm_enabled = 0U;
   s_storage_available = (qspi_ready != 0U) ? 1U : 0U;
   s_dirty = 0U;
   s_active_slot = 0xFFU;
   s_sequence = 0U;
   s_last_save_result = UI_SETTINGS_OK;
   s_buzzer_ticks = 0U;
+  s_low_battery_alert = 0U;
   HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
 
   if (s_storage_available != 0U)
@@ -236,6 +242,10 @@ void UI_Settings_Init(uint8_t qspi_ready)
       /* Byte 14 was 0xFF in records written before the language option was
        * introduced. Preserve those valid records and default them to English. */
       s_chinese_enabled = (selected[14] <= 1U) ? selected[14] : 0U;
+      /* Byte 15 is 0xFF in settings written before the battery-alarm option.
+       * Preserve the record and use the safe default (alarm disabled). */
+      s_low_battery_alarm_enabled =
+          (selected[15] <= 1U) ? selected[15] : 0U;
     }
   }
 
@@ -260,6 +270,11 @@ uint8_t UI_Settings_GetKeySoundEnabled(void)
 uint8_t UI_Settings_GetChineseEnabled(void)
 {
   return s_chinese_enabled;
+}
+
+uint8_t UI_Settings_GetLowBatteryAlarmEnabled(void)
+{
+  return s_low_battery_alarm_enabled;
 }
 
 void UI_Settings_SetRotation(uint8_t rotation)
@@ -289,7 +304,10 @@ void UI_Settings_SetKeySoundEnabled(uint8_t enabled)
   if (enabled == 0U)
   {
     s_buzzer_ticks = 0U;
-    HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+    if (s_low_battery_alert == 0U)
+    {
+      HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+    }
   }
 }
 
@@ -304,6 +322,24 @@ void UI_Settings_SetChineseEnabled(uint8_t enabled)
   s_chinese_enabled = enabled;
   s_dirty = 1U;
   s_save_due_tick = HAL_GetTick() + UI_SETTINGS_SAVE_DELAY_MS;
+}
+
+void UI_Settings_SetLowBatteryAlarmEnabled(uint8_t enabled)
+{
+  enabled = (enabled != 0U) ? 1U : 0U;
+  if (enabled == s_low_battery_alarm_enabled)
+  {
+    return;
+  }
+
+  s_low_battery_alarm_enabled = enabled;
+  s_dirty = 1U;
+  s_save_due_tick = HAL_GetTick() + UI_SETTINGS_SAVE_DELAY_MS;
+  if (enabled == 0U)
+  {
+    /* Disabling the option must silence an active alarm immediately. */
+    UI_Settings_SetLowBatteryAlert(0U);
+  }
 }
 
 UI_SettingsDirection UI_Settings_MapDirection(UI_SettingsDirection physical)
@@ -364,7 +400,7 @@ int8_t UI_Settings_GetLastSaveResult(void)
 
 void UI_Settings_NotifyKeyPress(void)
 {
-  if (s_key_sound_enabled == 0U)
+  if ((s_key_sound_enabled == 0U) || (s_low_battery_alert != 0U))
   {
     return;
   }
@@ -373,8 +409,38 @@ void UI_Settings_NotifyKeyPress(void)
   HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
 }
 
+void UI_Settings_SetLowBatteryAlert(uint8_t active)
+{
+  if (s_low_battery_alarm_enabled == 0U)
+  {
+    active = 0U;
+  }
+  active = (active != 0U) ? 1U : 0U;
+  if (active == s_low_battery_alert)
+  {
+    return;
+  }
+
+  s_low_battery_alert = active;
+  if (active != 0U)
+  {
+    s_buzzer_ticks = 0U;
+    HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
+  }
+  else
+  {
+    HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_RESET);
+  }
+}
+
 void UI_Settings_BuzzerTick1ms(void)
 {
+  if (s_low_battery_alert != 0U)
+  {
+    HAL_GPIO_WritePin(BUZZER_GPIO_Port, BUZZER_Pin, GPIO_PIN_SET);
+    return;
+  }
+
   if (s_buzzer_ticks == 0U)
   {
     return;

@@ -4,6 +4,7 @@
 #include "media_memory.h"
 #include "mjpeg_scheduler.h"
 #include "qspi_w25q64.h"
+#include "runtime_monitor.h"
 
 #define QSPI_START_ANIM_MAX_FRAME_BYTES (LCD_Width * LCD_Height * 2U)
 
@@ -188,6 +189,7 @@ int8_t QSPI_StartAnim_Play(void)
 
   for (frame_index = 0; frame_index < info.frame_count; )
   {
+    RuntimeMonitor_BootProgress();
     frame_addr = QSPI_START_ANIM_BASE_ADDR + info.data_offset_bytes + ((uint32_t)frame_index * info.frame_size_bytes);
     if (QSPI_W25Qxx_ReadBuffer(frame_buffer, frame_addr, info.frame_size_bytes) != QSPI_W25QXX_OK)
     {

@@ -52,6 +52,17 @@ typedef enum {
     MECANUM_MOTOR_RL = 4  /* 左后 */
 } MecanumMotor_t;
 
+typedef struct
+{
+    float reference_deg;
+    float actual_deg;
+    float error_deg;
+    float requested_wz_dps;
+    float correction_wz_dps;
+    float output_wz_dps;
+    uint8_t active;
+} MecanumHeadingDiagnostics;
+
 /* 控制模式定义 */
 // typedef enum {
 //     MECANUM_MODE_SPEED    = 0, /* 速度模式：参数单位为 mm/s, deg/s */
@@ -77,6 +88,7 @@ uint8_t Mecanum_IsGyroModeEnabled(void);
 int8_t Mecanum_GetGyroDirection(void);
 uint8_t Mecanum_GetGyroSpeedPercent(void);
 float Mecanum_GetGyroSpinDps(void);
+void Mecanum_GetHeadingDiagnostics(MecanumHeadingDiagnostics *diagnostics);
 
 void Mecanum_Tick10ms(void);
 

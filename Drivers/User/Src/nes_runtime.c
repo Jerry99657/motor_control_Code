@@ -6,6 +6,7 @@
 #include "media_memory.h"
 #include "nes_cpu.h"
 #include "nes_rom_cache.h"
+#include "runtime_monitor.h"
 #include "sd_diskio.h"
 
 #include <stddef.h>
@@ -1604,6 +1605,7 @@ int8_t NES_Runtime_Process(void)
   {
     return NES_RUNTIME_ERR_CACHE;
   }
+  RuntimeMonitor_ForegroundHeartbeat();
   LCD_TransferService();
 
   if (s_nes.exit_armed == 0U)

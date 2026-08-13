@@ -3,6 +3,7 @@
 #include "qspi_partition.h"
 #include "qspi_w25q64.h"
 #include "usbd_cdc_if.h"
+#include "runtime_monitor.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -117,6 +118,11 @@ static int8_t cdc_send_bytes(void *context, const uint8_t *buf, uint16_t len)
 
 static int8_t cdc_recv_bytes(void *context, uint8_t *buf, uint16_t len, uint32_t timeout_ms)
 {
+  uint32_t received = 0U;
+  uint32_t chunk;
+  uint32_t read_now;
+  uint32_t start_tick;
+
   (void)context;
 
   if ((buf == NULL) || (len == 0U))
@@ -129,14 +135,31 @@ static int8_t cdc_recv_bytes(void *context, uint8_t *buf, uint16_t len, uint32_t
     return QSPI_ANIM_LOADER_ERR_UART;
   }
 
-  if (CDC_ReadBytes(buf, len, timeout_ms) != len)
+  start_tick = HAL_GetTick();
+  while (received < len)
   {
+    chunk = (uint32_t)len - received;
+    if (chunk > 64U)
+    {
+      chunk = 64U;
+    }
+
+    read_now = CDC_ReadBytes(&buf[received], chunk, 250U);
+    received += read_now;
+    if (received >= len)
+    {
+      RuntimeMonitor_BootProgress();
+      continue;
+    }
     if (CDC_GetAndClearRxOverflow() != 0U)
     {
       return QSPI_ANIM_LOADER_ERR_UART;
     }
-
-    return QSPI_ANIM_LOADER_ERR_TIMEOUT;
+    if ((HAL_GetTick() - start_tick) >= timeout_ms)
+    {
+      return QSPI_ANIM_LOADER_ERR_TIMEOUT;
+    }
+    RuntimeMonitor_BootProgress();
   }
 
   return QSPI_ANIM_LOADER_OK;
@@ -220,6 +243,7 @@ static int8_t QSPI_StartAnim_DownloadSession(void *context, LoaderSendFn send_fn
   erase_end_addr = align_up_u32(base_addr + payload_size, START_ANIM_LOADER_SECTOR_SIZE);
   for (erase_addr = base_addr; erase_addr < erase_end_addr; erase_addr += START_ANIM_LOADER_SECTOR_SIZE)
   {
+    RuntimeMonitor_BootProgress();
     if (QSPI_W25Qxx_SectorErase(erase_addr) != QSPI_W25QXX_OK)
     {
       send_text(send_fn, context, "ERR ERASE\r\n");
@@ -237,6 +261,7 @@ static int8_t QSPI_StartAnim_DownloadSession(void *context, LoaderSendFn send_fn
 
   while (remaining > 0U)
   {
+    RuntimeMonitor_BootProgress();
     chunk_size = (remaining > START_ANIM_LOADER_RX_CHUNK) ? START_ANIM_LOADER_RX_CHUNK : remaining;
 
     if (recv_fn(context, s_loader_rx_buffer, (uint16_t)chunk_size, START_ANIM_LOADER_IO_TIMEOUT_MS) != QSPI_ANIM_LOADER_OK)

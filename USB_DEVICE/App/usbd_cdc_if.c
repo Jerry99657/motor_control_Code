@@ -23,6 +23,7 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include "main.h"
+#include "runtime_monitor.h"
 #include <string.h>
 
 /* USER CODE END INCLUDE */
@@ -607,6 +608,7 @@ uint32_t CDC_ReadBytes(uint8_t *buf, uint32_t len, uint32_t timeout_ms)
     if (has_data != 0U)
     {
       read_len++;
+      RuntimeMonitor_BootProgress();
       continue;
     }
 
@@ -614,6 +616,7 @@ uint32_t CDC_ReadBytes(uint8_t *buf, uint32_t len, uint32_t timeout_ms)
     {
       break;
     }
+    RuntimeMonitor_BootProgress();
   }
 
   return read_len;

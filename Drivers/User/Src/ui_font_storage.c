@@ -3,6 +3,7 @@
 #include "fatfs.h"
 #include "qspi_partition.h"
 #include "qspi_w25q64.h"
+#include "runtime_monitor.h"
 #include "ui_font_asset.h"
 #include "src/font/lv_font_fmt_txt.h"
 
@@ -242,6 +243,7 @@ int8_t UI_FontStorage_InstallFromSd(const char *path)
        erase_address < erase_end;
        erase_address += 0x10000U)
   {
+    RuntimeMonitor_BootProgress();
     if (QSPI_W25Qxx_BlockErase_64K(erase_address) != QSPI_W25QXX_OK)
     {
       result = UI_FONT_STORAGE_ERR_QSPI;
@@ -254,6 +256,7 @@ int8_t UI_FontStorage_InstallFromSd(const char *path)
   crc = 0xFFFFFFFFU;
   while (remaining != 0U)
   {
+    RuntimeMonitor_BootProgress();
     chunk = (remaining > sizeof(s_io_buffer)) ? sizeof(s_io_buffer) : remaining;
     fr = f_read(&file, s_io_buffer, chunk, &bytes_read);
     if ((fr != FR_OK) || (bytes_read != chunk))
@@ -285,6 +288,7 @@ int8_t UI_FontStorage_InstallFromSd(const char *path)
   crc = 0xFFFFFFFFU;
   while (remaining != 0U)
   {
+    RuntimeMonitor_BootProgress();
     chunk = (remaining > sizeof(s_io_buffer)) ? sizeof(s_io_buffer) : remaining;
     if (QSPI_W25Qxx_ReadBuffer(s_io_buffer, address, chunk) !=
         QSPI_W25QXX_OK)
