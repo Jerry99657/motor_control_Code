@@ -1250,7 +1250,7 @@ int main(void)
   lv_port_indev_init();
   LVGL_App_Init();
   RuntimeMonitor_BootProgress();
-  IMU_Service_Init();
+  IMU_Service_Init((g_qspi_init_status == QSPI_W25QXX_OK) ? 1U : 0U);
   RuntimeMonitor_BootProgress();
 
   if (DCMotor_OL_Init() != HAL_OK)

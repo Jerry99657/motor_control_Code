@@ -1,4 +1,6 @@
 #include "imu_service.h"
+#include "imu_calibration.h"
+#include "imu_recorder.h"
 #include "mpu6500.h"
 
 #include <math.h>
@@ -66,7 +68,7 @@ static uint8_t imu_service_sample_is_stationary(
             (fabsf((float)sample->gz) <= gyro_limit)) ? 1U : 0U;
 }
 
-void IMU_Service_Init(void)
+void IMU_Service_Init(uint8_t qspi_ready)
 {
     s_snapshots[0] = (ImuServiceSnapshot_t){0};
     s_snapshots[1] = (ImuServiceSnapshot_t){0};
@@ -80,6 +82,15 @@ void IMU_Service_Init(void)
     s_planar_yaw_sign = -1.0f;
     s_previous_planar_rate_dps = 0.0f;
     s_stationary_samples = 0U;
+    IMU_Calibration_Init(qspi_ready);
+    if (IMU_Calibration_HasStableRuntimeBias() == 0U)
+    {
+        /* First boot keeps the previous trimmed-mean fallback.  Once a
+         * verified W25Q64 record exists, boot applies it immediately and
+         * skips the roughly 1.6 s blocking calibration. */
+        imu_init();
+    }
+    IMU_Recorder_Init();
 }
 
 void IMU_Service_Process(void)
@@ -90,36 +101,52 @@ void IMU_Service_Process(void)
     float planar_rate_dps;
     uint8_t next_index;
     uint8_t timing_contiguous;
-    int16_t raw_az;
-    int16_t raw_gx;
-    int16_t raw_gy;
-    int16_t raw_gz;
     uint32_t sample_delta_ms;
+    ImuCalibrationStatus cal_status;
+    static ImuCalibrationState previous_cal_state = IMU_CAL_STATE_IDLE;
 
     if ((uint32_t)(now - s_last_attempt_tick) < IMU_SERVICE_PERIOD_MS)
     {
         return;
     }
     s_last_attempt_tick = now;
+    IMU_Calibration_Process(now);
 
-    if (MPU6500_GetData(&sample.ax, &sample.ay, &sample.az,
-                        &sample.gx, &sample.gy, &sample.gz) != HAL_OK)
+    if (MPU6500_GetDataEx(&sample.raw_ax, &sample.raw_ay, &sample.raw_az,
+                          &sample.temperature_raw,
+                          &sample.raw_gx, &sample.raw_gy,
+                          &sample.raw_gz) != HAL_OK)
     {
         s_failure_count++;
         return;
     }
 
-    raw_az = sample.az;
-    raw_gx = sample.gx;
-    raw_gy = sample.gy;
-    raw_gz = sample.gz;
+    sample.ax = sample.raw_ax;
+    sample.ay = sample.raw_ay;
+    sample.az = sample.raw_az;
+    sample.gx = sample.raw_gx;
+    sample.gy = sample.raw_gy;
+    sample.gz = sample.raw_gz;
+    IMU_Calibration_ProcessRaw(sample.raw_ax, sample.raw_ay, sample.raw_az,
+                               sample.raw_gx, sample.raw_gy, sample.raw_gz,
+                               sample.temperature_raw, now);
+    IMU_Calibration_GetStatus(&cal_status);
+    if (((cal_status.state == IMU_CAL_STATE_SUCCESS) ||
+         (cal_status.state == IMU_CAL_STATE_FAILED_STORAGE)) &&
+        (previous_cal_state != cal_status.state))
+    {
+        s_planar_yaw = 0.0f;
+        s_previous_planar_rate_dps = 0.0f;
+        s_stationary_samples = 0U;
+    }
+    previous_cal_state = cal_status.state;
     if ((s_sequence == 0U) &&
-        ((raw_az >= IMU_SERVICE_MOUNT_Z_DETECT_MIN) ||
-         (raw_az <= -IMU_SERVICE_MOUNT_Z_DETECT_MIN)))
+        ((sample.raw_az >= IMU_SERVICE_MOUNT_Z_DETECT_MIN) ||
+         (sample.raw_az <= -IMU_SERVICE_MOUNT_Z_DETECT_MIN)))
     {
         /* Detect whether the sensor Z axis points up or down. This keeps
          * clockwise-positive chassis yaw valid for either flat mounting. */
-        s_planar_yaw_sign = (raw_az >= 0) ? -1.0f : 1.0f;
+        s_planar_yaw_sign = (sample.raw_az >= 0) ? -1.0f : 1.0f;
     }
 
     imu_data_calibration(&sample.gx, &sample.gy, &sample.gz,
@@ -131,12 +158,14 @@ void IMU_Service_Process(void)
         {
             s_stationary_samples++;
         }
-        if (s_stationary_samples >= IMU_SERVICE_STATIONARY_SAMPLES)
+        if ((s_stationary_samples >= IMU_SERVICE_STATIONARY_SAMPLES) &&
+            (IMU_Calibration_HasStableRuntimeBias() == 0U) &&
+            (IMU_Calibration_IsActive() == 0U))
         {
             /* Temperature changes gyro zero-rate output. Adapt only after a
              * full second of stationary evidence so genuine slow rotation is
              * never learned as bias. */
-            imu_adapt_gyro_bias(raw_gx, raw_gy, raw_gz,
+            imu_adapt_gyro_bias(sample.raw_gx, sample.raw_gy, sample.raw_gz,
                                 IMU_SERVICE_BIAS_ADAPT_GAIN);
         }
     }
@@ -191,6 +220,7 @@ void IMU_Service_Process(void)
     __DMB();
     s_published_index = next_index;
     s_has_snapshot = 1U;
+    IMU_Recorder_Push(&sample);
 }
 
 uint8_t IMU_Service_GetSnapshot(ImuServiceSnapshot_t *snapshot)

@@ -51,6 +51,14 @@ volatile bool apRunning = false;
 uint8_t selectedApChannel = 6;
 uint8_t apHealthFailures = 0;
 uint8_t activeWebSocketClient = 0xFF;
+uint32_t activeWebSocketSession = 0;
+uint32_t revokedWebSocketSessions[4] = {0, 0, 0, 0};
+uint8_t revokedWebSocketWriteIndex = 0;
+uint32_t joystickRxCount = 0;
+uint32_t joystickRejectedCount = 0;
+uint32_t joystickTakeoverCount = 0;
+uint16_t lastJoystickSequence = 0;
+bool joystickSequenceValid = false;
 volatile bool apClientDisconnected = false;
 volatile bool apStopped = false;
 
@@ -64,6 +72,10 @@ const uint8_t FRAME_END = 0x0A;
 const uint8_t WS_TYPE_MODE = 0x4D; // 'M'
 const uint8_t WS_TYPE_NES = 0x4E;  // 'N'
 const uint8_t WS_TYPE_NES_RESET = 0x52; // 'R'
+const uint8_t WS_TYPE_ACK = 0x41;   // 'A'
+const uint8_t WS_TYPE_HELLO = 0x48; // 'H'
+const uint8_t WS_TYPE_AXES = 0x4A;  // 'J'
+const uint8_t WS_TYPE_GYRO = 0x47;  // 'G'
 const uint8_t UART_DEV_NES = 0x0E;
 
 // HTML/JS Frontend - Highly visible, Captive Portal compatible
@@ -224,10 +236,23 @@ const char index_html[] PROGMEM = R"rawliteral(
     let clx=0, cly=0, crx=0, cry=0;
     let gyroEnabled=false, gyroSignedSpeed=0, gyroDirty=true;
     let axesDirty=true, lastAxesSendMs=0, debugUpdatePending=false;
+    let axesInFlight=false, axesSequence=0, axesSentAtMs=0;
+    let lastRttMs=0, mergedAxesCount=0, ackTimeoutCount=0;
+    let socketClaimed=false, superseded=false;
     let controlMode=0, nesButtons=0, nesSequence=0, lastNesSendMs=0;
     const nesPointers=new Map();
-    const AXES_MIN_SEND_MS=20, AXES_KEEPALIVE_MS=100, WS_MAX_BUFFERED_BYTES=128;
+    const AXES_MIN_SEND_MS=20, AXES_KEEPALIVE_MS=100, AXES_ACK_TIMEOUT_MS=300;
+    const WS_MAX_BUFFERED_BYTES=128;
     const NES_KEEPALIVE_MS=50, MODE_MECANUM=0, MODE_NES=1;
+    const WS_MSG_ACK=0x41, WS_MSG_HELLO=0x48, WS_MSG_AXES=0x4A;
+    const sessionId = (() => {
+      if(window.crypto && window.crypto.getRandomValues) {
+        const value = new Uint32Array(1);
+        window.crypto.getRandomValues(value);
+        return value[0] || 1;
+      }
+      return ((Date.now() ^ Math.floor(Math.random()*0xffffffff)) >>> 0) || 1;
+    })();
     const debug = document.getElementById('debug');
     const robotPage = document.getElementById('robotPage');
     const nesPage = document.getElementById('nesPage');
@@ -377,7 +402,9 @@ const char index_html[] PROGMEM = R"rawliteral(
     function switchMode() {
       if(controlMode === MODE_MECANUM) {
         // Stop every latched robot action before exposing the game controls.
-        clx=0; cly=0; crx=0; cry=0; axesDirty=true;
+        clx=0; cly=0; crx=0; cry=0;
+        if(axesInFlight) mergedAxesCount++;
+        axesDirty=true;
         gyroEnabled=false; gyroDirty=true;
         updateGyroUI(false);
         sendLatest(true);
@@ -519,6 +546,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         
         if(isLeft) { clx = outX; cly = outY; }
         else { crx = outX; cry = outY; }
+        if(axesInFlight) mergedAxesCount++;
         axesDirty = true;
         draw();
         updateDebug();
@@ -544,6 +572,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         kx = cx; ky = cy;
         if(isLeft) { clx = 0; cly = 0; }
         else { crx = 0; cry = 0; }
+        if(axesInFlight) mergedAxesCount++;
         axesDirty = true;
         draw();
         updateDebug();
@@ -574,7 +603,8 @@ const char index_html[] PROGMEM = R"rawliteral(
     let reconnectTimer = null;
 
     function socketReady() {
-      return socket && socket.readyState === WebSocket.OPEN;
+      return socket && socket.readyState === WebSocket.OPEN &&
+             socketClaimed && !superseded;
     }
 
     function updateDebug() {
@@ -582,9 +612,12 @@ const char index_html[] PROGMEM = R"rawliteral(
       debugUpdatePending = true;
       requestAnimationFrame(() => {
         debugUpdatePending = false;
-        const state = socketReady() ? 'LINK' : 'WAIT';
+        const state = superseded ? 'TAKEN' : (socketReady() ? 'LINK' : 'WAIT');
         const gyroState = gyroEnabled ? `G:${gyroSignedSpeed}` : 'G:OFF';
-        debug.innerText = `${state} | ${gyroState} | L: (${clx}, ${cly}) | R: (${crx}, ${cry})`;
+        const link = socketReady() ?
+          `RTT:${Math.round(lastRttMs)}ms M:${mergedAxesCount} T:${ackTimeoutCount}` :
+          'RTT:--';
+        debug.innerText = `${state} ${link} | ${gyroState} | L: (${clx}, ${cly}) | R: (${crx}, ${cry})`;
       });
     }
 
@@ -592,22 +625,28 @@ const char index_html[] PROGMEM = R"rawliteral(
       if(controlMode !== MODE_MECANUM || !socketReady()) return;
 
       const now = performance.now();
+      if(axesInFlight) return;
       if(!force && (now - lastAxesSendMs < AXES_MIN_SEND_MS)) return;
       if(!axesDirty && (now - lastAxesSendMs < AXES_KEEPALIVE_MS)) return;
 
-      // Permit a few tiny frames in flight. The previous exact-zero test
-      // dropped nearly every update on phones whose WiFi stack drains slowly.
-      if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
-
-      const axes = new Int8Array([clx, cly, crx, cry]);
+      /* Keep exactly one axes frame in flight. New touch positions overwrite
+       * the local pending state instead of forming a stale TCP queue. */
+      if(socket.bufferedAmount !== 0) return;
+      axesSequence = (axesSequence + 1) & 0xFFFF;
+      const axes = new Int8Array([
+        WS_MSG_AXES, axesSequence & 0xFF, (axesSequence >> 8) & 0xFF,
+        clx, cly, crx, cry
+      ]);
       socket.send(axes.buffer);
+      axesInFlight = true;
+      axesSentAtMs = now;
       axesDirty = false;
       lastAxesSendMs = now;
     }
 
     function sendGyroState() {
       if(controlMode !== MODE_MECANUM || !gyroDirty || !socketReady()) return;
-      if(socket.bufferedAmount > WS_MAX_BUFFERED_BYTES) return;
+      if(axesInFlight || socket.bufferedAmount !== 0) return;
 
       // This low-rate latched command is queued behind the joystick frame.
       const gyro = new Int8Array([0x47, gyroEnabled ? 1 : 0, gyroSignedSpeed]);
@@ -615,8 +654,65 @@ const char index_html[] PROGMEM = R"rawliteral(
       gyroDirty = false;
     }
 
+    function sendHello() {
+      if(!socket || socket.readyState !== WebSocket.OPEN) return;
+      const hello = new Uint8Array([
+        WS_MSG_HELLO,
+        sessionId & 0xFF, (sessionId >>> 8) & 0xFF,
+        (sessionId >>> 16) & 0xFF, (sessionId >>> 24) & 0xFF
+      ]);
+      socket.send(hello.buffer);
+    }
+
+    function setAxesZero() {
+      clx=0; cly=0; crx=0; cry=0;
+      if(axesInFlight) mergedAxesCount++;
+      axesDirty=true;
+      updateDebug();
+    }
+
+    function handleSocketMessage(event) {
+      if(typeof event.data === 'string') {
+        if(event.data === 'ACTIVE') {
+          socketClaimed=true;
+          axesInFlight=false;
+          axesDirty=true;
+          gyroDirty=true;
+          sendMode();
+          if(controlMode === MODE_NES) sendNesState(true);
+          else {
+            sendLatest(true);
+            sendGyroState();
+          }
+        } else if(event.data === 'TAKEN_OVER') {
+          superseded=true;
+          socketClaimed=false;
+          axesInFlight=false;
+          if(controlMode === MODE_NES) releaseAllNes(false);
+          else setAxesZero();
+          if(socket) socket.close();
+        }
+        updateDebug();
+        updateNesStatus();
+        return;
+      }
+
+      const message = new Uint8Array(event.data);
+      if(message.length === 3 && message[0] === WS_MSG_ACK) {
+        const ackSequence = message[1] | (message[2] << 8);
+        if(axesInFlight && ackSequence === axesSequence) {
+          lastRttMs = performance.now() - axesSentAtMs;
+          axesInFlight=false;
+          updateDebug();
+          /* Do not starve a low-rate gyro change while the stick is moving. */
+          sendGyroState();
+          if(axesDirty) sendLatest(true);
+        }
+      }
+    }
+
     function scheduleReconnect() {
-      if(reconnectTimer !== null) return;
+      if(reconnectTimer !== null || superseded || document.hidden) return;
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
         connectSocket();
@@ -624,6 +720,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function connectSocket() {
+      if(superseded || document.hidden) return;
       if(socket && (socket.readyState === WebSocket.OPEN ||
                     socket.readyState === WebSocket.CONNECTING)) return;
 
@@ -631,26 +728,26 @@ const char index_html[] PROGMEM = R"rawliteral(
         socket = new WebSocket('ws://192.168.4.1:81/');
         socket.binaryType = 'arraybuffer';
         socket.onopen = () => {
-          gyroDirty = true;
+          socketClaimed=false;
+          axesInFlight=false;
           updateDebug();
-          sendMode();
-          if(controlMode === MODE_NES) sendNesState(true);
-          else {
-            sendLatest();
-            sendGyroState();
-          }
+          sendHello();
         };
+        socket.onmessage = handleSocketMessage;
         socket.onclose = () => {
           socket = null;
+          socketClaimed=false;
+          axesInFlight=false;
           updateDebug();
-          scheduleReconnect();
+          updateNesStatus();
+          if(!superseded && !document.hidden) scheduleReconnect();
         };
         socket.onerror = () => {
           if(socket) socket.close();
         };
       } catch(e) {
         socket = null;
-        scheduleReconnect();
+        if(!superseded && !document.hidden) scheduleReconnect();
       }
       updateDebug();
     }
@@ -658,12 +755,38 @@ const char index_html[] PROGMEM = R"rawliteral(
     // Dirty axes are sent at up to 50 Hz; unchanged state is kept alive at
     // 10 Hz. Touch handlers also request an immediate latest-value send.
     setInterval(() => {
+      if(axesInFlight &&
+         (performance.now() - axesSentAtMs >= AXES_ACK_TIMEOUT_MS)) {
+        /* Reconnect instead of letting TCP deliver an obsolete control
+         * history after a long local-network stall. */
+        ackTimeoutCount++;
+        axesInFlight=false;
+        axesDirty=true;
+        updateDebug();
+        if(socket) socket.close();
+        return;
+      }
       if(controlMode === MODE_NES) sendNesState();
       else {
         sendLatest();
         sendGyroState();
       }
     }, 20);
+
+    document.addEventListener('visibilitychange', () => {
+      if(document.hidden) {
+        if(controlMode === MODE_NES) releaseAllNes(false);
+        else setAxesZero();
+        if(socket) socket.close();
+      } else if(!superseded) {
+        connectSocket();
+      }
+    });
+    window.addEventListener('pagehide', () => {
+      if(controlMode === MODE_NES) releaseAllNes(false);
+      else setAxesZero();
+      if(socket) socket.close();
+    });
     connectSocket();
     updateGyroUI(false);
     updateDebug();
@@ -763,13 +886,11 @@ void sendNesResetCommand() {
   nesResetCommandPending = false;
 }
 
-void stopJoystick(const char* reason) {
+void zeroJoystick(const char* reason) {
   const bool wasMoving = (lx != 0 || ly != 0 || rx != 0 || ry != 0);
 
   setJoystickValues(0, 0, 0, 0);
   joystickActive = false;
-  activeWebSocketClient = 0xFF;
-  clearNesButtons(reason);
   /* Gyro is a latched command. A joystick heartbeat timeout only zeros the
    * translation command; it must never synthesize a GYRO OFF frame. */
   if(wasMoving) {
@@ -777,18 +898,35 @@ void stopJoystick(const char* reason) {
   }
 }
 
+void stopJoystick(const char* reason) {
+  zeroJoystick(reason);
+  clearNesButtons(reason);
+  activeWebSocketClient = 0xFF;
+  activeWebSocketSession = 0;
+  joystickSequenceValid = false;
+}
+
+bool isWebSocketSessionRevoked(uint32_t session) {
+  for(uint8_t index = 0; index < 4U; ++index) {
+    if((session != 0U) && (revokedWebSocketSessions[index] == session)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void revokeWebSocketSession(uint32_t session) {
+  if((session == 0U) || isWebSocketSessionRevoked(session)) return;
+
+  revokedWebSocketSessions[revokedWebSocketWriteIndex] = session;
+  revokedWebSocketWriteIndex = (uint8_t)((revokedWebSocketWriteIndex + 1U) % 4U);
+}
+
 void handleUpdate() {
-  if (server.hasArg("lx")) lx = server.arg("lx").toInt();
-  if (server.hasArg("ly")) ly = server.arg("ly").toInt();
-  if (server.hasArg("rx")) rx = server.arg("rx").toInt();
-  if (server.hasArg("ry")) ry = server.arg("ry").toInt();
-
-  setJoystickValues(lx, ly, rx, ry);
-  lastJoystickUpdateMs = millis();
-  joystickActive = true;
-
+  /* Reject cached legacy pages so they cannot overwrite live WebSocket
+   * input belonging to the current Robot/NES controller page. */
   server.sendHeader("Cache-Control", "no-store");
-  server.send(200, "text/plain", "OK");
+  server.send(410, "text/plain", "WebSocket controller required");
 }
 
 void handleNotFound() {
@@ -811,33 +949,89 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
       break;
 
     case WStype_BIN:
+      if((length == 5U) && (payload[0] == WS_TYPE_HELLO)) {
+        const uint32_t session = ((uint32_t)payload[1]) |
+                                 ((uint32_t)payload[2] << 8) |
+                                 ((uint32_t)payload[3] << 16) |
+                                 ((uint32_t)payload[4] << 24);
+
+        if((session == 0U) ||
+           (isWebSocketSessionRevoked(session) &&
+            (session != activeWebSocketSession))) {
+          joystickRejectedCount++;
+          webSocket.sendTXT(client, "TAKEN_OVER");
+          break;
+        }
+
+        if((activeWebSocketClient != 0xFFU) &&
+           (activeWebSocketClient != client)) {
+          const uint8_t oldClient = activeWebSocketClient;
+          const uint32_t oldSession = activeWebSocketSession;
+
+          zeroJoystick("control page takeover");
+          clearNesButtons("control page takeover");
+          if((oldSession != 0U) && (oldSession != session)) {
+            revokeWebSocketSession(oldSession);
+            joystickTakeoverCount++;
+          }
+          activeWebSocketClient = client;
+          activeWebSocketSession = session;
+          joystickSequenceValid = false;
+          webSocket.sendTXT(oldClient, "TAKEN_OVER");
+        } else {
+          activeWebSocketClient = client;
+          activeWebSocketSession = session;
+          joystickSequenceValid = false;
+        }
+
+        webSocket.sendTXT(client, "ACTIVE");
+        Serial.printf("[WS] client %u owns control, session=%08lX\n",
+                      client, (unsigned long)session);
+        break;
+      }
+
+      if(client != activeWebSocketClient) {
+        joystickRejectedCount++;
+        break;
+      }
+
       if((length == 2U) && (payload[0] == WS_TYPE_MODE) &&
          (payload[1] <= (uint8_t)CONTROL_MODE_NES)) {
         setControlMode((ControlMode)payload[1]);
-        activeWebSocketClient = client;
       } else if((length == 2U) && (payload[0] == WS_TYPE_NES_RESET)) {
         if(controlMode == CONTROL_MODE_NES) {
           nesResetSequence = payload[1];
           nesResetCommandPending = true;
-          activeWebSocketClient = client;
         }
       } else if((length == 3U) && (payload[0] == WS_TYPE_NES)) {
         if(controlMode == CONTROL_MODE_NES) {
           setNesButtons(payload[1], payload[2]);
-          activeWebSocketClient = client;
         }
-      } else if((length == 4U) && (controlMode == CONTROL_MODE_MECANUM)) {
-        setJoystickValues((int8_t)payload[0], (int8_t)payload[1],
-                          (int8_t)payload[2], (int8_t)payload[3]);
-        activeWebSocketClient = client;
-        lastJoystickUpdateMs = millis();
-        joystickActive = true;
-      } else if((length == 3U) && (payload[0] == 0x47U) &&
+      } else if((length == 7U) && (payload[0] == WS_TYPE_AXES)) {
+        const uint16_t sequence = (uint16_t)payload[1] |
+                                  ((uint16_t)payload[2] << 8);
+        const uint8_t ack[] = {
+          WS_TYPE_ACK, (uint8_t)(sequence & 0xFFU),
+          (uint8_t)((sequence >> 8) & 0xFFU)
+        };
+
+        if(controlMode == CONTROL_MODE_MECANUM) {
+          if(!joystickSequenceValid || (sequence != lastJoystickSequence)) {
+            setJoystickValues((int8_t)payload[3], (int8_t)payload[4],
+                              (int8_t)payload[5], (int8_t)payload[6]);
+            lastJoystickSequence = sequence;
+            joystickSequenceValid = true;
+            joystickRxCount++;
+          }
+          lastJoystickUpdateMs = millis();
+          joystickActive = true;
+        }
+        (void)webSocket.sendBIN(client, ack, sizeof(ack));
+      } else if((length == 3U) && (payload[0] == WS_TYPE_GYRO) &&
                 (controlMode == CONTROL_MODE_MECANUM)) {
         setGyroControl(payload[1] != 0U, (int8_t)payload[2]);
-        activeWebSocketClient = client;
-        lastJoystickUpdateMs = millis();
-        joystickActive = true;
+      } else {
+        joystickRejectedCount++;
       }
       break;
 
@@ -1078,7 +1272,8 @@ void loop() {
 
   const uint32_t now = millis();
   if(joystickActive && (now - lastJoystickUpdateMs >= JOYSTICK_TIMEOUT_MS)) {
-    stopJoystick("control heartbeat timeout");
+    /* Retain page ownership so its next sequenced frame resumes immediately. */
+    zeroJoystick("control heartbeat timeout");
   }
   if((controlMode == CONTROL_MODE_NES) && (nesButtons != 0U) &&
      (now - lastNesUpdateMs >= NES_INPUT_TIMEOUT_MS)) {
@@ -1109,13 +1304,19 @@ void loop() {
 
   if(now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
-    Serial.printf("[Status] AP=%u clients=%u heap=%u mode=%s axes=%d,%d,%d,%d gyro=%u/%d nes=%02X\n",
+    Serial.printf("[Status] AP=%u clients=%u heap=%u mode=%s "
+                  "axes=%d,%d,%d,%d gyro=%u/%d nes=%02X ws=%u "
+                  "session=%08lX rx=%lu reject=%lu takeover=%lu\n",
                   apRunning ? 1U : 0U,
                   WiFi.softAPgetStationNum(),
                   ESP.getFreeHeap(),
                   (controlMode == CONTROL_MODE_NES) ? "NES" : "ROBOT",
                   lx, ly, rx, ry,
-                  gyroEnabled ? 1U : 0U, gyroSignedSpeed, nesButtons);
+                  gyroEnabled ? 1U : 0U, gyroSignedSpeed, nesButtons,
+                  activeWebSocketClient, (unsigned long)activeWebSocketSession,
+                  (unsigned long)joystickRxCount,
+                  (unsigned long)joystickRejectedCount,
+                  (unsigned long)joystickTakeoverCount);
   }
 
   if ((controlMode == CONTROL_MODE_MECANUM) &&

@@ -44,6 +44,12 @@ typedef struct{
     float yaw;
 }eulerian_angles_t;
 
+typedef struct
+{
+    float gyro_bias[3];
+    float accel_offset[3];
+} imu_calibration_t;
+
 /******************************************************************************************/
 
 void imu_init(void);
@@ -54,5 +60,8 @@ eulerian_angles_t imu_update_eulerian_angles(float gx, float gy, float gz,
 void imu_data_calibration(short *gx, short *gy, short *gz, short *ax, short *ay, short *az);
 void imu_adapt_gyro_bias(short raw_gx, short raw_gy, short raw_gz,
                          float gain);
+void imu_set_calibration(const imu_calibration_t *calibration);
+void imu_get_calibration(imu_calibration_t *calibration);
+void imu_reset_attitude(void);
 
 #endif

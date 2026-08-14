@@ -24,6 +24,8 @@
 #include "mpu6500.h"
 #include "imu.h"
 #include "imu_service.h"
+#include "imu_calibration.h"
+#include "imu_recorder.h"
 #include "comm_service.h"
 #include "foc_link.h"
 #include "camera_service.h"
@@ -420,6 +422,7 @@ static void lvgl_app_exit_gif_player(const char *reason);
 static void lvgl_app_motor_menu_event_cb(lv_event_t *e);
 static void lvgl_app_control_event_cb(lv_event_t *e);
 static void lvgl_app_mecanum_stop(void);
+static void lvgl_app_mpu6500_cleanup(void);
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req);
 static void lvgl_app_process_pending_screen(void);
 
@@ -1302,6 +1305,12 @@ static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
         (req != LVGL_APP_SCREEN_REQ_MECANUM))
     {
         lvgl_app_mecanum_stop();
+    }
+    if ((s_current_screen == LVGL_APP_SCREEN_REQ_MPU6500) &&
+        (req != LVGL_APP_SCREEN_REQ_NONE) &&
+        (req != LVGL_APP_SCREEN_REQ_MPU6500))
+    {
+        lvgl_app_mpu6500_cleanup();
     }
     s_pending_screen_req = req;
 }
@@ -6244,9 +6253,8 @@ void LVGL_App_Init(void)
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
     HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
 #endif
-    
+
     MPU6500_Init();
-    imu_init();
 
     if (font_storage_status == UI_FONT_STORAGE_OK)
     {
@@ -6401,9 +6409,51 @@ static lv_timer_t *s_mpu_timer = NULL;
 static lv_obj_t *s_mpu_chart = NULL;
 static lv_chart_series_t *s_mpu_pitch_series = NULL;
 static lv_chart_series_t *s_mpu_roll_series = NULL;
+static lv_obj_t *s_mpu_tool_label = NULL;
+static lv_obj_t *s_mpu_progress = NULL;
 static ui_value_follower_t s_mpu_angle_followers[3];
 static uint32_t s_mpu_last_chart_tick = 0U;
 static uint8_t s_mpu_sample_valid = 0xFFU;
+static ImuCalibrationState s_mpu_last_cal_state = (ImuCalibrationState)0xFF;
+static ImuRecorderState s_mpu_last_rec_state = (ImuRecorderState)0xFF;
+static uint8_t s_mpu_ok_latched = 0U;
+static uint8_t s_mpu_direction_latched = 0U;
+
+static const char *lvgl_app_imu_cal_state_text(ImuCalibrationState state)
+{
+    switch (state)
+    {
+        case IMU_CAL_STATE_SETTLING: return "CAL keep still";
+        case IMU_CAL_STATE_COLLECTING: return "CAL sampling";
+        case IMU_CAL_STATE_SUCCESS: return "CAL saved";
+        case IMU_CAL_STATE_FAILED_MOTION: return "CAL motion timeout";
+        case IMU_CAL_STATE_FAILED_QUALITY: return "CAL noisy";
+        case IMU_CAL_STATE_FAILED_STORAGE: return "CAL active, save failed";
+        case IMU_CAL_STATE_CANCELLED: return "CAL cancelled";
+        default: return "CAL ready";
+    }
+}
+
+static void lvgl_app_mpu6500_cleanup(void)
+{
+    if (s_mpu_timer != NULL)
+    {
+        lv_timer_del(s_mpu_timer);
+        s_mpu_timer = NULL;
+    }
+    IMU_Calibration_Cancel();
+    (void)IMU_Recorder_Stop();
+    s_mpu_chart = NULL;
+    s_mpu_pitch_series = NULL;
+    s_mpu_roll_series = NULL;
+    s_mpu_tool_label = NULL;
+    s_mpu_progress = NULL;
+    s_mpu_angle_labels[0] = NULL;
+    s_mpu_angle_labels[1] = NULL;
+    s_mpu_angle_labels[2] = NULL;
+    s_mpu_raw_labels[0] = NULL;
+    s_mpu_raw_labels[1] = NULL;
+}
 
 static void lvgl_app_format_centi(char *buffer, size_t size, int32_t value)
 {
@@ -6440,12 +6490,31 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
     char centi_text[20];
     char angle_text[24];
     char raw_text[64];
+    char tool_text[96];
+    ImuCalibrationStatus calibration;
+    ImuRecorderStatus recorder;
     uint8_t i;
+    uint8_t snapshot_valid = 0U;
 
     (void)timer;
     if (s_ctrl_page != LVGL_APP_CTRL_PAGE_MPU6500) {
         return;
     }
+
+    if (HAL_GPIO_ReadPin(Key_OK_GPIO_Port, Key_OK_Pin) != GPIO_PIN_RESET)
+    {
+        s_mpu_ok_latched = 0U;
+    }
+    if ((HAL_GPIO_ReadPin(Key_Up_GPIO_Port, Key_Up_Pin) != GPIO_PIN_RESET) &&
+        (HAL_GPIO_ReadPin(Key_Right_GPIO_Port, Key_Right_Pin) != GPIO_PIN_RESET) &&
+        (HAL_GPIO_ReadPin(Key_Down_GPIO_Port, Key_Down_Pin) != GPIO_PIN_RESET) &&
+        (HAL_GPIO_ReadPin(Key_Left_GPIO_Port, Key_Left_Pin) != GPIO_PIN_RESET))
+    {
+        s_mpu_direction_latched = 0U;
+    }
+
+    IMU_Calibration_GetStatus(&calibration);
+    IMU_Recorder_GetStatus(&recorder);
 
     if (IMU_Service_GetSnapshot(&snapshot) == 0U) {
         for (i = 0U; i < 3U; ++i)
@@ -6471,8 +6540,9 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
             lvgl_app_set_status(lvgl_app_tr(
                 "Waiting for a valid IMU sample", "等待有效IMU数据"));
         }
-        return;
+        goto update_imu_tools;
     }
+    snapshot_valid = 1U;
     
     now = HAL_GetTick();
     UI_ValueFollower_SetTarget(&s_mpu_angle_followers[0],
@@ -6512,6 +6582,73 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
         (void)UI_LabelSetTextIfChanged(s_mpu_raw_labels[1], raw_text);
     }
 
+update_imu_tools:
+    if (recorder.state == IMU_RECORDER_RECORDING)
+    {
+        (void)snprintf(tool_text, sizeof(tool_text), "%s %u%% | REC %lu",
+                       lvgl_app_imu_cal_state_text(calibration.state),
+                       calibration.progress_percent,
+                       (unsigned long)recorder.record_count);
+    }
+    else if (recorder.state == IMU_RECORDER_ERROR)
+    {
+        (void)snprintf(tool_text, sizeof(tool_text), "%s %u%% | SD E%u",
+                       lvgl_app_imu_cal_state_text(calibration.state),
+                       calibration.progress_percent, recorder.fs_error);
+    }
+    else
+    {
+        (void)snprintf(tool_text, sizeof(tool_text), "%s %u%% | LOG ready",
+                       lvgl_app_imu_cal_state_text(calibration.state),
+                       calibration.progress_percent);
+    }
+    if ((s_mpu_tool_label != NULL) &&
+        (lv_obj_is_valid(s_mpu_tool_label) != false))
+    {
+        (void)UI_LabelSetTextIfChanged(s_mpu_tool_label, tool_text);
+    }
+    if ((s_mpu_progress != NULL) &&
+        (lv_obj_is_valid(s_mpu_progress) != false))
+    {
+        lv_bar_set_value(s_mpu_progress, calibration.progress_percent,
+                         LV_ANIM_ON);
+    }
+
+    if (calibration.state != s_mpu_last_cal_state)
+    {
+        s_mpu_last_cal_state = calibration.state;
+        if (calibration.state == IMU_CAL_STATE_SUCCESS)
+        {
+            lvgl_app_show_toast(UI_NOTICE_SUCCESS, "IMU calibration saved");
+        }
+        else if (calibration.state == IMU_CAL_STATE_FAILED_STORAGE)
+        {
+            lvgl_app_show_toast(UI_NOTICE_WARNING,
+                                "Calibration active; QSPI save failed");
+        }
+        else if ((calibration.state == IMU_CAL_STATE_FAILED_MOTION) ||
+                 (calibration.state == IMU_CAL_STATE_FAILED_QUALITY))
+        {
+            lvgl_app_show_toast(UI_NOTICE_ERROR, "%s",
+                                lvgl_app_imu_cal_state_text(
+                                    calibration.state));
+        }
+    }
+    if (recorder.state != s_mpu_last_rec_state)
+    {
+        s_mpu_last_rec_state = recorder.state;
+        if (recorder.state == IMU_RECORDER_ERROR)
+        {
+            lvgl_app_show_toast(UI_NOTICE_ERROR, "IMU log SD error %u",
+                                recorder.fs_error);
+        }
+    }
+
+    if (snapshot_valid == 0U)
+    {
+        return;
+    }
+
     if ((s_mpu_chart != NULL) && (lv_obj_is_valid(s_mpu_chart) != false) &&
         (s_mpu_pitch_series != NULL) && (s_mpu_roll_series != NULL) &&
         ((now - s_mpu_last_chart_tick) >= 100U))
@@ -6527,7 +6664,7 @@ static void mpu6500_timer_cb(lv_timer_t *timer)
     {
         s_mpu_sample_valid = 1U;
         lvgl_app_set_status(lvgl_app_tr(
-            "Live attitude | Left or KEY2 returns",
+            "OK calibrates | Right logs | Left back",
             "实时姿态 | 左键或K2返回"));
     }
 }
@@ -6538,20 +6675,74 @@ static void lvgl_app_mpu6500_event_cb(lv_event_t *e)
     if (code == LV_EVENT_KEY)
     {
         uint32_t key = lv_event_get_key(e);
+        if (key == LV_KEY_ENTER)
+        {
+            ImuRecorderStatus recorder;
+            if (s_mpu_ok_latched != 0U)
+            {
+                return;
+            }
+            s_mpu_ok_latched = 1U;
+            IMU_Recorder_GetStatus(&recorder);
+            if (recorder.state == IMU_RECORDER_RECORDING)
+            {
+                lvgl_app_show_toast(UI_NOTICE_WARNING,
+                                    "Stop logging before calibration");
+                return;
+            }
+            if (IMU_Calibration_IsActive() != 0U)
+            {
+                IMU_Calibration_Cancel();
+                lvgl_app_show_toast(UI_NOTICE_WARNING,
+                                    "IMU calibration cancelled");
+            }
+            else if (IMU_Calibration_Start() == 0)
+            {
+                lvgl_app_show_toast(UI_NOTICE_INFO,
+                                    "Keep chassis level and still");
+            }
+            return;
+        }
+        if (key == LV_KEY_RIGHT)
+        {
+            ImuRecorderStatus recorder;
+            if (s_mpu_direction_latched != 0U)
+            {
+                return;
+            }
+            s_mpu_direction_latched = 1U;
+            if (IMU_Calibration_IsActive() != 0U)
+            {
+                lvgl_app_show_toast(UI_NOTICE_WARNING,
+                                    "Finish calibration before logging");
+                return;
+            }
+            IMU_Recorder_GetStatus(&recorder);
+            if (recorder.state == IMU_RECORDER_RECORDING)
+            {
+                (void)IMU_Recorder_Stop();
+                IMU_Recorder_GetStatus(&recorder);
+                lvgl_app_show_toast(UI_NOTICE_SUCCESS,
+                                    "Log stopped: %lu samples",
+                                    (unsigned long)recorder.record_count);
+            }
+            else if (IMU_Recorder_Start() == 0)
+            {
+                IMU_Recorder_GetStatus(&recorder);
+                lvgl_app_show_toast(UI_NOTICE_INFO, "%s", recorder.filename);
+            }
+            else
+            {
+                IMU_Recorder_GetStatus(&recorder);
+                lvgl_app_show_toast(UI_NOTICE_ERROR,
+                                    "Log start failed, FS=%u",
+                                    recorder.fs_error);
+            }
+            return;
+        }
         if (key == LV_KEY_ESC || key == LV_KEY_LEFT)
         {
-            if (s_mpu_timer) {
-                lv_timer_del(s_mpu_timer);
-                s_mpu_timer = NULL;
-            }
-            s_mpu_chart = NULL;
-            s_mpu_pitch_series = NULL;
-            s_mpu_roll_series = NULL;
-            s_mpu_angle_labels[0] = NULL;
-            s_mpu_angle_labels[1] = NULL;
-            s_mpu_angle_labels[2] = NULL;
-            s_mpu_raw_labels[0] = NULL;
-            s_mpu_raw_labels[1] = NULL;
+            lvgl_app_mpu6500_cleanup();
             lvgl_app_set_status(lvgl_app_tr("Back to main menu",
                                             "返回主菜单"));
             lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
@@ -6640,6 +6831,7 @@ static void lvgl_app_show_mpu6500_data(void)
     lv_obj_t *chart_title;
     lv_obj_t *legend;
     lv_obj_t *legend_roll;
+    lv_obj_t *tool_card;
     lv_obj_t *key_receiver;
     uint8_t i;
 
@@ -6732,9 +6924,43 @@ static void lvgl_app_show_mpu6500_data(void)
     }
     UI_Anim_StaggerIn(raw_card, 3U);
 
+    tool_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(tool_card, 224, 30);
+    lv_obj_set_pos(tool_card, 8, 105);
+    UI_Theme_ApplyDataCard(tool_card);
+    lv_obj_set_style_bg_color(tool_card, lv_color_hex(0xEEF6FF), LV_PART_MAIN);
+    lv_obj_set_style_radius(tool_card, 9, LV_PART_MAIN);
+    lv_obj_clear_flag(tool_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_mpu_tool_label = lv_label_create(tool_card);
+    lv_label_set_long_mode(s_mpu_tool_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_size(s_mpu_tool_label, 206, 13);
+    lv_obj_set_style_text_font(s_mpu_tool_label, &lv_font_montserrat_12,
+                               LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_mpu_tool_label, lv_color_hex(0x344054),
+                                LV_PART_MAIN);
+    lv_label_set_text(s_mpu_tool_label, "CAL ready 0% | LOG ready");
+    lv_obj_align(s_mpu_tool_label, LV_ALIGN_TOP_MID, 0, 2);
+
+    s_mpu_progress = lv_bar_create(tool_card);
+    lv_bar_set_range(s_mpu_progress, 0, 100);
+    lv_bar_set_value(s_mpu_progress, 0, LV_ANIM_OFF);
+    lv_obj_set_size(s_mpu_progress, 206, 4);
+    lv_obj_align(s_mpu_progress, LV_ALIGN_BOTTOM_MID, 0, -3);
+    lv_obj_set_style_bg_color(s_mpu_progress, lv_color_hex(0xD7E6F5),
+                              LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_mpu_progress, lv_color_hex(0x2563EB),
+                              LV_PART_INDICATOR);
+    lv_obj_set_style_radius(s_mpu_progress, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_mpu_progress, LV_RADIUS_CIRCLE,
+                            LV_PART_INDICATOR);
+    lv_obj_clear_flag(s_mpu_progress, LV_OBJ_FLAG_CLICKABLE |
+                      LV_OBJ_FLAG_SCROLLABLE);
+    UI_Anim_StaggerIn(tool_card, 4U);
+
     chart_card = lv_obj_create(s_page_content);
-    lv_obj_set_size(chart_card, 224, 72);
-    lv_obj_set_pos(chart_card, 8, 105);
+    lv_obj_set_size(chart_card, 224, 38);
+    lv_obj_set_pos(chart_card, 8, 139);
     UI_Theme_ApplyDataCard(chart_card);
     lv_obj_set_style_bg_color(chart_card, lv_color_hex(0xF8FAFC),
                               LV_PART_MAIN);
@@ -6764,8 +6990,8 @@ static void lvgl_app_show_mpu6500_data(void)
     lv_obj_align(legend_roll, LV_ALIGN_TOP_RIGHT, -7, 4);
 
     s_mpu_chart = lv_chart_create(chart_card);
-    lv_obj_set_size(s_mpu_chart, 212, 48);
-    lv_obj_align(s_mpu_chart, LV_ALIGN_BOTTOM_MID, 0, -3);
+    lv_obj_set_size(s_mpu_chart, 212, 20);
+    lv_obj_align(s_mpu_chart, LV_ALIGN_BOTTOM_MID, 0, -2);
     lv_obj_set_style_bg_opa(s_mpu_chart, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_border_width(s_mpu_chart, 0, LV_PART_MAIN);
     lv_obj_set_style_pad_all(s_mpu_chart, 0, LV_PART_MAIN);
@@ -6785,7 +7011,7 @@ static void lvgl_app_show_mpu6500_data(void)
                                              lv_color_hex(0xF59E0B),
                                              LV_CHART_AXIS_PRIMARY_Y);
     lv_obj_clear_flag(s_mpu_chart, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
-    UI_Anim_StaggerIn(chart_card, 4U);
+    UI_Anim_StaggerIn(chart_card, 5U);
 
     for (i = 0U; i < 3U; ++i)
     {
@@ -6793,6 +7019,10 @@ static void lvgl_app_show_mpu6500_data(void)
     }
     s_mpu_last_chart_tick = HAL_GetTick();
     s_mpu_sample_valid = 0xFFU;
+    s_mpu_last_cal_state = (ImuCalibrationState)0xFF;
+    s_mpu_last_rec_state = (ImuRecorderState)0xFF;
+    s_mpu_ok_latched = 0U;
+    s_mpu_direction_latched = 0U;
 
     key_receiver = lv_btn_create(s_page_content);
     lv_obj_set_size(key_receiver, 1, 1);
@@ -6811,7 +7041,7 @@ static void lvgl_app_show_mpu6500_data(void)
     }
 
     lvgl_app_set_status(lvgl_app_tr(
-        "Live attitude | Left or KEY2 returns",
+        "OK calibrates | Right logs | Left back",
         "实时姿态 | 左键或K2返回"));
     lvgl_app_page_finish();
 }

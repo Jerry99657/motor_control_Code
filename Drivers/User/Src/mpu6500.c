@@ -46,10 +46,20 @@ uint8_t MPU6500_Init(void) {
 
 HAL_StatusTypeDef MPU6500_GetData(int16_t *Accx, int16_t *Accy, int16_t *Accz,
                                   int16_t *Gyrox, int16_t *Gyroy, int16_t *Gyroz) {
+    int16_t temperature;
+
+    return MPU6500_GetDataEx(Accx, Accy, Accz, &temperature,
+                             Gyrox, Gyroy, Gyroz);
+}
+
+HAL_StatusTypeDef MPU6500_GetDataEx(int16_t *Accx, int16_t *Accy, int16_t *Accz,
+                                    int16_t *Temperature,
+                                    int16_t *Gyrox, int16_t *Gyroy, int16_t *Gyroz) {
     uint8_t buf[14];
     HAL_StatusTypeDef status;
 
     if ((Accx == NULL) || (Accy == NULL) || (Accz == NULL) ||
+        (Temperature == NULL) ||
         (Gyrox == NULL) || (Gyroy == NULL) || (Gyroz == NULL)) {
         return HAL_ERROR;
     }
@@ -64,6 +74,7 @@ HAL_StatusTypeDef MPU6500_GetData(int16_t *Accx, int16_t *Accy, int16_t *Accz,
     *Accx  = (int16_t)((buf[0]  << 8) | buf[1]);
     *Accy  = (int16_t)((buf[2]  << 8) | buf[3]);
     *Accz  = (int16_t)((buf[4]  << 8) | buf[5]);
+    *Temperature = (int16_t)((buf[6] << 8) | buf[7]);
     *Gyrox = (int16_t)((buf[8]  << 8) | buf[9]);
     *Gyroy = (int16_t)((buf[10] << 8) | buf[11]);
     *Gyroz = (int16_t)((buf[12] << 8) | buf[13]);

@@ -348,6 +348,43 @@ void imu_adapt_gyro_bias(short raw_gx, short raw_gy, short raw_gz,
     s_gyro_bias[2] += gain * ((float)raw_gz - s_gyro_bias[2]);
 }
 
+void imu_set_calibration(const imu_calibration_t *calibration)
+{
+    uint8_t axis;
+
+    if (calibration == NULL)
+    {
+        return;
+    }
+
+    for (axis = 0U; axis < 3U; ++axis)
+    {
+        s_gyro_bias[axis] = calibration->gyro_bias[axis];
+        s_accel_offset[axis] = calibration->accel_offset[axis];
+    }
+}
+
+void imu_get_calibration(imu_calibration_t *calibration)
+{
+    uint8_t axis;
+
+    if (calibration == NULL)
+    {
+        return;
+    }
+
+    for (axis = 0U; axis < 3U; ++axis)
+    {
+        calibration->gyro_bias[axis] = s_gyro_bias[axis];
+        calibration->accel_offset[axis] = s_accel_offset[axis];
+    }
+}
+
+void imu_reset_attitude(void)
+{
+    imu_reset_fusion_state();
+}
+
 void imu_init(void)
 {
     uint16_t i;

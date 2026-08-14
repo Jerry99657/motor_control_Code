@@ -6,7 +6,8 @@
 /*
  * W25Q64 persistent layout
  *
- * 0x000000 .. 0x3FDFFF  Start-up animation (current asset still has 38 KiB spare)
+ * 0x000000 .. 0x3FBFFF  Start-up animation (current asset still has 30 KiB spare)
+ * 0x3FC000 .. 0x3FDFFF  IMU calibration, two power-loss-safe 4 KiB slots
  * 0x3FE000 .. 0x3FFFFF  UI settings, two power-loss-safe 4 KiB slots
  * 0x400000 .. 0x400FFF  NES cache metadata (one erase sector)
  * 0x401000 .. 0x77FFFF  NES ROM image
@@ -17,9 +18,17 @@
  * loss during erase/program cannot expose a partially written ROM as valid.
  */
 #define QSPI_PARTITION_START_ANIM_OFFSET      0x000000U
-#define QSPI_PARTITION_START_ANIM_SIZE        0x3FE000U
+#define QSPI_PARTITION_START_ANIM_SIZE        0x3FC000U
 #define QSPI_PARTITION_START_ANIM_END         \
   (QSPI_PARTITION_START_ANIM_OFFSET + QSPI_PARTITION_START_ANIM_SIZE)
+
+#define QSPI_PARTITION_IMU_CAL_OFFSET         0x3FC000U
+#define QSPI_PARTITION_IMU_CAL_SIZE           0x002000U
+#define QSPI_PARTITION_IMU_CAL_END            \
+  (QSPI_PARTITION_IMU_CAL_OFFSET + QSPI_PARTITION_IMU_CAL_SIZE)
+#define QSPI_PARTITION_IMU_CAL_SLOT_A         QSPI_PARTITION_IMU_CAL_OFFSET
+#define QSPI_PARTITION_IMU_CAL_SLOT_B         \
+  (QSPI_PARTITION_IMU_CAL_OFFSET + 0x001000U)
 
 #define QSPI_PARTITION_UI_SETTINGS_OFFSET     0x3FE000U
 #define QSPI_PARTITION_UI_SETTINGS_SIZE       0x002000U
@@ -43,8 +52,12 @@
 #define QSPI_PARTITION_NES_ROM_END            \
   (QSPI_PARTITION_NES_ROM_OFFSET + QSPI_PARTITION_NES_ROM_SIZE)
 
-#if (QSPI_PARTITION_START_ANIM_END > QSPI_PARTITION_UI_SETTINGS_OFFSET)
-#error "QSPI start animation overlaps UI settings"
+#if (QSPI_PARTITION_START_ANIM_END > QSPI_PARTITION_IMU_CAL_OFFSET)
+#error "QSPI start animation overlaps IMU calibration"
+#endif
+
+#if (QSPI_PARTITION_IMU_CAL_END > QSPI_PARTITION_UI_SETTINGS_OFFSET)
+#error "QSPI IMU calibration overlaps UI settings"
 #endif
 
 #if (QSPI_PARTITION_UI_SETTINGS_END > QSPI_PARTITION_NES_METADATA_OFFSET)
@@ -65,6 +78,7 @@
 #endif
 
 #if ((QSPI_PARTITION_START_ANIM_OFFSET & 0xFFFU) != 0U) || \
+    ((QSPI_PARTITION_IMU_CAL_OFFSET & 0xFFFU) != 0U) || \
     ((QSPI_PARTITION_UI_SETTINGS_OFFSET & 0xFFFU) != 0U) || \
     ((QSPI_PARTITION_NES_METADATA_OFFSET & 0xFFFU) != 0U) || \
     ((QSPI_PARTITION_NES_ROM_OFFSET & 0xFFFU) != 0U) || \
