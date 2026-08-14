@@ -11,6 +11,7 @@
 #include "runtime_monitor.h"
 #include "ui_settings.h"
 #include "ui_theme.h"
+#include "ui_navigation.h"
 #include "dc_motor_ol.h"
 #include "mjpeg_player.h"
 #include "sd_start_anim.h"
@@ -35,6 +36,8 @@
 #include "qspi_partition.h"
 #include "safety_manager.h"
 #include "battery_monitor.h"
+#include "app_health.h"
+#include "command_control.h"
 #include <stdlib.h>
 #include <ctype.h>
 #include <math.h>
@@ -130,27 +133,6 @@ typedef enum
 
 typedef enum
 {
-    LVGL_APP_SCREEN_REQ_NONE = 0,
-    LVGL_APP_SCREEN_REQ_MAIN,
-    LVGL_APP_SCREEN_REQ_MOTOR_MENU,
-    LVGL_APP_SCREEN_REQ_MOTOR_SPEED,
-    LVGL_APP_SCREEN_REQ_SERVO_ANGLE,
-    LVGL_APP_SCREEN_REQ_COMMAND,
-    LVGL_APP_SCREEN_REQ_SD_BROWSER,
-    LVGL_APP_SCREEN_REQ_NES_CACHE,
-    LVGL_APP_SCREEN_REQ_NES_PLAYER,
-    LVGL_APP_SCREEN_REQ_MECANUM,
-    LVGL_APP_SCREEN_REQ_MPU6500,
-    LVGL_APP_SCREEN_REQ_WS2812,
-    LVGL_APP_SCREEN_REQ_FOC,
-    LVGL_APP_SCREEN_REQ_DIAGNOSTICS,
-    LVGL_APP_SCREEN_REQ_CAMERA,
-    LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS,
-    LVGL_APP_SCREEN_REQ_GIF
-} lvgl_app_screen_req_t;
-
-typedef enum
-{
     LVGL_APP_CAMERA_PHASE_OFF = 0,
     LVGL_APP_CAMERA_PHASE_INIT_PENDING,
     LVGL_APP_CAMERA_PHASE_READY,
@@ -195,8 +177,7 @@ static lv_fs_drv_t s_lvfs_drv;
 static uint8_t s_lvfs_registered = 0U;
 
 static lvgl_app_ctrl_page_t s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
-static lvgl_app_screen_req_t s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
-static lvgl_app_screen_req_t s_current_screen = LVGL_APP_SCREEN_REQ_NONE;
+static UiNavigation s_navigation;
 static uint8_t s_main_menu_selected_id = LVGL_APP_MENU_ID_MANUAL;
 static ui_page_t s_page;
 static ui_feedback_t s_feedback;
@@ -206,7 +187,6 @@ static ui_transition_manager_t s_transition_manager;
 static uint8_t s_ctrl_selected_row = 0U;
 static uint8_t s_ctrl_editing = 0U;
 static int16_t s_motor_speed_preset[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
-static int16_t s_command_motor_speed_setpoint[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_motor_speed_actual[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static int32_t s_motor_speed_display[LVGL_APP_MOTOR_COUNT] = {0, 0, 0, 0};
 static ui_value_follower_t s_motor_speed_followers[LVGL_APP_MOTOR_COUNT];
@@ -272,6 +252,8 @@ static lv_obj_t *s_settings_language_switch = NULL;
 static lv_obj_t *s_settings_battery_alarm_switch = NULL;
 static uint8_t s_settings_selected_row = 0U;
 
+static lvgl_app_screen_req_t lvgl_app_current_screen(void);
+
 static void lvgl_app_update_header_activity(void)
 {
     lvgl_app_activity_t activity = LVGL_APP_ACTIVITY_NONE;
@@ -299,7 +281,7 @@ static void lvgl_app_update_header_activity(void)
         symbol = LV_SYMBOL_WARNING;
         color = lv_color_hex(0xFCA5A5);
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_GIF)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_GIF)
     {
         activity = (s_gif_paused != 0U) ?
                    LVGL_APP_ACTIVITY_PAUSED : LVGL_APP_ACTIVITY_RUNNING;
@@ -307,28 +289,28 @@ static void lvgl_app_update_header_activity(void)
         color = (s_gif_paused != 0U) ? lv_color_hex(0xFCD34D) : lv_color_hex(0x86EFAC);
         spin = 0U;
     }
-    else if ((s_current_screen == LVGL_APP_SCREEN_REQ_SD_BROWSER) ||
-             (s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE))
+    else if ((lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_SD_BROWSER) ||
+             (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_NES_CACHE))
     {
         activity = LVGL_APP_ACTIVITY_STORAGE;
         symbol = LV_SYMBOL_SD_CARD;
         color = lv_color_hex(0x93C5FD);
-        spin = ((s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE) &&
+        spin = ((lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_NES_CACHE) &&
                 (NES_RomCache_IsBusy() != 0U)) ? 1U : 0U;
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_COMMAND)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_COMMAND)
     {
         activity = LVGL_APP_ACTIVITY_COMMAND;
         symbol = LV_SYMBOL_USB;
         color = lv_color_hex(0x93C5FD);
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_DIAGNOSTICS)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_DIAGNOSTICS)
     {
         activity = LVGL_APP_ACTIVITY_DIAGNOSTIC;
         symbol = LV_SYMBOL_EYE_OPEN;
         color = lv_color_hex(0xC4B5FD);
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_CAMERA)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_CAMERA)
     {
         activity = LVGL_APP_ACTIVITY_RUNNING;
         symbol = LV_SYMBOL_IMAGE;
@@ -338,7 +320,7 @@ static void lvgl_app_update_header_activity(void)
                 (s_camera_phase == LVGL_APP_CAMERA_PHASE_CAPTURING) ||
                 (s_camera_phase == LVGL_APP_CAMERA_PHASE_DECODE_PENDING)) ? 1U : 0U;
     }
-    else if ((s_current_screen == LVGL_APP_SCREEN_REQ_MECANUM) &&
+    else if ((lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_MECANUM) &&
              ((s_mecanum_executing != 0U) || (Mecanum_IsMotionActive() != 0U)))
     {
         activity = LVGL_APP_ACTIVITY_RUNNING;
@@ -346,7 +328,7 @@ static void lvgl_app_update_header_activity(void)
         color = lv_color_hex(0x86EFAC);
         spin = 1U;
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_MOTOR_SPEED)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_MOTOR_SPEED)
     {
         for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
         {
@@ -426,23 +408,9 @@ static void lvgl_app_mpu6500_cleanup(void);
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req);
 static void lvgl_app_process_pending_screen(void);
 
-static uint8_t lvgl_app_screen_depth(lvgl_app_screen_req_t screen)
+static lvgl_app_screen_req_t lvgl_app_current_screen(void)
 {
-    if (screen == LVGL_APP_SCREEN_REQ_MAIN)
-    {
-        return 0U;
-    }
-
-    if ((screen == LVGL_APP_SCREEN_REQ_MOTOR_SPEED) ||
-        (screen == LVGL_APP_SCREEN_REQ_SERVO_ANGLE) ||
-        (screen == LVGL_APP_SCREEN_REQ_NES_CACHE) ||
-        (screen == LVGL_APP_SCREEN_REQ_NES_PLAYER) ||
-        (screen == LVGL_APP_SCREEN_REQ_GIF))
-    {
-        return 2U;
-    }
-
-    return 1U;
+    return UiNavigation_GetCurrent(&s_navigation);
 }
 
 static uint8_t lvgl_app_chinese_enabled(void)
@@ -459,10 +427,11 @@ static void lvgl_app_page_begin(lvgl_app_screen_req_t target, const char *title)
 {
     ui_transition_t transition = UI_TRANSITION_NONE;
     lv_obj_t *outgoing = NULL;
+    lvgl_app_screen_req_t current = lvgl_app_current_screen();
 
-    if ((s_current_screen != LVGL_APP_SCREEN_REQ_NONE) && (s_current_screen != target))
+    if ((current != LVGL_APP_SCREEN_REQ_NONE) && (current != target))
     {
-        transition = (lvgl_app_screen_depth(target) < lvgl_app_screen_depth(s_current_screen))
+        transition = (UiNavigation_GetDepth(target) < UiNavigation_GetDepth(current))
                          ? UI_TRANSITION_BACKWARD
                          : UI_TRANSITION_FORWARD;
     }
@@ -547,7 +516,7 @@ static void lvgl_app_page_begin(lvgl_app_screen_req_t target, const char *title)
 
     UI_Feedback_SetStatus(&s_feedback, s_status_text);
     UI_Feedback_SetFault(&s_feedback, s_last_safety_faults, s_status_text);
-    s_current_screen = target;
+    UiNavigation_Commit(&s_navigation, target);
     UI_TransitionManager_Prepare(&s_transition_manager, outgoing,
                                  s_page_content, transition);
 }
@@ -1295,32 +1264,43 @@ static void lvgl_app_servo_angle_send_cmd(uint8_t servo_index, int16_t angle)
 #endif
 }
 
-static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
+static void lvgl_app_navigation_leave(lvgl_app_screen_req_t current,
+                                      lvgl_app_screen_req_t target,
+                                      void *context)
 {
-    /* Mecanum Control owns its motion command only while its page is active.
-     * Put the guard at the common transition boundary so Left, KEY2/KEY3 and
-     * future navigation paths cannot leave a background command running. */
-    if ((s_current_screen == LVGL_APP_SCREEN_REQ_MECANUM) &&
-        (req != LVGL_APP_SCREEN_REQ_NONE) &&
-        (req != LVGL_APP_SCREEN_REQ_MECANUM))
+    (void)context;
+
+    if ((current == LVGL_APP_SCREEN_REQ_MECANUM) &&
+        (target != LVGL_APP_SCREEN_REQ_MECANUM))
     {
         lvgl_app_mecanum_stop();
     }
-    if ((s_current_screen == LVGL_APP_SCREEN_REQ_MPU6500) &&
-        (req != LVGL_APP_SCREEN_REQ_NONE) &&
-        (req != LVGL_APP_SCREEN_REQ_MPU6500))
+    if ((current == LVGL_APP_SCREEN_REQ_MPU6500) &&
+        (target != LVGL_APP_SCREEN_REQ_MPU6500))
     {
         lvgl_app_mpu6500_cleanup();
     }
-    s_pending_screen_req = req;
+    if ((current == LVGL_APP_SCREEN_REQ_COMMAND) &&
+        (target != LVGL_APP_SCREEN_REQ_COMMAND))
+    {
+        CommandControl_Leave();
+        s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    }
+}
+
+static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
+{
+    UiNavigation_Request(&s_navigation, req);
 }
 
 static void lvgl_app_process_pending_screen(void)
 {
     lvgl_app_screen_req_t req;
 
-    req = s_pending_screen_req;
-    s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
+    if (UiNavigation_TakePending(&s_navigation, &req) == 0U)
+    {
+        return;
+    }
 
     if (req == LVGL_APP_SCREEN_REQ_MAIN)
     {
@@ -1382,68 +1362,6 @@ static void lvgl_app_process_pending_screen(void)
 
 static lv_obj_t *s_cmd_ctrl_label = NULL;
 
-static int8_t s_joy_lx = 0;
-static int8_t s_joy_ly = 0;
-static int8_t s_joy_rx = 0;
-static int8_t s_joy_ry = 0;
-static uint8_t s_command_gyro_enabled = 0U;
-static int8_t s_command_gyro_signed_speed = 0;
-
-uint8_t LVGL_App_IsCommandControlActive(void)
-{
-    return (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND) ? 1U : 0U;
-}
-
-uint8_t LVGL_App_CommandSetMotorSpeed(uint8_t motor_index, int16_t speed_percent)
-{
-    if ((LVGL_App_IsCommandControlActive() == 0U) ||
-        (motor_index == 0U) || (motor_index > LVGL_APP_MOTOR_COUNT))
-    {
-        return 0U;
-    }
-
-    if (speed_percent < LVGL_APP_SPEED_MIN)
-    {
-        speed_percent = LVGL_APP_SPEED_MIN;
-    }
-    else if (speed_percent > LVGL_APP_SPEED_MAX)
-    {
-        speed_percent = LVGL_APP_SPEED_MAX;
-    }
-
-    s_command_motor_speed_setpoint[motor_index - 1U] = speed_percent;
-    lvgl_app_motor_speed_send_cmd(motor_index, speed_percent);
-    s_ctrl_last_actual_refresh_tick = 0U;
-    return 1U;
-}
-
-void LVGL_App_CommandStopMotors(void)
-{
-    uint8_t i;
-
-    if (LVGL_App_IsCommandControlActive() == 0U)
-    {
-        return;
-    }
-
-    for (i = 0U; i < LVGL_APP_MOTOR_COUNT; ++i)
-    {
-        s_command_motor_speed_setpoint[i] = 0;
-    }
-    s_joy_lx = 0;
-    s_joy_ly = 0;
-    s_joy_rx = 0;
-    s_joy_ry = 0;
-    s_command_gyro_enabled = 0U;
-    s_command_gyro_signed_speed = 0;
-
-    Mecanum_GyroDisable();
-    Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-    DCMotor_OL_RequestStopAll();
-    (void)FOC_Link_SendStop();
-    s_ctrl_last_actual_refresh_tick = 0U;
-}
-
 static void lvgl_app_control_refresh_rows(void)
 {
     uint8_t i;
@@ -1460,12 +1378,14 @@ static void lvgl_app_control_refresh_rows(void)
         if (s_cmd_ctrl_label != NULL)
         {
             char big_buf[256];
+            CommandControlSnapshot command;
             FOC_LinkTelemetry foc_telemetry;
             uint8_t foc_alive;
-            s_command_gyro_enabled = Mecanum_IsGyroModeEnabled();
+            CommandControl_GetSnapshot(&command);
+            command.gyro_enabled = Mecanum_IsGyroModeEnabled();
             FOC_Link_GetTelemetry(&foc_telemetry);
             foc_alive = FOC_Link_IsTelemetryAlive(250U);
-            int gyro_dps = (int)s_command_gyro_signed_speed * 2;
+            int gyro_dps = (int)command.gyro_signed_speed * 2;
             snprintf(big_buf, sizeof(big_buf),
                      "M1 Set: %+4d, Act: %+5ld\n"
                      "M2 Set: %+4d, Act: %+5ld\n"
@@ -1474,16 +1394,17 @@ static void lvgl_app_control_refresh_rows(void)
                      "FOC:%s V:%+6.1f Iq:%+5.2f\n"
                      "Gyro: %s  Spin:%+4d%% %+4ddps\n"
                      "Joy: L(%+3d,%+3d) R(%+3d,%+3d)",
-                     s_command_motor_speed_setpoint[0], s_motor_speed_display[0],
-                     s_command_motor_speed_setpoint[1], s_motor_speed_display[1],
-                     s_command_motor_speed_setpoint[2], s_motor_speed_display[2],
-                     s_command_motor_speed_setpoint[3], s_motor_speed_display[3],
+                     command.motor_speed_setpoint[0], s_motor_speed_display[0],
+                     command.motor_speed_setpoint[1], s_motor_speed_display[1],
+                     command.motor_speed_setpoint[2], s_motor_speed_display[2],
+                     command.motor_speed_setpoint[3], s_motor_speed_display[3],
                      (foc_alive != 0U) ? "UP  " : "DOWN",
                      (double)foc_telemetry.channel[1],
                      (double)foc_telemetry.channel[2],
-                     (s_command_gyro_enabled != 0U) ? "ON " : "OFF",
-                     (int)s_command_gyro_signed_speed, gyro_dps,
-                     s_joy_lx, s_joy_ly, s_joy_rx, s_joy_ry);
+                     (command.gyro_enabled != 0U) ? "ON " : "OFF",
+                     (int)command.gyro_signed_speed, gyro_dps,
+                     command.joystick_lx, command.joystick_ly,
+                     command.joystick_rx, command.joystick_ry);
             (void)UI_LabelSetTextIfChanged(s_cmd_ctrl_label, big_buf);
         }
         return;
@@ -1772,7 +1693,7 @@ static void lvgl_app_mecanum_stop(void)
 static void mecanum_start_timer_cb(lv_timer_t *timer)
 {
     if ((timer != s_mecanum_timer) ||
-        (s_current_screen != LVGL_APP_SCREEN_REQ_MECANUM) ||
+        (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_MECANUM) ||
         (s_ctrl_page != LVGL_APP_CTRL_PAGE_MECANUM) ||
         (s_mecanum_executing == 0U))
     {
@@ -3365,7 +3286,7 @@ static void lvgl_app_nes_player_start(void)
     DCMotor_OL_RequestStopAll();
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     s_ctrl_editing = 0U;
-    s_pending_screen_req = LVGL_APP_SCREEN_REQ_NONE;
+    UiNavigation_ClearPending(&s_navigation);
 
     lvgl_app_set_status("NES: OK=A, KEY1=B, OK+KEY1=Start, double KEY1=Select");
     UI_TransitionManager_Cancel(&s_transition_manager);
@@ -3388,7 +3309,7 @@ static void lvgl_app_nes_player_start(void)
     }
 
     lv_port_indev_suppress_all_keys_until_release();
-    s_current_screen = LVGL_APP_SCREEN_REQ_NES_PLAYER;
+    UiNavigation_Commit(&s_navigation, LVGL_APP_SCREEN_REQ_NES_PLAYER);
 }
 
 static int8_t lvgl_app_nes_player_process(void)
@@ -3511,7 +3432,7 @@ static void lvgl_app_nes_cache_process(void)
     uint8_t phase_changed;
     char info[192];
 
-    if (s_current_screen != LVGL_APP_SCREEN_REQ_NES_CACHE)
+    if (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_NES_CACHE)
     {
         return;
     }
@@ -3973,6 +3894,7 @@ static void lvgl_app_diagnostics_refresh(void)
     const char *page_name;
     const char *status_text;
     lv_color_t status_bg;
+    ui_perf_status_t visual_status;
     char text_buf[384];
 
     if ((s_diag_page_label == NULL) || (s_diag_data_label == NULL) ||
@@ -4008,10 +3930,11 @@ static void lvgl_app_diagnostics_refresh(void)
         status_text = "GOOD";
         status_bg = lv_color_hex(0xE4F7EA);
     }
+    visual_status = snapshot.status;
 
     if (s_diag_page_index == 0U)
     {
-        page_name = "1/7  OVERVIEW";
+        page_name = "1/8  OVERVIEW";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4034,7 +3957,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 1U)
     {
-        page_name = "2/7  DISPLAY";
+        page_name = "2/8  DISPLAY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4055,7 +3978,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 2U)
     {
-        page_name = "3/7  MEMORY";
+        page_name = "3/8  MEMORY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4075,7 +3998,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 3U)
     {
-        page_name = "4/7  RELIABILITY";
+        page_name = "4/8  RELIABILITY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4107,7 +4030,7 @@ static void lvgl_app_diagnostics_refresh(void)
         {
             voltage_fraction = -voltage_fraction;
         }
-        page_name = "5/7  SAFETY";
+        page_name = "5/8  SAFETY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4130,7 +4053,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 5U)
     {
-        page_name = "6/7  MOTION LOOP";
+        page_name = "6/8  MOTION LOOP";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4162,9 +4085,9 @@ static void lvgl_app_diagnostics_refresh(void)
             (unsigned long)snapshot.motor_encoder_suspect_events[2],
             (unsigned long)snapshot.motor_encoder_suspect_events[3]);
     }
-    else
+    else if (s_diag_page_index == 6U)
     {
-        page_name = "7/7  CHASSIS ODOM";
+        page_name = "7/8  CHASSIS ODOM";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4190,6 +4113,59 @@ static void lvgl_app_diagnostics_refresh(void)
             (unsigned long)snapshot.odometry_timing_gap_count,
             (snapshot.heading_control_active != 0U) ? "ON" : "OFF");
     }
+    else
+    {
+        AppHealthSnapshot health;
+        UiNavigationSnapshot navigation;
+
+        AppHealth_GetSnapshot(&health);
+        LVGL_App_GetNavigationSnapshot(&navigation);
+        if (health.state == APP_HEALTH_FAULT)
+        {
+            visual_status = UI_PERF_STATUS_OVERLOAD;
+            status_bg = lv_color_hex(0xFDE8E8);
+        }
+        else if (health.state == APP_HEALTH_WARNING)
+        {
+            visual_status = UI_PERF_STATUS_BUSY;
+            status_bg = lv_color_hex(0xFFF2CC);
+        }
+        else
+        {
+            visual_status = UI_PERF_STATUS_GOOD;
+            status_bg = lv_color_hex(0xE4F7EA);
+        }
+        page_name = "8/8  ARCHITECTURE";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "Health %-7s F %08lX\n"
+            "Evt P/H/D %5lu/%5lu/%3lu\n"
+            "Q %2u/%2u UART %4lu/%4lu\n"
+            "Cmd A/R/S %5lu/%3lu/%3lu %s\n"
+            "Nav C/P %2u/%2u T/R %5lu/%3lu\n"
+            "Sch L/C %5lu/%6lu T%u",
+            AppHealth_StateText(health.state),
+            (unsigned long)health.flags,
+            (unsigned long)health.events.posted_count,
+            (unsigned long)health.events.handled_count,
+            (unsigned long)health.events.dropped_count,
+            (unsigned int)health.events.pending_count,
+            (unsigned int)health.events.high_watermark,
+            (unsigned long)health.uart_rx_overflow_count,
+            (unsigned long)health.uart_tx_drop_count,
+            (unsigned long)health.command.accepted_command_count,
+            (unsigned long)health.command.rejected_command_count,
+            (unsigned long)health.command.stop_count,
+            (health.command.active != 0U) ? "ON" : "OFF",
+            (unsigned int)navigation.current,
+            (unsigned int)navigation.pending,
+            (unsigned long)navigation.transition_count,
+            (unsigned long)navigation.replaced_request_count,
+            (unsigned long)health.scheduler.run_count,
+            (unsigned long)health.scheduler.task_call_count,
+            (unsigned int)health.scheduler.task_count);
+    }
 
     (void)UI_LabelSetTextIfChanged(s_diag_page_label, page_name);
     (void)UI_LabelSetTextIfChanged(s_diag_data_label, text_buf);
@@ -4197,9 +4173,9 @@ static void lvgl_app_diagnostics_refresh(void)
         (lv_obj_is_valid(s_diag_status_card) != false))
     {
         lv_obj_set_style_bg_color(s_diag_status_card, status_bg, LV_PART_MAIN);
-        if (s_diag_last_status != snapshot.status)
+        if (s_diag_last_status != visual_status)
         {
-            s_diag_last_status = snapshot.status;
+            s_diag_last_status = visual_status;
             UI_Anim_StateBounce(s_diag_status_card);
         }
     }
@@ -4217,13 +4193,13 @@ static void lvgl_app_diagnostics_event_cb(lv_event_t *e)
     key = lvgl_app_event_get_key(e);
     if (key == LV_KEY_RIGHT)
     {
-        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 7U);
+        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 8U);
         lvgl_app_diagnostics_refresh();
         UI_Anim_CarouselIn(s_diag_data_panel, 1);
     }
     else if (key == LV_KEY_LEFT)
     {
-        s_diag_page_index = (s_diag_page_index == 0U) ? 6U : (uint8_t)(s_diag_page_index - 1U);
+        s_diag_page_index = (s_diag_page_index == 0U) ? 7U : (uint8_t)(s_diag_page_index - 1U);
         lvgl_app_diagnostics_refresh();
         UI_Anim_CarouselIn(s_diag_data_panel, -1);
     }
@@ -4516,7 +4492,7 @@ static void lvgl_app_camera_process(void)
     uint32_t decode_started;
     int8_t decode_result;
 
-    if (s_current_screen != LVGL_APP_SCREEN_REQ_CAMERA)
+    if (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_CAMERA)
     {
         return;
     }
@@ -4662,7 +4638,7 @@ static void lvgl_app_camera_process(void)
 
 static void lvgl_app_camera_exit(const char *reason)
 {
-    if (s_current_screen != LVGL_APP_SCREEN_REQ_CAMERA)
+    if (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_CAMERA)
     {
         return;
     }
@@ -5441,7 +5417,7 @@ static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
     uint16_t i;
     int8_t direction;
 
-    if ((line == NULL) || (LVGL_App_IsCommandControlActive() == 0U))
+    if ((line == NULL) || (CommandControl_IsActive() == 0U))
     {
         return;
     }
@@ -5467,8 +5443,7 @@ static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
     {
         Mecanum_GyroDisable();
         Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-        s_command_gyro_enabled = 0U;
-        s_command_gyro_signed_speed = 0;
+        CommandControl_SetGyroState(0U, 0);
         lvgl_app_cmd_send_text(channel, "GYRO OFF OK\r\n");
     }
     else if ((fields == 4) && (strcmp(action, "ON") == 0) &&
@@ -5490,10 +5465,10 @@ static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
 
         if (Mecanum_GyroEnable(direction, (uint8_t)speed_percent) != 0U)
         {
-            s_command_gyro_enabled = 1U;
-            s_command_gyro_signed_speed =
+            CommandControl_SetGyroState(
+                1U,
                 (int8_t)((direction == MECANUM_GYRO_DIRECTION_CCW) ?
-                         -speed_percent : speed_percent);
+                         -speed_percent : speed_percent));
             lvgl_app_cmd_send_text(channel, "GYRO ON OK\r\n");
         }
         else
@@ -5659,23 +5634,17 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
         return;
     }
 
-    if (LVGL_App_IsCommandControlActive() == 0U)
+    if (CommandControl_IsActive() == 0U)
     {
         return;
     }
     
     if (dev_id == 0x0C && len == 0x0A) // Virtual Joystick Mecanum Control
     {
-        s_joy_lx = (int8_t)frame[4];
-        s_joy_ly = (int8_t)frame[5];
-        s_joy_rx = (int8_t)frame[6];
-        s_joy_ry = (int8_t)frame[7];
-        
-        float wz = (float)s_joy_lx * 2.0f;
-        float vy = (float)s_joy_rx * 10.0f;
-        float vx = (float)s_joy_ry * 10.0f;
-        
-        Mecanum_MixedControl(vx, vy, wz, 0.0f, 0.0f, 0.0f);
+        (void)CommandControl_SetJoystick((int8_t)frame[4],
+                                         (int8_t)frame[5],
+                                         (int8_t)frame[6],
+                                         (int8_t)frame[7]);
         
         s_ctrl_last_actual_refresh_tick = 0; // Force UI refresh
         return;
@@ -5693,8 +5662,8 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
         {
             uint8_t i;
             for (i = 0; i < 4; i++) {
-                (void)LVGL_App_CommandSetMotorSpeed((uint8_t)(i + 1U),
-                                                    (int8_t)frame[5 + i]);
+                (void)CommandControl_SetMotorSpeed((uint8_t)(i + 1U),
+                                                   (int8_t)frame[5 + i]);
             }
         }
         else if (dev_id == 0x02 && len >= 0x08) // Single-motor
@@ -5702,7 +5671,7 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
             uint8_t port = frame[5];
             int8_t speed = (int8_t)frame[6];
             if (port >= 1 && port <= 4) {
-                (void)LVGL_App_CommandSetMotorSpeed(port, speed);
+                (void)CommandControl_SetMotorSpeed(port, speed);
             }
         }
         else if (dev_id == 0x03 && len >= 0x0D) // Mecanum Mixed Control
@@ -5747,14 +5716,12 @@ static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
                         Mecanum_MixedControl(0.0f, 0.0f, 0.0f,
                                             0.0f, 0.0f, 0.0f);
                     }
-                    s_command_gyro_enabled = 0U;
                     /* Preserve the ESP32 slider preset while gyro mode is OFF. */
-                    s_command_gyro_signed_speed = signed_speed;
+                    CommandControl_SetGyroState(0U, signed_speed);
                 }
                 else if (Mecanum_GyroEnable(direction, speed_percent) != 0U)
                 {
-                    s_command_gyro_enabled = 1U;
-                    s_command_gyro_signed_speed = signed_speed;
+                    CommandControl_SetGyroState(1U, signed_speed);
                 }
             }
         }
@@ -5838,6 +5805,11 @@ void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len)
     lvgl_app_com_rx_channel_cb(0U, buf, len);
 }
 
+void LVGL_App_GetNavigationSnapshot(UiNavigationSnapshot *snapshot)
+{
+    UiNavigation_GetSnapshot(&s_navigation, snapshot);
+}
+
 void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
 {
     uint32_t i;
@@ -5845,7 +5817,7 @@ void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
     uint16_t *rx_idx;
 
     if ((buf == NULL) || (channel >= 2U)) return;
-    if (LVGL_App_IsCommandControlActive() == 0U)
+    if (CommandControl_IsActive() == 0U)
     {
         s_cmd_text_rx_idx[channel] = 0U;
     }
@@ -5853,7 +5825,7 @@ void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
     rx_idx = &s_cmd_rx_idx[channel];
 
     for (i = 0; i < len; i++) {
-        if (LVGL_App_IsCommandControlActive() != 0U)
+        if (CommandControl_IsActive() != 0U)
         {
             lvgl_app_cmd_text_rx_byte(channel, buf[i]);
         }
@@ -5910,7 +5882,7 @@ static void lvgl_app_command_exit_event_cb(lv_event_t *e)
         return;
     }
 
-    LVGL_App_CommandStopMotors();
+    CommandControl_Leave();
     s_cmd_rx_idx[0] = 0U;
     s_cmd_rx_idx[1] = 0U;
     s_cmd_text_rx_idx[0] = 0U;
@@ -5932,7 +5904,7 @@ static void lvgl_app_show_command_control(void)
     ws2812_update();
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_COMMAND;
-    LVGL_App_CommandStopMotors();
+    CommandControl_Enter();
     s_cmd_rx_idx[0] = 0U;
     s_cmd_rx_idx[1] = 0U;
     s_cmd_text_rx_idx[0] = 0U;
@@ -6170,7 +6142,7 @@ static void lvgl_app_process_global_stop_key(void)
     }
     else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
     {
-        LVGL_App_CommandStopMotors();
+        CommandControl_Stop();
         s_cmd_rx_idx[0] = 0U;
         s_cmd_rx_idx[1] = 0U;
         lvgl_app_set_status("EMERGENCY STOP!");
@@ -6192,7 +6164,7 @@ static void lvgl_app_process_global_stop_key(void)
         lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_exit_gif_player("Stopped by KEY2");
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_NES_CACHE)
     {
         lv_port_indev_suppress_all_keys_until_release();
         lvgl_app_nes_cache_exit("NES cache cancelled by KEY2");
@@ -6221,12 +6193,12 @@ static void lvgl_app_process_media_return_key(void)
         lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_exit_gif_player("Returned by KEY3");
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_CAMERA)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_CAMERA)
     {
         lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_camera_exit("Returned by KEY3");
     }
-    else if (s_current_screen == LVGL_APP_SCREEN_REQ_NES_CACHE)
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_NES_CACHE)
     {
         lv_port_indev_suppress_all_keys_until_release();
         lvgl_app_nes_cache_exit("Returned by KEY3");
@@ -6244,6 +6216,9 @@ void LVGL_App_Init(void)
     font_storage_status = UI_FontStorage_Bootstrap();
 
     UI_Theme_Init(lv_disp_get_default());
+    UiNavigation_Init(&s_navigation);
+    UiNavigation_SetLifecycle(&s_navigation,
+                              lvgl_app_navigation_leave, NULL, NULL);
     UI_TransitionManager_Init(&s_transition_manager);
     UI_Feedback_Init(&s_feedback);
     UI_PerfDiag_Init();
@@ -6300,7 +6275,7 @@ void LVGL_App_Process(void)
         UI_FontStorage_MaintainMappedRead();
     }
     UI_PerfDiag_Process();
-    if ((s_current_screen == LVGL_APP_SCREEN_REQ_DIAGNOSTICS) &&
+    if ((lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_DIAGNOSTICS) &&
         ((HAL_GetTick() - s_diag_last_refresh_tick) >= 500U))
     {
         s_diag_last_refresh_tick = HAL_GetTick();

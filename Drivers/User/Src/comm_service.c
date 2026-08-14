@@ -1,12 +1,15 @@
 #include "comm_service.h"
+#include "app_event.h"
 #include "usbd_cdc_if.h"
-#include "lvgl_app.h"
 #include <string.h>
 
 #define COMM_UART_RX_BUFFER_SIZE 256U
 #define COMM_UART_TX_QUEUE_DEPTH 8U
 #define COMM_UART_TX_PACKET_SIZE 32U
 #define COMM_PROCESS_CHUNK_SIZE  64U
+
+_Static_assert(COMM_PROCESS_CHUNK_SIZE <= APP_EVENT_PAYLOAD_CAPACITY,
+               "Communication chunk must fit in one application event");
 
 typedef struct
 {
@@ -15,8 +18,6 @@ typedef struct
 } CommUartTxPacket_t;
 
 extern UART_HandleTypeDef huart5;
-extern void vofa_usb_rx_cb(uint8_t *buf, uint32_t len);
-
 static uint8_t s_uart_rx_buffer[COMM_UART_RX_BUFFER_SIZE];
 static volatile uint16_t s_uart_rx_head = 0U;
 static volatile uint16_t s_uart_rx_tail = 0U;
@@ -177,14 +178,13 @@ void CommService_Process(void)
 
     if (length > 0U)
     {
-        lvgl_app_com_rx_channel_cb(0U, buffer, length);
+        (void)AppEvent_PostCommRx(0U, buffer, (uint16_t)length);
     }
 
     length = CDC_ReadAppBytes(buffer, sizeof(buffer));
     if (length > 0U)
     {
-        lvgl_app_com_rx_channel_cb(1U, buffer, length);
-        vofa_usb_rx_cb(buffer, length);
+        (void)AppEvent_PostCommRx(1U, buffer, (uint16_t)length);
     }
 
     CDC_TxService();
