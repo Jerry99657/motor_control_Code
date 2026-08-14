@@ -3,12 +3,16 @@
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <WebSocketsServer.h>
+#include <ESPmDNS.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
 
-// WiFi AP Setup
-const char* ssid = "ESP32_JoyStick";
-const char* password = "12345678"; // At least 8 characters
+// Prefer the shared router; keep the original SoftAP as a recovery path.
+const char* staSsid = "HUAWEI-A48L7A_HiLink";
+const char* staPassword = "88888888@";
+const char* fallbackApSsid = "ESP32_JoyStick";
+const char* fallbackApPassword = "12345678"; // At least 8 characters
+const char* mdnsHostname = "esp32-controller";
 
 WebServer server(80);
 WebSocketsServer webSocket(81);
@@ -23,6 +27,10 @@ const uint32_t JOYSTICK_TIMEOUT_MS = 1000;
 const uint32_t NES_INPUT_TIMEOUT_MS = 350;
 const uint32_t NES_KEEPALIVE_MS = 50;
 const uint32_t AP_RETRY_INTERVAL_MS = 2000;
+const uint32_t STA_CONNECT_TIMEOUT_MS = 12000;
+const uint32_t STA_RETRY_INTERVAL_MS = 5000;
+const uint32_t STA_FALLBACK_DELAY_MS = 12000;
+const uint32_t MDNS_RETRY_INTERVAL_MS = 10000;
 const uint32_t STATUS_INTERVAL_MS = 5000;
 const uint32_t AP_HEALTH_INTERVAL_MS = 3000;
 const int8_t AP_TX_POWER_QDBM = 80; // 20 dBm, API unit is 0.25 dBm
@@ -48,6 +56,10 @@ bool nesCommandDirty = true;
 uint8_t nesResetSequence = 0;
 bool nesResetCommandPending = false;
 volatile bool apRunning = false;
+volatile bool staGotIp = false;
+volatile bool staDisconnected = false;
+bool staConnected = false;
+bool mdnsRunning = false;
 uint8_t selectedApChannel = 6;
 uint8_t apHealthFailures = 0;
 uint8_t activeWebSocketClient = 0xFF;
@@ -61,6 +73,9 @@ uint16_t lastJoystickSequence = 0;
 bool joystickSequenceValid = false;
 volatile bool apClientDisconnected = false;
 volatile bool apStopped = false;
+uint32_t lastStaRetryMs = 0;
+uint32_t staDisconnectedSinceMs = 0;
+uint32_t lastMdnsRetryMs = 0;
 
 // Joystick values (-100 ~ 100)
 int lx = 0, ly = 0, rx = 0, ry = 0;
@@ -725,7 +740,9 @@ const char index_html[] PROGMEM = R"rawliteral(
                     socket.readyState === WebSocket.CONNECTING)) return;
 
       try {
-        socket = new WebSocket('ws://192.168.4.1:81/');
+        /* Use the address that served this page. This works with the router
+         * address, mDNS hostname and the 192.168.4.1 fallback AP. */
+        socket = new WebSocket('ws://' + window.location.hostname + ':81/');
         socket.binaryType = 'arraybuffer';
         socket.onopen = () => {
           socketClaimed=false;
@@ -930,8 +947,8 @@ void handleUpdate() {
 }
 
 void handleNotFound() {
-  // Captive Portal Redirect Handler
-  server.sendHeader("Location", "http://192.168.4.1/", true);
+  // Relative redirect works on both the router and the fallback captive portal.
+  server.sendHeader("Location", "/", true);
   server.send(302, "text/plain", "");
 }
 
@@ -1041,7 +1058,11 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
 }
 
 void wifiEvent(WiFiEvent_t event) {
-  if(event == ARDUINO_EVENT_WIFI_AP_START) {
+  if(event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+    staGotIp = true;
+  } else if(event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+    staDisconnected = true;
+  } else if(event == ARDUINO_EVENT_WIFI_AP_START) {
     apRunning = true;
     Serial.println("[WiFi] SoftAP started");
   } else if(event == ARDUINO_EVENT_WIFI_AP_STOP) {
@@ -1156,8 +1177,9 @@ bool accessPointHealthy() {
     return false;
   }
   if(esp_wifi_get_config(WIFI_IF_AP, &apConfig) != ESP_OK) return false;
-  if((apConfig.ap.channel != selectedApChannel) ||
-     (apConfig.ap.ssid_hidden != 0) ||
+  /* In AP+STA mode the radio follows the router's channel automatically, so
+   * the configured fallback channel must not be treated as a fault. */
+  if((apConfig.ap.ssid_hidden != 0) ||
      (apConfig.ap.beacon_interval != 100)) {
     return false;
   }
@@ -1169,11 +1191,13 @@ bool startAccessPoint() {
   const IPAddress gateway(192, 168, 4, 1);
   const IPAddress subnet(255, 255, 255, 0);
 
-  WiFi.mode(WIFI_AP);
+  /* Keep the station interface alive so it can reconnect in the background. */
+  WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
 
   const bool configOk = WiFi.softAPConfig(localIp, gateway, subnet);
-  const bool apOk = WiFi.softAP(ssid, password, selectedApChannel, 0, 4);
+  const bool apOk = WiFi.softAP(fallbackApSsid, fallbackApPassword,
+                                selectedApChannel, 0, 4);
   const bool radioOk = apOk ? configureAccessPointRadio() : false;
 
   apRunning = configOk && apOk;
@@ -1184,7 +1208,57 @@ bool startAccessPoint() {
                 radioOk ? "OK" : "WARN",
                 selectedApChannel,
                 WiFi.softAPIP().toString().c_str());
+  if(apRunning) {
+    dnsServer.stop();
+    dnsServer.start(DNS_PORT, "*", localIp);
+  }
   return apRunning;
+}
+
+bool startStation() {
+  Serial.printf("[WiFi] connecting to %s", staSsid);
+  WiFi.mode(WIFI_STA);
+  const bool hostnameOk = WiFi.setHostname(mdnsHostname);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  Serial.printf(" [hostname=%s]", hostnameOk ? "OK" : "FAIL");
+  WiFi.begin(staSsid, staPassword);
+
+  const uint32_t startedAt = millis();
+  while((WiFi.status() != WL_CONNECTED) &&
+        (millis() - startedAt < STA_CONNECT_TIMEOUT_MS)) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  staConnected = (WiFi.status() == WL_CONNECTED);
+  staDisconnectedSinceMs = millis();
+  if(staConnected) {
+    Serial.printf("[WiFi] STA connected, IP=%s RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  } else {
+    Serial.println("[WiFi] STA timeout; starting recovery AP");
+  }
+  return staConnected;
+}
+
+void startMdnsIfNeeded() {
+  if(!staConnected || mdnsRunning) return;
+
+  lastMdnsRetryMs = millis();
+  if(MDNS.begin(mdnsHostname)) {
+    MDNS.setInstanceName("ESP32 Virtual Controller");
+    const bool httpOk = MDNS.addService("http", "tcp", 80);
+    const bool wsOk = MDNS.addService("ws", "tcp", 81);
+    MDNS.enableWorkstation(ESP_IF_WIFI_STA);
+    mdnsRunning = true;
+    Serial.printf("[mDNS] responder=OK http=%s ws=%s url=http://%s.local\n",
+                  httpOk ? "OK" : "FAIL", wsOk ? "OK" : "FAIL",
+                  mdnsHostname);
+  } else {
+    Serial.println("[mDNS] start failed; use the STA IP printed above");
+  }
 }
 
 #if 0
@@ -1231,9 +1305,10 @@ void setup() {
   WiFi.mode(WIFI_OFF);
   delay(100);
   selectedApChannel = chooseBestApChannel();
-  (void)startAccessPoint();
+  if(!startStation()) {
+    (void)startAccessPoint();
+  }
 
-  dnsServer.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
   server.on("/", HTTP_GET, handleRoot);
   server.on("/update", HTTP_GET, handleUpdate);
   server.onNotFound(handleNotFound);
@@ -1244,11 +1319,18 @@ void setup() {
   /* Avoid disconnecting mobile browsers during brief UI/network scheduling
    * stalls. Joystick freshness is handled separately by its data watchdog. */
   webSocket.enableHeartbeat(5000, 5000, 3);
-  Serial.println("[HTTP] http://192.168.4.1  [WS] port 81");
+  startMdnsIfNeeded();
+  if(staConnected) {
+    Serial.printf("[HTTP] http://%s or http://%s.local  [WS] port 81\n",
+                  WiFi.localIP().toString().c_str(), mdnsHostname);
+  }
+  if(apRunning) {
+    Serial.println("[HTTP] fallback AP: http://192.168.4.1");
+  }
 }
 
 void loop() {
-  dnsServer.processNextRequest();
+  if(apRunning) dnsServer.processNextRequest();
   server.handleClient();
   webSocket.loop();
   delay(1);
@@ -1260,13 +1342,30 @@ void loop() {
     Serial.println("[WiFi] SoftAP stopped");
   }
 
+  if(staGotIp) {
+    staGotIp = false;
+    staDisconnected = false;
+    staConnected = true;
+    Serial.printf("[WiFi] STA connected, IP=%s RSSI=%d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI());
+    startMdnsIfNeeded();
+  }
+
+  if(staDisconnected) {
+    staDisconnected = false;
+    staConnected = false;
+    staDisconnectedSinceMs = millis();
+    if(mdnsRunning) {
+      MDNS.end();
+      mdnsRunning = false;
+    }
+    Serial.println("[WiFi] STA disconnected; reconnecting");
+  }
+
   if(apClientDisconnected) {
     apClientDisconnected = false;
-    /* WebSocket disconnect identifies the controlling client precisely. An
-     * AP station event can also belong to a probing/secondary station. */
-    if(WiFi.softAPgetStationNum() == 0U) {
-      stopJoystick("phone disconnected");
-    }
+    /* Do not stop a controller connected through the router merely because a
+     * recovery-AP client left. The WebSocket callback identifies the owner. */
     Serial.println("[WiFi] station disconnected");
   }
 
@@ -1280,7 +1379,28 @@ void loop() {
     clearNesButtons("NES heartbeat timeout");
   }
 
-  if(!apRunning && (now - lastApRetryMs >= AP_RETRY_INTERVAL_MS)) {
+  if(!staConnected && (now - lastStaRetryMs >= STA_RETRY_INTERVAL_MS)) {
+    lastStaRetryMs = now;
+    if(WiFi.status() != WL_CONNECTED) {
+      Serial.println("[WiFi] retrying router connection");
+      (void)WiFi.reconnect();
+    }
+  }
+
+  if(staConnected && !mdnsRunning &&
+     (now - lastMdnsRetryMs >= MDNS_RETRY_INTERVAL_MS)) {
+    startMdnsIfNeeded();
+  }
+
+  if(!staConnected && !apRunning &&
+     (now - staDisconnectedSinceMs >= STA_FALLBACK_DELAY_MS)) {
+    Serial.println("[WiFi] router unavailable; enabling recovery AP");
+    lastApRetryMs = now;
+    (void)startAccessPoint();
+  }
+
+  if(!apRunning && (WiFi.getMode() == WIFI_AP_STA) &&
+     (now - lastApRetryMs >= AP_RETRY_INTERVAL_MS)) {
     lastApRetryMs = now;
     Serial.println("[WiFi] retrying SoftAP start");
     (void)startAccessPoint();
@@ -1296,7 +1416,8 @@ void loop() {
       if(apHealthFailures >= 2) {
         stopJoystick("SoftAP health failure");
         apRunning = false;
-        (void)WiFi.softAPdisconnect(true);
+        /* Keep the STA radio and its router reconnection alive. */
+        (void)WiFi.softAPdisconnect(false);
         lastApRetryMs = now;
       }
     }
@@ -1304,9 +1425,12 @@ void loop() {
 
   if(now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
-    Serial.printf("[Status] AP=%u clients=%u heap=%u mode=%s "
+    Serial.printf("[Status] STA=%u ip=%s rssi=%d AP=%u clients=%u heap=%u mode=%s "
                   "axes=%d,%d,%d,%d gyro=%u/%d nes=%02X ws=%u "
                   "session=%08lX rx=%lu reject=%lu takeover=%lu\n",
+                  staConnected ? 1U : 0U,
+                  staConnected ? WiFi.localIP().toString().c_str() : "0.0.0.0",
+                  staConnected ? WiFi.RSSI() : 0,
                   apRunning ? 1U : 0U,
                   WiFi.softAPgetStationNum(),
                   ESP.getFreeHeap(),
