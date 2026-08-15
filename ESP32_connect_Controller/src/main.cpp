@@ -7,6 +7,8 @@
 #include <esp_system.h>
 #include <esp_wifi.h>
 
+#include "flydigi_gamepad.h"
+
 // Prefer the shared router; keep the original SoftAP as a recovery path.
 const char* staSsid = "HUAWEI-A48L7A_HiLink";
 const char* staPassword = "88888888@";
@@ -47,9 +49,16 @@ enum ControlMode : uint8_t {
   CONTROL_MODE_MECANUM = 0,
   CONTROL_MODE_NES = 1
 };
+enum InputSource : uint8_t {
+  INPUT_SOURCE_NONE = 0,
+  INPUT_SOURCE_WEB = 1,
+  INPUT_SOURCE_GAMEPAD = 2
+};
 ControlMode controlMode = CONTROL_MODE_MECANUM;
+InputSource activeInputSource = INPUT_SOURCE_NONE;
 uint8_t nesButtons = 0;
 uint8_t nesSequence = 0;
+uint8_t gamepadNesSequence = 0;
 uint32_t lastNesUpdateMs = 0;
 uint32_t lastNesSendMs = 0;
 bool nesCommandDirty = true;
@@ -60,6 +69,7 @@ volatile bool staGotIp = false;
 volatile bool staDisconnected = false;
 bool staConnected = false;
 bool mdnsRunning = false;
+bool gamepadBleEnabled = false;
 uint8_t selectedApChannel = 6;
 uint8_t apHealthFailures = 0;
 uint8_t activeWebSocketClient = 0xFF;
@@ -854,6 +864,7 @@ void clearNesButtons(const char* reason) {
 
 void setControlMode(ControlMode mode) {
   nesResetCommandPending = false;
+  activeInputSource = INPUT_SOURCE_NONE;
   if(mode == CONTROL_MODE_NES) {
     setJoystickValues(0, 0, 0, 0);
     joystickActive = false;
@@ -915,12 +926,139 @@ void zeroJoystick(const char* reason) {
   }
 }
 
+const char* inputSourceName(InputSource source) {
+  switch(source) {
+    case INPUT_SOURCE_WEB:
+      return "WEB";
+    case INPUT_SOURCE_GAMEPAD:
+      return "GAMEPAD";
+    default:
+      return "NONE";
+  }
+}
+
+bool claimInputSource(InputSource source, const char* reason) {
+  if(source == INPUT_SOURCE_NONE) return false;
+  if(activeInputSource == source) return true;
+
+  /* BLE has deterministic ownership while active. The continuously streamed
+   * WebSocket frames therefore cannot fight an event-driven controller that
+   * only reports state changes. */
+  if((activeInputSource != INPUT_SOURCE_NONE) &&
+     (source != INPUT_SOURCE_GAMEPAD)) {
+    return false;
+  }
+
+  Serial.printf("[Input] %s -> %s: %s\n",
+                inputSourceName(activeInputSource), inputSourceName(source),
+                reason);
+  if(activeInputSource == INPUT_SOURCE_WEB) {
+    joystickActive = false;
+  }
+  activeInputSource = source;
+  return true;
+}
+
+void releaseInputSource(InputSource source, const char* reason) {
+  if(activeInputSource != source) return;
+
+  if(controlMode == CONTROL_MODE_MECANUM) {
+    zeroJoystick(reason);
+  } else {
+    clearNesButtons(reason);
+  }
+  Serial.printf("[Input] %s -> NONE: %s\n", inputSourceName(source), reason);
+  activeInputSource = INPUT_SOURCE_NONE;
+}
+
 void stopJoystick(const char* reason) {
-  zeroJoystick(reason);
-  clearNesButtons(reason);
+  /* Wi-Fi/WebSocket failures must never cancel a connected BLE controller. */
+  releaseInputSource(INPUT_SOURCE_WEB, reason);
   activeWebSocketClient = 0xFF;
   activeWebSocketSession = 0;
   joystickSequenceValid = false;
+}
+
+uint8_t gamepadToNesButtons(const flydigi_direwolf3::State& state) {
+  uint8_t buttons = 0U;
+  if(state.actionPressed(flydigi_direwolf3::kButtonA)) buttons |= 0x01U;
+  if(state.actionPressed(flydigi_direwolf3::kButtonB)) buttons |= 0x02U;
+  if(state.miscPressed(flydigi_direwolf3::kButtonSelect)) buttons |= 0x04U;
+  if(state.miscPressed(flydigi_direwolf3::kButtonStart)) buttons |= 0x08U;
+
+  switch(state.hat) {
+    case flydigi_direwolf3::kHatUp:
+      buttons |= 0x10U;
+      break;
+    case flydigi_direwolf3::kHatUpRight:
+      buttons |= 0x10U | 0x80U;
+      break;
+    case flydigi_direwolf3::kHatRight:
+      buttons |= 0x80U;
+      break;
+    case flydigi_direwolf3::kHatDownRight:
+      buttons |= 0x20U | 0x80U;
+      break;
+    case flydigi_direwolf3::kHatDown:
+      buttons |= 0x20U;
+      break;
+    case flydigi_direwolf3::kHatDownLeft:
+      buttons |= 0x20U | 0x40U;
+      break;
+    case flydigi_direwolf3::kHatLeft:
+      buttons |= 0x40U;
+      break;
+    case flydigi_direwolf3::kHatUpLeft:
+      buttons |= 0x10U | 0x40U;
+      break;
+    default:
+      break;
+  }
+  return buttons;
+}
+
+void processGamepadInput() {
+  bool connected = false;
+  if(flydigi_gamepad::takeConnectionChange(&connected) && !connected) {
+    releaseInputSource(INPUT_SOURCE_GAMEPAD, "BLE controller disconnected");
+  }
+
+  flydigi_direwolf3::State state;
+  while(flydigi_gamepad::takeState(&state)) {
+    if(controlMode == CONTROL_MODE_MECANUM) {
+      const int padLx = flydigi_direwolf3::axisPercent(state.leftX);
+      const int padLy = -flydigi_direwolf3::axisPercent(state.leftY);
+      const int padRx = flydigi_direwolf3::axisPercent(state.rightX);
+      const int padRy = -flydigi_direwolf3::axisPercent(state.rightY);
+      const bool active = (padLx != 0) || (padLy != 0) ||
+                          (padRx != 0) || (padRy != 0);
+
+      if(active) {
+        if(claimInputSource(INPUT_SOURCE_GAMEPAD, "BLE axes active")) {
+          setJoystickValues(padLx, padLy, padRx, padRy);
+        }
+      } else {
+        releaseInputSource(INPUT_SOURCE_GAMEPAD, "BLE axes centered");
+      }
+    } else {
+      const uint8_t buttons = gamepadToNesButtons(state);
+      if(buttons != 0U) {
+        if(claimInputSource(INPUT_SOURCE_GAMEPAD, "BLE NES button active") &&
+           (buttons != nesButtons)) {
+          setNesButtons(buttons, gamepadNesSequence++);
+          /* A short press and release can both be queued before loop() gets
+           * CPU time. Transmit every transition instead of coalescing them. */
+          sendNesCommand();
+        }
+      } else {
+        if(activeInputSource == INPUT_SOURCE_GAMEPAD) {
+          releaseInputSource(INPUT_SOURCE_GAMEPAD,
+                             "BLE NES buttons released");
+          sendNesCommand();
+        }
+      }
+    }
+  }
 }
 
 bool isWebSocketSessionRevoked(uint32_t session) {
@@ -985,8 +1123,7 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
           const uint8_t oldClient = activeWebSocketClient;
           const uint32_t oldSession = activeWebSocketSession;
 
-          zeroJoystick("control page takeover");
-          clearNesButtons("control page takeover");
+          releaseInputSource(INPUT_SOURCE_WEB, "control page takeover");
           if((oldSession != 0U) && (oldSession != session)) {
             revokeWebSocketSession(oldSession);
             joystickTakeoverCount++;
@@ -1022,7 +1159,17 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
         }
       } else if((length == 3U) && (payload[0] == WS_TYPE_NES)) {
         if(controlMode == CONTROL_MODE_NES) {
-          setNesButtons(payload[1], payload[2]);
+          if(payload[1] != 0U) {
+            claimInputSource(INPUT_SOURCE_WEB, "web NES button active");
+          }
+          if(activeInputSource == INPUT_SOURCE_WEB) {
+            if(payload[1] != 0U) {
+              setNesButtons(payload[1], payload[2]);
+            } else {
+              releaseInputSource(INPUT_SOURCE_WEB,
+                                 "web NES buttons released");
+            }
+          }
         }
       } else if((length == 7U) && (payload[0] == WS_TYPE_AXES)) {
         const uint16_t sequence = (uint16_t)payload[1] |
@@ -1033,15 +1180,29 @@ void webSocketEvent(uint8_t client, WStype_t type, uint8_t* payload, size_t leng
         };
 
         if(controlMode == CONTROL_MODE_MECANUM) {
-          if(!joystickSequenceValid || (sequence != lastJoystickSequence)) {
-            setJoystickValues((int8_t)payload[3], (int8_t)payload[4],
-                              (int8_t)payload[5], (int8_t)payload[6]);
+          const int webLx = (int8_t)payload[3];
+          const int webLy = (int8_t)payload[4];
+          const int webRx = (int8_t)payload[5];
+          const int webRy = (int8_t)payload[6];
+          const bool active = (webLx != 0) || (webLy != 0) ||
+                              (webRx != 0) || (webRy != 0);
+          if(active) {
+            claimInputSource(INPUT_SOURCE_WEB, "web axes active");
+          }
+          if((activeInputSource == INPUT_SOURCE_WEB) &&
+             (!joystickSequenceValid || (sequence != lastJoystickSequence))) {
+            setJoystickValues(webLx, webLy, webRx, webRy);
             lastJoystickSequence = sequence;
             joystickSequenceValid = true;
             joystickRxCount++;
           }
-          lastJoystickUpdateMs = millis();
-          joystickActive = true;
+          if(activeInputSource == INPUT_SOURCE_WEB) {
+            lastJoystickUpdateMs = millis();
+            joystickActive = active;
+            if(!active) {
+              releaseInputSource(INPUT_SOURCE_WEB, "web axes centered");
+            }
+          }
         }
         (void)webSocket.sendBIN(client, ack, sizeof(ack));
       } else if((length == 3U) && (payload[0] == WS_TYPE_GYRO) &&
@@ -1137,7 +1298,9 @@ bool configureAccessPointRadio() {
   protocolResult = esp_wifi_set_protocol(
       WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
   bandwidthResult = esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
-  powerSaveResult = esp_wifi_set_ps(WIFI_PS_NONE);
+  /* Wi-Fi modem sleep is mandatory when the ESP32-C3 software coexistence
+   * layer shares its RF with BLE. WIFI_PS_NONE makes BT enable abort. */
+  powerSaveResult = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
   powerResult = esp_wifi_set_max_tx_power(AP_TX_POWER_QDBM);
 
   getConfigResult = esp_wifi_get_config(WIFI_IF_AP, &apConfig);
@@ -1193,7 +1356,7 @@ bool startAccessPoint() {
 
   /* Keep the station interface alive so it can reconnect in the background. */
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
 
   const bool configOk = WiFi.softAPConfig(localIp, gateway, subnet);
   const bool apOk = WiFi.softAP(fallbackApSsid, fallbackApPassword,
@@ -1219,7 +1382,7 @@ bool startStation() {
   Serial.printf("[WiFi] connecting to %s", staSsid);
   WiFi.mode(WIFI_STA);
   const bool hostnameOk = WiFi.setHostname(mdnsHostname);
-  WiFi.setSleep(false);
+  WiFi.setSleep(true);
   WiFi.setAutoReconnect(true);
   Serial.printf(" [hostname=%s]", hostnameOk ? "OK" : "FAIL");
   WiFi.begin(staSsid, staPassword);
@@ -1259,6 +1422,27 @@ void startMdnsIfNeeded() {
   } else {
     Serial.println("[mDNS] start failed; use the STA IP printed above");
   }
+}
+
+bool prepareBleCoexistence() {
+  wifi_ps_type_t powerSave = WIFI_PS_NONE;
+  esp_err_t getResult = esp_wifi_get_ps(&powerSave);
+  esp_err_t setResult = ESP_OK;
+
+  if((getResult == ESP_OK) && (powerSave == WIFI_PS_NONE)) {
+    setResult = esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    if(setResult == ESP_OK) {
+      getResult = esp_wifi_get_ps(&powerSave);
+    }
+  }
+
+  const bool ready = (getResult == ESP_OK) &&
+                     (setResult == ESP_OK) &&
+                     (powerSave != WIFI_PS_NONE);
+  Serial.printf("[WiFi/BLE] coexist ps=%d get=%d set=%d ready=%u\n",
+                (int)powerSave, (int)getResult, (int)setResult,
+                ready ? 1U : 0U);
+  return ready;
 }
 
 #if 0
@@ -1327,12 +1511,22 @@ void setup() {
   if(apRunning) {
     Serial.println("[HTTP] fallback AP: http://192.168.4.1");
   }
+  gamepadBleEnabled = prepareBleCoexistence();
+  if(gamepadBleEnabled) {
+    flydigi_gamepad::begin();
+  } else {
+    Serial.println("[PAD BLE] disabled: Wi-Fi coexistence setup failed");
+  }
 }
 
 void loop() {
   if(apRunning) dnsServer.processNextRequest();
   server.handleClient();
   webSocket.loop();
+  if(gamepadBleEnabled) {
+    flydigi_gamepad::service();
+    processGamepadInput();
+  }
   delay(1);
 
   if(apStopped) {
@@ -1370,13 +1564,15 @@ void loop() {
   }
 
   const uint32_t now = millis();
-  if(joystickActive && (now - lastJoystickUpdateMs >= JOYSTICK_TIMEOUT_MS)) {
+  if((activeInputSource == INPUT_SOURCE_WEB) && joystickActive &&
+     (now - lastJoystickUpdateMs >= JOYSTICK_TIMEOUT_MS)) {
     /* Retain page ownership so its next sequenced frame resumes immediately. */
-    zeroJoystick("control heartbeat timeout");
+    releaseInputSource(INPUT_SOURCE_WEB, "control heartbeat timeout");
   }
-  if((controlMode == CONTROL_MODE_NES) && (nesButtons != 0U) &&
+  if((activeInputSource == INPUT_SOURCE_WEB) &&
+     (controlMode == CONTROL_MODE_NES) && (nesButtons != 0U) &&
      (now - lastNesUpdateMs >= NES_INPUT_TIMEOUT_MS)) {
-    clearNesButtons("NES heartbeat timeout");
+    releaseInputSource(INPUT_SOURCE_WEB, "NES heartbeat timeout");
   }
 
   if(!staConnected && (now - lastStaRetryMs >= STA_RETRY_INTERVAL_MS)) {
@@ -1426,8 +1622,9 @@ void loop() {
   if(now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
     Serial.printf("[Status] STA=%u ip=%s rssi=%d AP=%u clients=%u heap=%u mode=%s "
-                  "axes=%d,%d,%d,%d gyro=%u/%d nes=%02X ws=%u "
-                  "session=%08lX rx=%lu reject=%lu takeover=%lu\n",
+                  "source=%s axes=%d,%d,%d,%d gyro=%u/%d nes=%02X ws=%u "
+                  "session=%08lX rx=%lu reject=%lu takeover=%lu "
+                  "pad=%u/%d reports=%lu/%lu\n",
                   staConnected ? 1U : 0U,
                   staConnected ? WiFi.localIP().toString().c_str() : "0.0.0.0",
                   staConnected ? WiFi.RSSI() : 0,
@@ -1435,12 +1632,17 @@ void loop() {
                   WiFi.softAPgetStationNum(),
                   ESP.getFreeHeap(),
                   (controlMode == CONTROL_MODE_NES) ? "NES" : "ROBOT",
+                  inputSourceName(activeInputSource),
                   lx, ly, rx, ry,
                   gyroEnabled ? 1U : 0U, gyroSignedSpeed, nesButtons,
                   activeWebSocketClient, (unsigned long)activeWebSocketSession,
                   (unsigned long)joystickRxCount,
                   (unsigned long)joystickRejectedCount,
-                  (unsigned long)joystickTakeoverCount);
+                  (unsigned long)joystickTakeoverCount,
+                  flydigi_gamepad::isConnected() ? 1U : 0U,
+                  flydigi_gamepad::rssi(),
+                  (unsigned long)flydigi_gamepad::reportCount(),
+                  (unsigned long)flydigi_gamepad::droppedReportCount());
   }
 
   if ((controlMode == CONTROL_MODE_MECANUM) &&
