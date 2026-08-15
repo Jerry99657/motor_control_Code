@@ -27,7 +27,7 @@
 #include "imu_service.h"
 #include "imu_calibration.h"
 #include "imu_recorder.h"
-#include "comm_service.h"
+#include "command_protocol.h"
 #include "foc_link.h"
 #include "camera_service.h"
 #include "media_memory.h"
@@ -3934,7 +3934,7 @@ static void lvgl_app_diagnostics_refresh(void)
 
     if (s_diag_page_index == 0U)
     {
-        page_name = "1/8  OVERVIEW";
+        page_name = "1/9  OVERVIEW";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -3957,7 +3957,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 1U)
     {
-        page_name = "2/8  DISPLAY";
+        page_name = "2/9  DISPLAY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -3978,7 +3978,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 2U)
     {
-        page_name = "3/8  MEMORY";
+        page_name = "3/9  MEMORY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -3998,7 +3998,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 3U)
     {
-        page_name = "4/8  RELIABILITY";
+        page_name = "4/9  RELIABILITY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4030,7 +4030,7 @@ static void lvgl_app_diagnostics_refresh(void)
         {
             voltage_fraction = -voltage_fraction;
         }
-        page_name = "5/8  SAFETY";
+        page_name = "5/9  SAFETY";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4053,7 +4053,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 5U)
     {
-        page_name = "6/8  MOTION LOOP";
+        page_name = "6/9  MOTION LOOP";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4087,7 +4087,7 @@ static void lvgl_app_diagnostics_refresh(void)
     }
     else if (s_diag_page_index == 6U)
     {
-        page_name = "7/8  CHASSIS ODOM";
+        page_name = "7/9  CHASSIS ODOM";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
@@ -4113,6 +4113,45 @@ static void lvgl_app_diagnostics_refresh(void)
             (unsigned long)snapshot.odometry_timing_gap_count,
             (snapshot.heading_control_active != 0U) ? "ON" : "OFF");
     }
+    else if (s_diag_page_index == 7U)
+    {
+        AppHealthSnapshot health;
+
+        AppHealth_GetSnapshot(&health);
+        page_name = "8/9  COMMUNICATION";
+        (void)snprintf(
+            text_buf,
+            sizeof(text_buf),
+            "U5 RX B%7lu O/E %3lu/%3lu\n"
+            "U5 TX Q/C %5lu/%5lu D/E %3lu/%3lu\n"
+            "USB RX B%6lu O %3lu\n"
+            "USB TX Q/C %5lu/%5lu D/E %3lu/%3lu\n"
+            "Frm U/V %5lu/%5lu E %3lu/%3lu\n"
+            "Cmd A/R %5lu/%4lu RD%3lu FOC %2lu/%2lu/%2lu",
+            (unsigned long)health.communication.uart_rx_byte_count,
+            (unsigned long)health.communication.uart_rx_overflow_count,
+            (unsigned long)health.communication.uart_rx_error_count,
+            (unsigned long)health.communication.uart_tx_queued_count,
+            (unsigned long)health.communication.uart_tx_complete_count,
+            (unsigned long)health.communication.uart_tx_drop_count,
+            (unsigned long)health.communication.uart_tx_start_error_count,
+            (unsigned long)health.communication.usb_rx_byte_count,
+            (unsigned long)health.communication.usb_rx_overflow_count,
+            (unsigned long)health.communication.usb_tx_queued_count,
+            (unsigned long)health.communication.usb_tx_complete_count,
+            (unsigned long)health.communication.usb_tx_drop_count,
+            (unsigned long)health.communication.usb_tx_start_error_count,
+            (unsigned long)health.protocol.valid_frame_count[0],
+            (unsigned long)health.protocol.valid_frame_count[1],
+            (unsigned long)health.protocol.frame_error_count[0],
+            (unsigned long)health.protocol.frame_error_count[1],
+            (unsigned long)health.protocol.accepted_command_count,
+            (unsigned long)health.protocol.rejected_command_count,
+            (unsigned long)health.protocol.response_drop_count,
+            (unsigned long)health.foc_link.rx_overflow_count,
+            (unsigned long)health.foc_link.rx_error_count,
+            (unsigned long)health.foc_link.tx_drop_count);
+    }
     else
     {
         AppHealthSnapshot health;
@@ -4135,13 +4174,13 @@ static void lvgl_app_diagnostics_refresh(void)
             visual_status = UI_PERF_STATUS_GOOD;
             status_bg = lv_color_hex(0xE4F7EA);
         }
-        page_name = "8/8  ARCHITECTURE";
+        page_name = "9/9  ARCHITECTURE";
         (void)snprintf(
             text_buf,
             sizeof(text_buf),
             "Health %-7s F %08lX\n"
             "Evt P/H/D %5lu/%5lu/%3lu\n"
-            "Q %2u/%2u UART %4lu/%4lu\n"
+            "Q %2u/%2u U5Err %3lu USBErr %3lu\n"
             "Cmd A/R/S %5lu/%3lu/%3lu %s\n"
             "Nav C/P %2u/%2u T/R %5lu/%3lu\n"
             "Sch L/C %5lu/%6lu T%u",
@@ -4152,8 +4191,10 @@ static void lvgl_app_diagnostics_refresh(void)
             (unsigned long)health.events.dropped_count,
             (unsigned int)health.events.pending_count,
             (unsigned int)health.events.high_watermark,
-            (unsigned long)health.uart_rx_overflow_count,
-            (unsigned long)health.uart_tx_drop_count,
+            (unsigned long)(health.communication.uart_rx_error_count +
+                            health.communication.uart_rx_rearm_error_count),
+            (unsigned long)(health.communication.usb_rx_overflow_count +
+                            health.communication.usb_tx_drop_count),
             (unsigned long)health.command.accepted_command_count,
             (unsigned long)health.command.rejected_command_count,
             (unsigned long)health.command.stop_count,
@@ -4193,13 +4234,13 @@ static void lvgl_app_diagnostics_event_cb(lv_event_t *e)
     key = lvgl_app_event_get_key(e);
     if (key == LV_KEY_RIGHT)
     {
-        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 8U);
+        s_diag_page_index = (uint8_t)((s_diag_page_index + 1U) % 9U);
         lvgl_app_diagnostics_refresh();
         UI_Anim_CarouselIn(s_diag_data_panel, 1);
     }
     else if (key == LV_KEY_LEFT)
     {
-        s_diag_page_index = (s_diag_page_index == 0U) ? 7U : (uint8_t)(s_diag_page_index - 1U);
+        s_diag_page_index = (s_diag_page_index == 0U) ? 8U : (uint8_t)(s_diag_page_index - 1U);
         lvgl_app_diagnostics_refresh();
         UI_Anim_CarouselIn(s_diag_data_panel, -1);
     }
@@ -5304,566 +5345,9 @@ static void lvgl_app_show_main_menu(void)
     lvgl_app_page_finish();
 }
 
-#include "usbd_cdc_if.h"
-
-static uint8_t s_cmd_rx_buf[2][64];
-static uint16_t s_cmd_rx_idx[2] = {0U, 0U};
-static char s_cmd_text_rx_buf[2][64];
-static uint16_t s_cmd_text_rx_idx[2] = {0U, 0U};
-
-static void lvgl_app_cmd_send_text(uint8_t channel, const char *text)
-{
-    uint16_t length;
-
-    if (text == NULL)
-    {
-        return;
-    }
-
-    length = (uint16_t)strlen(text);
-    if (channel == 0U)
-    {
-        (void)CommService_UartSend((const uint8_t *)text, length);
-    }
-    else
-    {
-        (void)CDC_Transmit_FS((uint8_t *)text, length);
-    }
-}
-
-static void lvgl_app_cmd_send_binary(uint8_t channel,
-                                     const uint8_t *data, uint16_t length)
-{
-    if ((data == NULL) || (length == 0U))
-    {
-        return;
-    }
-    if (channel == 0U)
-    {
-        (void)CommService_UartSend(data, length);
-    }
-    else
-    {
-        (void)CDC_Transmit_FS((uint8_t *)data, length);
-    }
-}
-
-static uint8_t lvgl_app_cmd_parse_foc_text(uint8_t channel, const char *line)
-{
-    float value_a = 0.0f;
-    unsigned int motor_id = 0U;
-    char trailing = '\0';
-    char response[40];
-    int8_t result = FOC_LINK_ERR_ARGUMENT;
-    const char *operation = "ERROR";
-
-    if ((line == NULL) || (strncmp(line, "FOC ", 4U) != 0))
-    {
-        return 0U;
-    }
-
-    if (sscanf(line, "FOC SPEED %f %c", &value_a, &trailing) == 1)
-    {
-        operation = "SPEED";
-        result = FOC_Link_SendSpeed(value_a);
-    }
-    else if (sscanf(line, "FOC ANGLE %f %c", &value_a, &trailing) == 1)
-    {
-        operation = "ANGLE";
-        result = FOC_Link_SendAngle(value_a);
-    }
-    else if (sscanf(line, "FOC TORQUE %f %c", &value_a, &trailing) == 1)
-    {
-        operation = "TORQUE";
-        result = FOC_Link_SendTorque(value_a);
-    }
-    else if ((sscanf(line, "FOC MOTOR %u %c", &motor_id, &trailing) == 1) &&
-             (motor_id <= 1U))
-    {
-        operation = "MOTOR";
-        result = FOC_Link_SendMotor((uint8_t)motor_id);
-    }
-    else if (strcmp(line, "FOC SENSORLESS") == 0)
-    {
-        operation = "SENSORLESS";
-        result = FOC_Link_SendSensorless();
-    }
-    else if (strcmp(line, "FOC LOCK") == 0)
-    {
-        operation = "LOCK";
-        result = FOC_Link_SendLock();
-    }
-    else if (strcmp(line, "FOC STOP") == 0)
-    {
-        operation = "STOP";
-        result = FOC_Link_SendStop();
-    }
-
-    (void)snprintf(response, sizeof(response), "FOC %s %s (%d)\r\n",
-                   operation, (result == FOC_LINK_OK) ? "QUEUED" : "FAILED",
-                   (int)result);
-    lvgl_app_cmd_send_text(channel, response);
-    return 1U;
-}
-
-static void lvgl_app_cmd_parse_text(uint8_t channel, char *line)
-{
-    char command[8] = {0};
-    char action[8] = {0};
-    char direction_text[8] = {0};
-    char extra[8] = {0};
-    int speed_percent = 0;
-    int fields;
-    uint16_t i;
-    int8_t direction;
-
-    if ((line == NULL) || (CommandControl_IsActive() == 0U))
-    {
-        return;
-    }
-
-    for (i = 0U; line[i] != '\0'; ++i)
-    {
-        line[i] = (char)toupper((unsigned char)line[i]);
-    }
-
-    if (lvgl_app_cmd_parse_foc_text(channel, line) != 0U)
-    {
-        return;
-    }
-
-    fields = sscanf(line, "%7s %7s %7s %d %7s",
-                    command, action, direction_text, &speed_percent, extra);
-    if (strcmp(command, "GYRO") != 0)
-    {
-        return;
-    }
-
-    if ((fields == 2) && (strcmp(action, "OFF") == 0))
-    {
-        Mecanum_GyroDisable();
-        Mecanum_MixedControl(0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
-        CommandControl_SetGyroState(0U, 0);
-        lvgl_app_cmd_send_text(channel, "GYRO OFF OK\r\n");
-    }
-    else if ((fields == 4) && (strcmp(action, "ON") == 0) &&
-             (speed_percent >= 0) && (speed_percent <= 100))
-    {
-        if (strcmp(direction_text, "CW") == 0)
-        {
-            direction = MECANUM_GYRO_DIRECTION_CW;
-        }
-        else if (strcmp(direction_text, "CCW") == 0)
-        {
-            direction = MECANUM_GYRO_DIRECTION_CCW;
-        }
-        else
-        {
-            lvgl_app_cmd_send_text(channel, "ERR GYRO DIR CW|CCW\r\n");
-            return;
-        }
-
-        if (Mecanum_GyroEnable(direction, (uint8_t)speed_percent) != 0U)
-        {
-            CommandControl_SetGyroState(
-                1U,
-                (int8_t)((direction == MECANUM_GYRO_DIRECTION_CCW) ?
-                         -speed_percent : speed_percent));
-            lvgl_app_cmd_send_text(channel, "GYRO ON OK\r\n");
-        }
-        else
-        {
-            lvgl_app_cmd_send_text(channel, "ERR GYRO RANGE 0-100\r\n");
-        }
-    }
-    else
-    {
-        lvgl_app_cmd_send_text(channel,
-                               "ERR USE: GYRO ON CW|CCW 0-100 / GYRO OFF\r\n");
-    }
-
-    s_ctrl_last_actual_refresh_tick = 0U;
-}
-
-static void lvgl_app_cmd_text_rx_byte(uint8_t channel, uint8_t byte)
-{
-    uint16_t *index = &s_cmd_text_rx_idx[channel];
-    char *text_buf = s_cmd_text_rx_buf[channel];
-
-    if ((byte == '\r') || (byte == '\n'))
-    {
-        if (*index != 0U)
-        {
-            text_buf[*index] = '\0';
-            lvgl_app_cmd_parse_text(channel, text_buf);
-            *index = 0U;
-        }
-        return;
-    }
-
-    if ((byte < 0x20U) || (byte > 0x7EU))
-    {
-        *index = 0U;
-        return;
-    }
-
-    if (*index < (sizeof(s_cmd_text_rx_buf[channel]) - 1U))
-    {
-        text_buf[(*index)++] = (char)byte;
-    }
-    else
-    {
-        *index = 0U;
-    }
-}
-
-static float lvgl_app_cmd_read_float_le(const uint8_t *bytes)
-{
-    float value = 0.0f;
-    if (bytes != NULL)
-    {
-        memcpy(&value, bytes, sizeof(value));
-    }
-    return value;
-}
-
-static int8_t lvgl_app_cmd_execute_foc(const uint8_t *frame, uint8_t len)
-{
-    uint8_t operation;
-
-    if ((frame == NULL) || (len < 7U))
-    {
-        return FOC_LINK_ERR_ARGUMENT;
-    }
-    operation = frame[5];
-    switch (operation)
-    {
-        case FOC_LINK_OP_SPEED:
-            return (len == 11U) ?
-                FOC_Link_SendSpeed(lvgl_app_cmd_read_float_le(&frame[6])) :
-                FOC_LINK_ERR_ARGUMENT;
-        case FOC_LINK_OP_ANGLE:
-            return (len == 11U) ?
-                FOC_Link_SendAngle(lvgl_app_cmd_read_float_le(&frame[6])) :
-                FOC_LINK_ERR_ARGUMENT;
-        case FOC_LINK_OP_TORQUE:
-            return (len == 11U) ?
-                FOC_Link_SendTorque(lvgl_app_cmd_read_float_le(&frame[6])) :
-                FOC_LINK_ERR_ARGUMENT;
-        case FOC_LINK_OP_MOTOR:
-            return (len == 8U) ? FOC_Link_SendMotor(frame[6]) :
-                                 FOC_LINK_ERR_ARGUMENT;
-        case FOC_LINK_OP_SENSORLESS:
-            return (len == 7U) ? FOC_Link_SendSensorless() :
-                                 FOC_LINK_ERR_ARGUMENT;
-        case FOC_LINK_OP_LOCK:
-            return (len == 7U) ? FOC_Link_SendLock() :
-                                 FOC_LINK_ERR_ARGUMENT;
-        case FOC_LINK_OP_STOP:
-            return (len == 7U) ? FOC_Link_SendStop() :
-                                 FOC_LINK_ERR_ARGUMENT;
-        default:
-            return FOC_LINK_ERR_ARGUMENT;
-    }
-}
-
-static void lvgl_app_cmd_send_foc_ack(uint8_t channel, uint8_t operation,
-                                      int8_t result)
-{
-    uint8_t response[8] = {
-        0x77U, 0x68U, 0x08U, FOC_LINK_HOST_DEVICE_ID,
-        FOC_LINK_HOST_CMD_WRITE, operation, (uint8_t)result, 0x0AU
-    };
-    lvgl_app_cmd_send_binary(channel, response, sizeof(response));
-}
-
-static void lvgl_app_cmd_send_foc_status(uint8_t channel)
-{
-    FOC_LinkTelemetry telemetry;
-    uint8_t response[32] = {0};
-    uint8_t flags = 0U;
-
-    FOC_Link_GetTelemetry(&telemetry);
-    if (telemetry.valid != 0U) flags |= 0x01U;
-    if (FOC_Link_IsTelemetryAlive(250U) != 0U) flags |= 0x02U;
-    if (telemetry.rx_overflow_count != 0U) flags |= 0x04U;
-    if (telemetry.rx_error_count != 0U) flags |= 0x08U;
-    if (telemetry.tx_drop_count != 0U) flags |= 0x10U;
-
-    response[0] = 0x77U;
-    response[1] = 0x68U;
-    response[2] = (uint8_t)sizeof(response);
-    response[3] = FOC_LINK_HOST_DEVICE_ID;
-    response[4] = FOC_LINK_HOST_CMD_READ;
-    response[5] = flags;
-    memcpy(&response[6], &telemetry.channel[0], sizeof(float));
-    memcpy(&response[10], &telemetry.channel[1], sizeof(float));
-    memcpy(&response[14], &telemetry.channel[2], sizeof(float));
-    memcpy(&response[18], &telemetry.channel[3], sizeof(float));
-    memcpy(&response[22], &telemetry.channel[8], sizeof(float));
-    memcpy(&response[26], &telemetry.channel[9], sizeof(float));
-    response[30] = (uint8_t)telemetry.frame_count;
-    response[31] = 0x0AU;
-    lvgl_app_cmd_send_binary(channel, response, sizeof(response));
-}
-
-static void lvgl_app_cmd_parse(uint8_t channel, uint8_t *frame, uint8_t len)
-{
-    uint8_t dev_id = frame[3];
-    uint8_t cmd    = frame[4];
-
-    /* ESP32 virtual NES controller is a global UART5 input source. It is
-     * accepted while NES owns the LCD, independently of the Command Control
-     * page; all motor-related devices remain page-gated below. */
-    if ((channel == 0U) && (dev_id == 0x0EU) && (cmd == 0x02U) &&
-        (len == 0x08U))
-    {
-        if (NES_Runtime_IsActive() != 0U)
-        {
-            NES_Runtime_SetRemoteButtons(frame[5]);
-        }
-        return;
-    }
-    if ((channel == 0U) && (dev_id == 0x0EU) && (cmd == 0x03U) &&
-        (len == 0x07U))
-    {
-        if (NES_Runtime_IsActive() != 0U)
-        {
-            NES_Runtime_RequestRemoteReset();
-        }
-        return;
-    }
-
-    if (CommandControl_IsActive() == 0U)
-    {
-        return;
-    }
-    
-    if (dev_id == 0x0C && len == 0x0A) // Virtual Joystick Mecanum Control
-    {
-        (void)CommandControl_SetJoystick((int8_t)frame[4],
-                                         (int8_t)frame[5],
-                                         (int8_t)frame[6],
-                                         (int8_t)frame[7]);
-        
-        s_ctrl_last_actual_refresh_tick = 0; // Force UI refresh
-        return;
-    }
-    
-    if (cmd == 0x02) // Write
-    {
-        if (dev_id == FOC_LINK_HOST_DEVICE_ID)
-        {
-            uint8_t operation = (len >= 7U) ? frame[5] : 0U;
-            int8_t result = lvgl_app_cmd_execute_foc(frame, len);
-            lvgl_app_cmd_send_foc_ack(channel, operation, result);
-        }
-        else if (dev_id == 0x01 && len == 0x0A) // Multi-motor
-        {
-            uint8_t i;
-            for (i = 0; i < 4; i++) {
-                (void)CommandControl_SetMotorSpeed((uint8_t)(i + 1U),
-                                                   (int8_t)frame[5 + i]);
-            }
-        }
-        else if (dev_id == 0x02 && len >= 0x08) // Single-motor
-        {
-            uint8_t port = frame[5];
-            int8_t speed = (int8_t)frame[6];
-            if (port >= 1 && port <= 4) {
-                (void)CommandControl_SetMotorSpeed(port, speed);
-            }
-        }
-        else if (dev_id == 0x03 && len >= 0x0D) // Mecanum Mixed Control
-        {
-            // format: 0x77 0x68 [len=13] 0x03 0x02 [mode] [VxL] [VxH] [VyL] [VyH] [WzL] [WzH] [ck/tail]
-            uint8_t m_mode = frame[5];
-            int16_t vx_in  = (int16_t)((frame[7] << 8)  | frame[6]);
-            int16_t vy_in  = (int16_t)((frame[9] << 8)  | frame[8]);
-            int16_t wz_in  = (int16_t)((frame[11] << 8) | frame[10]);
-            
-            if (m_mode == 1) {
-                // DISTANCE mode: use fixed default speed (e.g. 100.0)
-                Mecanum_MixedControl(100.0f, 100.0f, 100.0f, (float)vx_in, (float)vy_in, (float)wz_in);
-            } else {
-                // SPEED mode
-                Mecanum_MixedControl((float)vx_in, (float)vy_in, (float)wz_in, 0.0f, 0.0f, 0.0f);
-            }
-        }
-        else if (dev_id == 0x0D && len >= 0x09) // Gyro mode control
-        {
-            uint8_t enable = frame[5];
-            int8_t direction = (int8_t)frame[6];
-            uint8_t speed_percent = frame[7];
-
-            /* Latched event command: only this explicit frame may change gyro
-             * mode. Missing/repeated joystick frames never imply GYRO OFF. */
-            if ((enable <= 1U) &&
-                (speed_percent <= 100U) &&
-                ((direction == MECANUM_GYRO_DIRECTION_CW) ||
-                 (direction == MECANUM_GYRO_DIRECTION_CCW)))
-            {
-                int8_t signed_speed =
-                    (int8_t)((direction == MECANUM_GYRO_DIRECTION_CCW) ?
-                             -(int16_t)speed_percent : (int16_t)speed_percent);
-
-                if (enable == 0U)
-                {
-                    uint8_t was_enabled = Mecanum_IsGyroModeEnabled();
-                    Mecanum_GyroDisable();
-                    if (was_enabled != 0U)
-                    {
-                        Mecanum_MixedControl(0.0f, 0.0f, 0.0f,
-                                            0.0f, 0.0f, 0.0f);
-                    }
-                    /* Preserve the ESP32 slider preset while gyro mode is OFF. */
-                    CommandControl_SetGyroState(0U, signed_speed);
-                }
-                else if (Mecanum_GyroEnable(direction, speed_percent) != 0U)
-                {
-                    CommandControl_SetGyroState(1U, signed_speed);
-                }
-            }
-        }
-        else if (dev_id == 0x05 && len >= 0x09) // PWM Servo
-        {
-#if LVGL_APP_SERVO_HW_ENABLED
-            uint8_t port  = frame[5]; // 1~7
-            uint8_t angle = frame[7]; // 0~180
-            
-            if (port >= 1 && port <= 2) {
-                int16_t target_angle = (int16_t)angle * 3 / 2; // 0~180 to 0~270
-                s_servo_angle_preset[port - 1] = target_angle;
-                lvgl_app_servo_angle_send_cmd(port, target_angle);
-            }
-#endif
-        }
-    }
-    else if (cmd == 0x01) // Read Encoder
-    {
-        uint8_t tx_buf[16];
-        uint8_t tx_len = 0;
-
-        if ((dev_id == FOC_LINK_HOST_DEVICE_ID) && (len == 0x06U))
-        {
-            lvgl_app_cmd_send_foc_status(channel);
-            return;
-        }
-
-        lvgl_app_motor_speed_sync_actual();
-        
-        if (dev_id == 0x03) // Multi-encoder
-        {
-            tx_buf[0] = 0x77;
-            tx_buf[1] = 0x68;
-            tx_buf[2] = 0x0A;
-            tx_buf[3] = 0x03;
-            tx_buf[4] = 0x01; 
-            tx_buf[5] = (uint8_t)(s_motor_speed_actual[0]);
-            tx_buf[6] = (uint8_t)(s_motor_speed_actual[1]);
-            tx_buf[7] = (uint8_t)(s_motor_speed_actual[2]);
-            tx_buf[8] = (uint8_t)(s_motor_speed_actual[3]);
-            tx_buf[9] = 0x0A;
-            tx_len = 0x0A;
-        }
-        else if (dev_id == 0x04) // Single-encoder 
-        {
-            uint8_t port = frame[5];
-            tx_buf[0] = 0x77;
-            tx_buf[1] = 0x68;
-            tx_buf[2] = 0x08;
-            tx_buf[3] = 0x04;
-            tx_buf[4] = 0x01;
-            tx_buf[5] = port;
-            if (port >= 1 && port <= 4) {
-                tx_buf[6] = (uint8_t)(s_motor_speed_actual[port - 1]);
-            } else {
-                tx_buf[6] = 0;
-            }
-            tx_buf[7] = 0x0A;
-            tx_len = 0x08;
-        }
-        
-        if (tx_len > 0) {
-            if (channel == 0U)
-            {
-                (void)CommService_UartSend(tx_buf, tx_len);
-            }
-            else
-            {
-                (void)CDC_Transmit_FS(tx_buf, tx_len);
-            }
-        }
-    }
-    
-    // Force UI refresh on next main loop
-    s_ctrl_last_actual_refresh_tick = 0;
-}
-
-void lvgl_app_com_rx_cb(uint8_t *buf, uint32_t len)
-{
-    lvgl_app_com_rx_channel_cb(0U, buf, len);
-}
-
 void LVGL_App_GetNavigationSnapshot(UiNavigationSnapshot *snapshot)
 {
     UiNavigation_GetSnapshot(&s_navigation, snapshot);
-}
-
-void lvgl_app_com_rx_channel_cb(uint8_t channel, uint8_t *buf, uint32_t len)
-{
-    uint32_t i;
-    uint8_t *rx_buf;
-    uint16_t *rx_idx;
-
-    if ((buf == NULL) || (channel >= 2U)) return;
-    if (CommandControl_IsActive() == 0U)
-    {
-        s_cmd_text_rx_idx[channel] = 0U;
-    }
-    rx_buf = s_cmd_rx_buf[channel];
-    rx_idx = &s_cmd_rx_idx[channel];
-
-    for (i = 0; i < len; i++) {
-        if (CommandControl_IsActive() != 0U)
-        {
-            lvgl_app_cmd_text_rx_byte(channel, buf[i]);
-        }
-
-        if (*rx_idx < sizeof(s_cmd_rx_buf[channel])) {
-            rx_buf[(*rx_idx)++] = buf[i];
-        }
-        
-        while (*rx_idx >= 3U) { 
-            if (rx_buf[0] != 0x77 || rx_buf[1] != 0x68) {
-                uint16_t j;
-                for (j = 0; j < *rx_idx - 1U; j++) rx_buf[j] = rx_buf[j+1U];
-                (*rx_idx)--;
-                continue;
-            }
-            
-            uint8_t frame_len = rx_buf[2];
-            if (frame_len < 0x04 || frame_len > 0x10) { 
-                uint16_t j;
-                for (j = 0; j < *rx_idx - 2U; j++) rx_buf[j] = rx_buf[j+2U];
-                *rx_idx -= 2U;
-                continue;
-            }
-            
-            if (*rx_idx >= frame_len) {
-                if (rx_buf[frame_len - 1U] == 0x0A) {
-                    lvgl_app_cmd_parse(channel, rx_buf, frame_len);
-                }
-                uint16_t j;
-                for (j = 0; j < *rx_idx - frame_len; j++) {
-                    rx_buf[j] = rx_buf[j + frame_len];
-                }
-                *rx_idx -= frame_len;
-            } else {
-                break;
-            }
-        }
-    }
 }
 
 static void lvgl_app_command_exit_event_cb(lv_event_t *e)
@@ -5883,10 +5367,7 @@ static void lvgl_app_command_exit_event_cb(lv_event_t *e)
     }
 
     CommandControl_Leave();
-    s_cmd_rx_idx[0] = 0U;
-    s_cmd_rx_idx[1] = 0U;
-    s_cmd_text_rx_idx[0] = 0U;
-    s_cmd_text_rx_idx[1] = 0U;
+    CommandProtocol_ResetInput();
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     lv_port_indev_suppress_all_keys_until_release();
     lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
@@ -5905,10 +5386,7 @@ static void lvgl_app_show_command_control(void)
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_COMMAND;
     CommandControl_Enter();
-    s_cmd_rx_idx[0] = 0U;
-    s_cmd_rx_idx[1] = 0U;
-    s_cmd_text_rx_idx[0] = 0U;
-    s_cmd_text_rx_idx[1] = 0U;
+    CommandProtocol_ResetInput();
     lvgl_app_control_clear_row_refs();
     lvgl_app_group_reset();
     s_status_label = NULL;
@@ -6143,8 +5621,7 @@ static void lvgl_app_process_global_stop_key(void)
     else if (s_ctrl_page == LVGL_APP_CTRL_PAGE_COMMAND)
     {
         CommandControl_Stop();
-        s_cmd_rx_idx[0] = 0U;
-        s_cmd_rx_idx[1] = 0U;
+        CommandProtocol_ResetInput();
         lvgl_app_set_status("EMERGENCY STOP!");
         lvgl_app_control_refresh_rows();
     }

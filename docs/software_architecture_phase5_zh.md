@@ -103,7 +103,7 @@ UART5和USB CDC每次最多投递64字节的 `APP_EVENT_COMM_RX` 事件。队列
 - 调度器循环次数、任务调用次数和注册任务数。
 - IWDG喂狗、漏票、栈保护和运行状态。
 
-进入 `8 UI Diagnostics`，使用Left/Right切换到 `8/8 ARCHITECTURE`：
+进入 `8 UI Diagnostics`，使用Left/Right切换到 `9/9 ARCHITECTURE`。通信统计已独立到 `8/9 COMMUNICATION`，详见第六阶段文档：
 
 ```text
 Health GOOD    Flags 00000000

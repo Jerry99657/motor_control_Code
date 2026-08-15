@@ -67,7 +67,7 @@ LVGL 当前使用以下逻辑按键：
 
 ## 4. 主页面和各功能页面
 
-主菜单共 9 项：
+主菜单共 10 项：
 
 1. `Motor Control`
 2. `Command Control`
@@ -78,6 +78,7 @@ LVGL 当前使用以下逻辑按键：
 7. `FOC Control`
 8. `UI Diagnostics`
 9. `Camera Test`
+10. `Display Settings`
 
 ### 4.1 Motor Control
 
@@ -160,7 +161,7 @@ Up/Down 选择控制环，OK 进入编辑，再按 OK 将目标加入 UART4 队�
 
 ### 4.8 UI Diagnostics
 
-UI Diagnostics 分为 Overview、Display、Memory 三个视图，使用 Left/Right 切换，KEY2/KEY3/ESC 返回。页面只显示关键指标：LVGL FPS、刷新耗时、脏区刷新次数、媒体/显示状态和内存池使用情况，避免一次性显示过多信息影响诊断本身。
+UI Diagnostics 分为 9 个分页：Overview、Display、Memory、Reliability、Safety、Motion Loop、Chassis Odom、Communication 和 Architecture。使用 Left/Right 切换，KEY2/KEY3/ESC 返回。Communication 页显示 UART5、USB CDC、命令协议和 UART4 FOC 的收发、溢出、丢弃及错误计数；详细定义和回归方法见 [`docs/communication_and_engineering_quality_phase6_zh.md`](docs/communication_and_engineering_quality_phase6_zh.md)。
 
 ### 4.9 Camera Test
 
@@ -168,6 +169,10 @@ UI Diagnostics 分为 Overview、Display、Memory 三个视图，使用 Left/Rig
 
 - OK：重新初始化摄像头并采集下一帧。
 - Left/KEY2/KEY3：停止当前采集、拉低 `OV_RESET`、进入掉电状态并返回主菜单。
+
+### 4.10 Display Settings
+
+提供屏幕旋转、按键声音、中英文切换和低电压蜂鸣器报警开关。屏幕旋转后五维按键方向同步映射；设置写入 W25Q64，掉电后保持。
 - 初始化或采集失败时，页面显示传感器 ID、Camera 错误码和 DCMI 错误码；按 OK 可重试。
 
 该页面只做单帧拍照测试，不持续占用 DCMI。离开页面会释放共享 RGB565 媒体内存池，摄像头压缩帧缓冲与显示帧缓冲分别位于 D2 SRAM 和 AXI SRAM，保证硬件 JPEG 解码时输入、输出能够同时存在。

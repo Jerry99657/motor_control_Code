@@ -61,11 +61,11 @@ _Min_Stack_Size = 0x2000; /* 8 KiB main stack with runtime watermark */
 /* Specify the memory areas */
 MEMORY
 {
-DTCMRAM (xrw)      : ORIGIN = 0x20000000, LENGTH = 128K
-RAM (xrw)      : ORIGIN = 0x24000000, LENGTH = 512K
-RAM_D2 (xrw)      : ORIGIN = 0x30000000, LENGTH = 288K
-RAM_D3 (xrw)      : ORIGIN = 0x38000000, LENGTH = 64K
-ITCMRAM (xrw)      : ORIGIN = 0x00000000, LENGTH = 64K
+DTCMRAM (rw)      : ORIGIN = 0x20000000, LENGTH = 128K
+RAM (rw)      : ORIGIN = 0x24000000, LENGTH = 512K
+RAM_D2 (rw)      : ORIGIN = 0x30000000, LENGTH = 288K
+RAM_D3 (rw)      : ORIGIN = 0x38000000, LENGTH = 64K
+ITCMRAM (rx)      : ORIGIN = 0x00000000, LENGTH = 64K
 FLASH (rx)      : ORIGIN = 0x8000000, LENGTH = 2048K
 }
 
@@ -113,20 +113,20 @@ SECTIONS
     __exidx_end = .;
   } >FLASH
 
-  .preinit_array     :
+  .preinit_array (READONLY) :
   {
     PROVIDE_HIDDEN (__preinit_array_start = .);
     KEEP (*(.preinit_array*))
     PROVIDE_HIDDEN (__preinit_array_end = .);
   } >FLASH
-  .init_array :
+  .init_array (READONLY) :
   {
     PROVIDE_HIDDEN (__init_array_start = .);
     KEEP (*(SORT(.init_array.*)))
     KEEP (*(.init_array*))
     PROVIDE_HIDDEN (__init_array_end = .);
   } >FLASH
-  .fini_array :
+  .fini_array (READONLY) :
   {
     PROVIDE_HIDDEN (__fini_array_start = .);
     KEEP (*(SORT(.fini_array.*)))

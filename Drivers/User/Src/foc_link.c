@@ -31,6 +31,8 @@ static volatile uint16_t s_rx_head = 0U;
 static volatile uint16_t s_rx_tail = 0U;
 static volatile uint32_t s_rx_overflow_count = 0U;
 static volatile uint32_t s_rx_error_count = 0U;
+static volatile uint8_t s_rx_rearm_pending = 0U;
+static uint32_t s_last_rx_rearm_tick = 0U;
 
 static uint8_t s_telemetry_window[FOC_LINK_TELEMETRY_SIZE];
 static uint8_t s_telemetry_count = 0U;
@@ -55,6 +57,19 @@ static void foc_link_unlock(uint32_t primask)
   if (primask == 0U)
   {
     __enable_irq();
+  }
+}
+
+static void foc_link_arm_rx(void)
+{
+  if (HAL_UART_Receive_IT(&huart4, &s_rx_byte, 1U) == HAL_OK)
+  {
+    s_rx_rearm_pending = 0U;
+  }
+  else
+  {
+    s_rx_rearm_pending = 1U;
+    s_rx_error_count++;
   }
 }
 
@@ -238,6 +253,8 @@ void FOC_Link_Init(void)
   s_rx_tail = 0U;
   s_rx_overflow_count = 0U;
   s_rx_error_count = 0U;
+  s_rx_rearm_pending = 0U;
+  s_last_rx_rearm_tick = 0U;
   s_telemetry_count = 0U;
   memset(&s_telemetry, 0, sizeof(s_telemetry));
   memset(&s_command_state, 0, sizeof(s_command_state));
@@ -245,16 +262,21 @@ void FOC_Link_Init(void)
   s_safety_stop_pending = 0U;
   foc_link_unlock(primask);
 
-  if (HAL_UART_Receive_IT(&huart4, &s_rx_byte, 1U) != HAL_OK)
-  {
-    s_rx_error_count++;
-  }
+  foc_link_arm_rx();
 }
 
 void FOC_Link_Process(void)
 {
   uint16_t tail;
   uint8_t send_safety_stop = 0U;
+  uint32_t now = HAL_GetTick();
+
+  if ((s_rx_rearm_pending != 0U) &&
+      ((now - s_last_rx_rearm_tick) >= 10U))
+  {
+    s_last_rx_rearm_tick = now;
+    foc_link_arm_rx();
+  }
 
   while (s_rx_tail != s_rx_head)
   {
@@ -474,10 +496,7 @@ void FOC_Link_UartRxCompleteFromISR(UART_HandleTypeDef *huart)
     s_rx_ring[s_rx_head] = s_rx_byte;
     s_rx_head = next;
   }
-  if (HAL_UART_Receive_IT(&huart4, &s_rx_byte, 1U) != HAL_OK)
-  {
-    s_rx_error_count++;
-  }
+  foc_link_arm_rx();
 }
 
 void FOC_Link_UartTxCompleteFromISR(UART_HandleTypeDef *huart)
@@ -506,8 +525,5 @@ void FOC_Link_UartErrorFromISR(UART_HandleTypeDef *huart)
     return;
   }
   s_rx_error_count++;
-  if (HAL_UART_Receive_IT(&huart4, &s_rx_byte, 1U) != HAL_OK)
-  {
-    s_rx_error_count++;
-  }
+  foc_link_arm_rx();
 }

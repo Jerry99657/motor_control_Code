@@ -14,6 +14,8 @@
 
 static uint8_t s_uart5_rx_byte;
 static volatile uint32_t s_tim7_frame_tick;
+static volatile uint8_t s_uart5_rx_rearm_pending;
+static uint32_t s_uart5_last_rearm_tick;
 
 static void app_hal_bridge_arm_uart5_rx(void)
 {
@@ -21,7 +23,15 @@ static void app_hal_bridge_arm_uart5_rx(void)
 
     if (context->uart5 != NULL)
     {
-        (void)HAL_UART_Receive_IT(context->uart5, &s_uart5_rx_byte, 1U);
+        if (HAL_UART_Receive_IT(context->uart5, &s_uart5_rx_byte, 1U) != HAL_OK)
+        {
+            s_uart5_rx_rearm_pending = 1U;
+            CommService_UartRxRearmFailedFromISR();
+        }
+        else
+        {
+            s_uart5_rx_rearm_pending = 0U;
+        }
     }
 }
 
@@ -29,7 +39,26 @@ void AppHalBridge_Init(void)
 {
     s_uart5_rx_byte = 0U;
     s_tim7_frame_tick = 0U;
+    s_uart5_rx_rearm_pending = 0U;
+    s_uart5_last_rearm_tick = 0U;
     app_hal_bridge_arm_uart5_rx();
+}
+
+void AppHalBridge_Process(void)
+{
+    uint32_t now;
+
+    if (s_uart5_rx_rearm_pending == 0U)
+    {
+        return;
+    }
+
+    now = HAL_GetTick();
+    if ((now - s_uart5_last_rearm_tick) >= 10U)
+    {
+        s_uart5_last_rearm_tick = now;
+        app_hal_bridge_arm_uart5_rx();
+    }
 }
 
 uint32_t AppHalBridge_GetTim7FrameTick(void)
@@ -70,6 +99,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *uart)
 
     if (uart->Instance == UART5)
     {
+        CommService_UartErrorFromISR(uart);
         app_hal_bridge_arm_uart5_rx();
     }
     else if (uart->Instance == UART4)

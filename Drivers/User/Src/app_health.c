@@ -14,9 +14,9 @@ void AppHealth_GetSnapshot(AppHealthSnapshot *snapshot)
 
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->uptime_ms = HAL_GetTick();
-    snapshot->uart_rx_overflow_count =
-        CommService_GetUartRxOverflowCount();
-    snapshot->uart_tx_drop_count = CommService_GetUartTxDropCount();
+    CommService_GetStats(&snapshot->communication);
+    CommandProtocol_GetStats(&snapshot->protocol);
+    FOC_Link_GetTelemetry(&snapshot->foc_link);
     AppEvent_GetStats(&snapshot->events);
     AppRuntime_GetSchedulerStats(&snapshot->scheduler);
     CommandControl_GetSnapshot(&snapshot->command);
@@ -26,11 +26,11 @@ void AppHealth_GetSnapshot(AppHealthSnapshot *snapshot)
     {
         snapshot->flags |= APP_HEALTH_FLAG_EVENT_DROP;
     }
-    if (snapshot->uart_rx_overflow_count != 0U)
+    if (snapshot->communication.uart_rx_overflow_count != 0U)
     {
         snapshot->flags |= APP_HEALTH_FLAG_UART_RX_OVERFLOW;
     }
-    if (snapshot->uart_tx_drop_count != 0U)
+    if (snapshot->communication.uart_tx_drop_count != 0U)
     {
         snapshot->flags |= APP_HEALTH_FLAG_UART_TX_DROP;
     }
@@ -41,6 +41,35 @@ void AppHealth_GetSnapshot(AppHealthSnapshot *snapshot)
     if (snapshot->runtime.stack_guard_ok == 0U)
     {
         snapshot->flags |= APP_HEALTH_FLAG_STACK_GUARD;
+    }
+    if (snapshot->communication.usb_rx_overflow_count != 0U)
+    {
+        snapshot->flags |= APP_HEALTH_FLAG_USB_RX_OVERFLOW;
+    }
+    if (snapshot->communication.usb_tx_drop_count != 0U)
+    {
+        snapshot->flags |= APP_HEALTH_FLAG_USB_TX_DROP;
+    }
+    if ((snapshot->communication.uart_rx_error_count != 0U) ||
+        (snapshot->communication.uart_rx_rearm_error_count != 0U) ||
+        (snapshot->communication.uart_tx_start_error_count != 0U))
+    {
+        snapshot->flags |= APP_HEALTH_FLAG_UART_ERROR;
+    }
+    if ((snapshot->foc_link.rx_overflow_count != 0U) ||
+        (snapshot->foc_link.rx_error_count != 0U) ||
+        (snapshot->foc_link.tx_drop_count != 0U))
+    {
+        snapshot->flags |= APP_HEALTH_FLAG_FOC_LINK_ERROR;
+    }
+    if ((snapshot->protocol.frame_error_count[0] != 0U) ||
+        (snapshot->protocol.frame_error_count[1] != 0U))
+    {
+        snapshot->flags |= APP_HEALTH_FLAG_PROTOCOL_ERROR;
+    }
+    if (snapshot->protocol.response_drop_count != 0U)
+    {
+        snapshot->flags |= APP_HEALTH_FLAG_RESPONSE_DROP;
     }
 
     if ((snapshot->flags & APP_HEALTH_FLAG_STACK_GUARD) != 0U)

@@ -25,11 +25,8 @@ set(CMAKE_PROJECT_NAME STM32H743ZIT6_KIT)
 # Enable compile command to ease indexing with e.g. clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
 
-# Enable CMake support for ASM and C languages
-enable_language(C ASM)
-
 # Core project settings
-project(${CMAKE_PROJECT_NAME})
+project(${CMAKE_PROJECT_NAME} LANGUAGES C ASM)
 message("Build type: " ${CMAKE_BUILD_TYPE})
 
 # Create an executable object type
@@ -51,6 +48,28 @@ file(GLOB USER_DRIVER_SOURCES CONFIGURE_DEPENDS
 file(GLOB_RECURSE LVGL_CORE_SOURCES CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/lvgl/src/*.c
 )
+
+# Generated/third-party files retain upstream signatures and optional fallback
+# code. Keep their known benign warnings out of the project warning baseline.
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/USB_DEVICE/App/usbd_desc.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-missing-field-initializers"
+)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/sd_diskio.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/FATFS/Target/bsp_driver_sd.c
+    ${LVGL_CORE_SOURCES}
+    PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter"
+)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/Drivers/User/Src/mjpeg_player.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-unused-function"
+)
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/Middlewares/Third_Party/lvgl/src/extra/libs/qrcode/qrcodegen.c
+    PROPERTIES COMPILE_OPTIONS "-Wno-type-limits"
+)
+target_compile_options(FatFs PRIVATE -Wno-unused-parameter)
 
 set(USER_PERSISTENT_SOURCES
     ${USER_DRIVER_SOURCES}
@@ -103,6 +122,14 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
     stm32cubemx
 
     # Add user defined libraries
+)
+
+# Treat fundamental C API mistakes as build failures while retaining normal
+# warning visibility for generated middleware and third-party sources.
+target_compile_options(${CMAKE_PROJECT_NAME} PRIVATE
+    -Werror=implicit-function-declaration
+    -Werror=return-type
+    -Werror=incompatible-pointer-types
 )
 
 # newlib-nano excludes floating-point printf/scanf conversion unless these

@@ -1,12 +1,8 @@
 #include "telemetry_service.h"
-#include "app_boot.h"
-#include "command_control.h"
 #include "dc_motor_ol.h"
 #include "foc_link.h"
 #include "usbd_cdc_if.h"
 #include <math.h>
-#include <stdio.h>
-#include <string.h>
 
 typedef enum
 {
@@ -38,59 +34,10 @@ _Static_assert(sizeof(TelemetryFrame) ==
                "VOFA JustFloat frame must not contain padding");
 
 static uint32_t s_last_send_tick;
-static char s_usb_text_buffer[64];
-static uint8_t s_usb_text_index;
 
 void TelemetryService_Init(void)
 {
     s_last_send_tick = 0U;
-    s_usb_text_index = 0U;
-    memset(s_usb_text_buffer, 0, sizeof(s_usb_text_buffer));
-}
-
-void TelemetryService_UsbRx(const uint8_t *buffer, uint32_t length)
-{
-    uint32_t index;
-
-    if ((buffer == NULL) || (CommandControl_IsActive() == 0U))
-    {
-        s_usb_text_index = 0U;
-        return;
-    }
-
-    for (index = 0U; index < length; ++index)
-    {
-        if ((buffer[index] == '\n') || (buffer[index] == '\r'))
-        {
-            if (s_usb_text_index > 0U)
-            {
-                int motor_index;
-                int speed_percent;
-
-                s_usb_text_buffer[s_usb_text_index] = '\0';
-                if (sscanf(s_usb_text_buffer, "M%d:%d",
-                           &motor_index, &speed_percent) == 2)
-                {
-                    if ((motor_index >= 1) && (motor_index <= 4))
-                    {
-                        if (speed_percent > 100) speed_percent = 100;
-                        if (speed_percent < -100) speed_percent = -100;
-                        (void)CommandControl_SetMotorSpeed(
-                            (uint8_t)motor_index, (int16_t)speed_percent);
-                    }
-                }
-                else if (strcmp(s_usb_text_buffer, "STOP") == 0)
-                {
-                    CommandControl_Stop();
-                }
-                s_usb_text_index = 0U;
-            }
-        }
-        else if (s_usb_text_index < (sizeof(s_usb_text_buffer) - 1U))
-        {
-            s_usb_text_buffer[s_usb_text_index++] = (char)buffer[index];
-        }
-    }
 }
 
 void TelemetryService_Process(void)
@@ -107,11 +54,6 @@ void TelemetryService_Process(void)
         return;
     }
     s_last_send_tick = now;
-
-    if (AppBoot_IsCdcReady() == 0U)
-    {
-        return;
-    }
 
     FOC_Link_GetTelemetry(&foc_telemetry);
     FOC_Link_GetCommandState(&foc_command);
@@ -157,5 +99,9 @@ void TelemetryService_Process(void)
     frame.tail[1] = 0x00U;
     frame.tail[2] = 0x80U;
     frame.tail[3] = 0x7FU;
-    (void)CDC_Transmit_FS((uint8_t *)&frame, sizeof(frame));
+    /* Periodic telemetry owns a coalescing "latest sample" slot.  It must not
+     * fill the reliable response/log queue while the host briefly pauses, and
+     * it starts as soon as USB enumeration is complete rather than depending
+     * on the boot welcome message. */
+    (void)CDC_TransmitLatest_FS((const uint8_t *)&frame, sizeof(frame));
 }

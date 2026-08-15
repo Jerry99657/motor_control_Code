@@ -66,6 +66,16 @@
 
 /* USER CODE BEGIN EXPORTED_TYPES */
 
+typedef struct
+{
+  uint32_t app_rx_byte_count;
+  uint32_t app_rx_overflow_count;
+  uint32_t tx_queued_count;
+  uint32_t tx_complete_count;
+  uint32_t tx_drop_count;
+  uint32_t tx_start_error_count;
+} CDC_AppStats;
+
 /* USER CODE END EXPORTED_TYPES */
 
 /**
@@ -113,9 +123,9 @@ void CDC_SetDownloadMode(uint8_t enable);
 uint32_t CDC_ReadBytes(uint8_t *buf, uint32_t len, uint32_t timeout_ms);
 uint8_t CDC_GetAndClearRxOverflow(void);
 uint32_t CDC_ReadAppBytes(uint8_t *buf, uint32_t len);
+uint8_t CDC_TransmitLatest_FS(const uint8_t *buf, uint16_t len);
 void CDC_TxService(void);
-uint32_t CDC_GetAppRxOverflowCount(void);
-uint32_t CDC_GetTxDropCount(void);
+void CDC_GetAppStats(CDC_AppStats *stats);
 
 /* USER CODE END EXPORTED_FUNCTIONS */
 

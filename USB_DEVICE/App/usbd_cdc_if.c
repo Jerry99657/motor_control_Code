@@ -59,6 +59,12 @@ typedef struct
   uint8_t data[APP_TX_DATA_SIZE];
 } CDC_TxPacket_t;
 
+typedef struct
+{
+  uint16_t length;
+  uint8_t data[128U];
+} CDC_LatestPacket_t;
+
 /* USER CODE END PRIVATE_TYPES */
 
 /**
@@ -74,6 +80,9 @@ typedef struct
 #define CDC_APP_RX_BUFFER_SIZE 512U
 #define CDC_TX_QUEUE_DEPTH     3U
 #define CDC_TX_PACKET_SIZE     APP_TX_DATA_SIZE
+#define CDC_TX_BUSY_NONE       0U
+#define CDC_TX_BUSY_QUEUE      1U
+#define CDC_TX_BUSY_LATEST     2U
 /* USER CODE END PRIVATE_DEFINES */
 
 /**
@@ -115,6 +124,7 @@ static uint8_t g_cdc_rx_buffer[131072U];
 static volatile uint16_t g_cdc_app_rx_head = 0U;
 static volatile uint16_t g_cdc_app_rx_tail = 0U;
 static volatile uint32_t g_cdc_app_rx_overflow_count = 0U;
+static volatile uint32_t g_cdc_app_rx_byte_count = 0U;
 static uint8_t g_cdc_app_rx_buffer[CDC_APP_RX_BUFFER_SIZE]
   __attribute__((section(".ram_d2"), aligned(32)));
 static CDC_TxPacket_t g_cdc_tx_queue[CDC_TX_QUEUE_DEPTH]
@@ -122,7 +132,16 @@ static CDC_TxPacket_t g_cdc_tx_queue[CDC_TX_QUEUE_DEPTH]
 static volatile uint8_t g_cdc_tx_head = 0U;
 static volatile uint8_t g_cdc_tx_tail = 0U;
 static volatile uint8_t g_cdc_tx_busy = 0U;
+static volatile uint8_t g_cdc_tx_busy_kind = CDC_TX_BUSY_NONE;
+static volatile uint8_t g_cdc_latest_pending = 0U;
+static CDC_LatestPacket_t g_cdc_latest_pending_packet
+  __attribute__((section(".ram_d2"), aligned(32)));
+static CDC_LatestPacket_t g_cdc_latest_active_packet
+  __attribute__((section(".ram_d2"), aligned(32)));
 static volatile uint32_t g_cdc_tx_drop_count = 0U;
+static volatile uint32_t g_cdc_tx_queued_count = 0U;
+static volatile uint32_t g_cdc_tx_complete_count = 0U;
+static volatile uint32_t g_cdc_tx_start_error_count = 0U;
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -189,6 +208,14 @@ static int8_t CDC_Init_FS(void)
   g_cdc_tx_head = 0U;
   g_cdc_tx_tail = 0U;
   g_cdc_tx_busy = 0U;
+  g_cdc_tx_busy_kind = CDC_TX_BUSY_NONE;
+  g_cdc_latest_pending = 0U;
+  g_cdc_app_rx_overflow_count = 0U;
+  g_cdc_app_rx_byte_count = 0U;
+  g_cdc_tx_drop_count = 0U;
+  g_cdc_tx_queued_count = 0U;
+  g_cdc_tx_complete_count = 0U;
+  g_cdc_tx_start_error_count = 0U;
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
@@ -206,6 +233,8 @@ static int8_t CDC_DeInit_FS(void)
   g_cdc_tx_head = 0U;
   g_cdc_tx_tail = 0U;
   g_cdc_tx_busy = 0U;
+  g_cdc_tx_busy_kind = CDC_TX_BUSY_NONE;
+  g_cdc_latest_pending = 0U;
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -329,6 +358,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
     }
     else
     {
+      g_cdc_app_rx_byte_count += rx_len;
       for (index = 0U; index < rx_len; ++index)
       {
         CDC_AppRxPush(Buf[index]);
@@ -394,6 +424,7 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   g_cdc_tx_queue[queue_index].length = Len;
   __DMB();
   g_cdc_tx_head = next;
+  g_cdc_tx_queued_count++;
   if (primask == 0U)
   {
     __enable_irq();
@@ -425,13 +456,18 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(epnum);
   if (g_cdc_tx_busy != 0U)
   {
-    uint8_t next = (uint8_t)(g_cdc_tx_tail + 1U);
-    if (next >= CDC_TX_QUEUE_DEPTH)
+    if (g_cdc_tx_busy_kind == CDC_TX_BUSY_QUEUE)
     {
-      next = 0U;
+      uint8_t next = (uint8_t)(g_cdc_tx_tail + 1U);
+      if (next >= CDC_TX_QUEUE_DEPTH)
+      {
+        next = 0U;
+      }
+      g_cdc_tx_tail = next;
     }
-    g_cdc_tx_tail = next;
     g_cdc_tx_busy = 0U;
+    g_cdc_tx_busy_kind = CDC_TX_BUSY_NONE;
+    g_cdc_tx_complete_count++;
   }
   CDC_TxKick();
   /* USER CODE END 13 */
@@ -479,13 +515,15 @@ static void CDC_AppRxPush(uint8_t byte)
 
 static void CDC_TxKick(void)
 {
-  uint8_t index;
+  uint8_t *buffer;
+  uint8_t busy_kind;
   uint16_t length;
   uint32_t primask = __get_PRIMASK();
 
   __disable_irq();
-  if ((g_cdc_tx_busy != 0U) || (g_cdc_tx_tail == g_cdc_tx_head) ||
-      (hUsbDeviceFS.pClassData == NULL))
+  if ((g_cdc_tx_busy != 0U) || (hUsbDeviceFS.pClassData == NULL) ||
+      ((g_cdc_latest_pending == 0U) &&
+       (g_cdc_tx_tail == g_cdc_tx_head)))
   {
     if (primask == 0U)
     {
@@ -494,20 +532,47 @@ static void CDC_TxKick(void)
     return;
   }
 
-  index = g_cdc_tx_tail;
-  length = g_cdc_tx_queue[index].length;
+  if (g_cdc_latest_pending != 0U)
+  {
+    length = g_cdc_latest_pending_packet.length;
+    memcpy(g_cdc_latest_active_packet.data,
+           g_cdc_latest_pending_packet.data, length);
+    g_cdc_latest_active_packet.length = length;
+    g_cdc_latest_pending = 0U;
+    buffer = g_cdc_latest_active_packet.data;
+    busy_kind = CDC_TX_BUSY_LATEST;
+  }
+  else
+  {
+    uint8_t index = g_cdc_tx_tail;
+    length = g_cdc_tx_queue[index].length;
+    buffer = g_cdc_tx_queue[index].data;
+    busy_kind = CDC_TX_BUSY_QUEUE;
+  }
+
   g_cdc_tx_busy = 1U;
+  g_cdc_tx_busy_kind = busy_kind;
   if (primask == 0U)
   {
     __enable_irq();
   }
 
-  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, g_cdc_tx_queue[index].data, length);
+  USBD_CDC_SetTxBuffer(&hUsbDeviceFS, buffer, length);
   if (USBD_CDC_TransmitPacket(&hUsbDeviceFS) != USBD_OK)
   {
     primask = __get_PRIMASK();
     __disable_irq();
+    if ((busy_kind == CDC_TX_BUSY_LATEST) &&
+        (g_cdc_latest_pending == 0U))
+    {
+      memcpy(g_cdc_latest_pending_packet.data,
+             g_cdc_latest_active_packet.data, length);
+      g_cdc_latest_pending_packet.length = length;
+      g_cdc_latest_pending = 1U;
+    }
     g_cdc_tx_busy = 0U;
+    g_cdc_tx_busy_kind = CDC_TX_BUSY_NONE;
+    g_cdc_tx_start_error_count++;
     if (primask == 0U)
     {
       __enable_irq();
@@ -537,19 +602,66 @@ uint32_t CDC_ReadAppBytes(uint8_t *buf, uint32_t len)
   return count;
 }
 
+uint8_t CDC_TransmitLatest_FS(const uint8_t *buf, uint16_t len)
+{
+  uint32_t primask;
+
+  if ((buf == NULL) || (len == 0U) ||
+      (len > sizeof(g_cdc_latest_pending_packet.data)))
+  {
+    return USBD_FAIL;
+  }
+
+  if (hUsbDeviceFS.pClassData == NULL)
+  {
+    return USBD_FAIL;
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  if (g_cdc_latest_pending == 0U)
+  {
+    g_cdc_tx_queued_count++;
+  }
+  memcpy(g_cdc_latest_pending_packet.data, buf, len);
+  g_cdc_latest_pending_packet.length = len;
+  __DMB();
+  g_cdc_latest_pending = 1U;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
+
+  CDC_TxKick();
+  return USBD_OK;
+}
+
 void CDC_TxService(void)
 {
   CDC_TxKick();
 }
 
-uint32_t CDC_GetAppRxOverflowCount(void)
+void CDC_GetAppStats(CDC_AppStats *stats)
 {
-  return g_cdc_app_rx_overflow_count;
-}
+  uint32_t primask;
 
-uint32_t CDC_GetTxDropCount(void)
-{
-  return g_cdc_tx_drop_count;
+  if (stats == NULL)
+  {
+    return;
+  }
+
+  primask = __get_PRIMASK();
+  __disable_irq();
+  stats->app_rx_byte_count = g_cdc_app_rx_byte_count;
+  stats->app_rx_overflow_count = g_cdc_app_rx_overflow_count;
+  stats->tx_queued_count = g_cdc_tx_queued_count;
+  stats->tx_complete_count = g_cdc_tx_complete_count;
+  stats->tx_drop_count = g_cdc_tx_drop_count;
+  stats->tx_start_error_count = g_cdc_tx_start_error_count;
+  if (primask == 0U)
+  {
+    __enable_irq();
+  }
 }
 
 void CDC_SetDownloadMode(uint8_t enable)

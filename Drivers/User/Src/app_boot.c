@@ -777,8 +777,6 @@ void AppBoot_Run(void)
   (void)HAL_ADCEx_Calibration_Start(
       context->adc1, ADC_CALIB_OFFSET, ADC_SINGLE_ENDED);
   CommService_Init();
-  FOC_Link_Init();
-  AppHalBridge_Init();
 
   SPI_LCD_Init();
   Boot_LogStatus("BOOT: JPEG init=", g_jpeg_init_ok);
@@ -849,6 +847,13 @@ void AppBoot_Run(void)
   MecanumOdometry_Init();
   Safety_Init();
   BatteryMonitor_Init();
+
+  /* Start continuous UART reception only after the blocking display/QSPI/SD
+   * boot sequence has finished.  Starting it before the animation allowed the
+   * ESP32 stream to fill the UART5 ring while the foreground could not drain
+   * it, producing overflow, bad-frame and rearm warnings on every boot. */
+  FOC_Link_Init();
+  AppHalBridge_Init();
 
   if (HAL_TIM_Base_Start_IT(context->tim6) != HAL_OK)
   {

@@ -2,9 +2,11 @@
 #include "adc_sampler.h"
 #include "app_boot.h"
 #include "app_event.h"
+#include "app_hal_bridge.h"
 #include "app_scheduler.h"
 #include "battery_monitor.h"
 #include "camera_service.h"
+#include "command_protocol.h"
 #include "command_control.h"
 #include "comm_service.h"
 #include "foc_link.h"
@@ -21,6 +23,7 @@ static void app_runtime_comm_task(uint32_t now, void *context)
 {
     (void)now;
     (void)context;
+    AppHalBridge_Process();
     CommService_Process();
 }
 
@@ -41,12 +44,8 @@ static void app_runtime_event_task(uint32_t now, void *context)
     {
         if (event.type == APP_EVENT_COMM_RX)
         {
-            lvgl_app_com_rx_channel_cb(event.channel, event.payload,
-                                       event.length);
-            if (event.channel == 1U)
-            {
-                TelemetryService_UsbRx(event.payload, event.length);
-            }
+            CommandProtocol_Receive(event.channel, event.payload,
+                                    event.length);
         }
         AppEvent_MarkHandled();
     }
@@ -134,6 +133,7 @@ void AppRuntime_Init(const AppContext *context)
     AppContext_Init(context);
     AppEvent_Init();
     CommandControl_Init();
+    CommandProtocol_Init();
     TelemetryService_Init();
     AppBoot_Run();
 

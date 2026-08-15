@@ -31,6 +31,10 @@ uint8_t CommandControl_SetMotorSpeed(uint8_t motor_index,
                                      int16_t speed_percent);
 uint8_t CommandControl_SetJoystick(int8_t lx, int8_t ly,
                                    int8_t rx, int8_t ry);
+uint8_t CommandControl_SetMecanum(uint8_t mode, int16_t vx,
+                                  int16_t vy, int16_t wz);
+uint8_t CommandControl_SetGyro(uint8_t enabled, int8_t direction,
+                               uint8_t speed_percent);
 void CommandControl_SetGyroState(uint8_t enabled,
                                  int8_t signed_speed_percent);
 void CommandControl_Stop(void);
