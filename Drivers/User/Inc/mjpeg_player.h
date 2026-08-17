@@ -22,6 +22,11 @@ extern "C" {
 
 int8_t MJPEG_Player_PlayFile(const char *file_path);
 uint8_t MJPEG_Player_GetLastFsError(void);
+/* Inject the standard DHT when an OV5640/MJPEG frame omits it and return the
+ * padded length accepted by the hardware JPEG DMA path. */
+int8_t MJPEG_Player_NormalizeJpeg(uint8_t *jpeg_data,
+                                 uint32_t *jpeg_len,
+                                 uint32_t jpeg_capacity);
 int8_t MJPEG_Player_DecodeMemoryToRgb565(uint8_t *jpeg_data,
                                         uint32_t jpeg_len,
                                         uint32_t jpeg_capacity,

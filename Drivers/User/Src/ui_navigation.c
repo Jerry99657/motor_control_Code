@@ -111,6 +111,7 @@ uint8_t UiNavigation_GetDepth(lvgl_app_screen_req_t screen)
         (screen == LVGL_APP_SCREEN_REQ_SERVO_ANGLE) ||
         (screen == LVGL_APP_SCREEN_REQ_NES_CACHE) ||
         (screen == LVGL_APP_SCREEN_REQ_NES_PLAYER) ||
+        (screen == LVGL_APP_SCREEN_REQ_PHOTO) ||
         (screen == LVGL_APP_SCREEN_REQ_GIF))
     {
         return 2U;

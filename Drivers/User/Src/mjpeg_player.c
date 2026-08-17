@@ -123,6 +123,7 @@ static uint32_t s_mjpeg_decode_fail_count = 0U;
 static uint32_t s_mjpeg_skip_log_count = 0U;
 static uint32_t s_mjpeg_dht_inject_log_count = 0U;
 static uint32_t s_mjpeg_aligned_len_log_count = 0U;
+static uint32_t s_mjpeg_decode_frame_count = 0U;
 static uint8_t s_mjpeg_jpeg_tables_ready = 0U;
 static mjpeg_dma_decode_ctx_t s_mjpeg_dma_ctx;
 static uint32_t s_mjpeg_pipeline_frame_interval_ms = MJPEG_PLAYER_DEFAULT_FRAME_MS;
@@ -174,6 +175,26 @@ static void mjpeg_cache_invalidate_range(void *addr, uint32_t size)
   start = ((uint32_t)addr) & ~(MJPEG_DCACHE_LINE_SIZE - 1U);
   end = (((uint32_t)addr + size + MJPEG_DCACHE_LINE_SIZE - 1U) & ~(MJPEG_DCACHE_LINE_SIZE - 1U));
   SCB_InvalidateDCache_by_Addr((uint32_t *)start, (int32_t)(end - start));
+#else
+  (void)addr;
+  (void)size;
+#endif
+}
+
+static void mjpeg_cache_clean_invalidate_range(void *addr, uint32_t size)
+{
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+  uint32_t start;
+  uint32_t end;
+
+  if ((addr == NULL) || (size == 0U) || ((SCB->CCR & SCB_CCR_DC_Msk) == 0U))
+  {
+    return;
+  }
+
+  start = ((uint32_t)addr) & ~(MJPEG_DCACHE_LINE_SIZE - 1U);
+  end = (((uint32_t)addr + size + MJPEG_DCACHE_LINE_SIZE - 1U) & ~(MJPEG_DCACHE_LINE_SIZE - 1U));
+  SCB_CleanInvalidateDCache_by_Addr((uint32_t *)start, (int32_t)(end - start));
 #else
   (void)addr;
   (void)size;
@@ -418,11 +439,16 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *h, uint8_t *pDataOut, uint32
 
   if ((pDataOut == NULL) || (OutDataLength == 0U))
   {
+    mjpeg_cache_invalidate_range(s_mjpeg_dma_out_chunk, sizeof(s_mjpeg_dma_out_chunk));
     HAL_JPEG_ConfigOutputBuffer(h, s_mjpeg_dma_out_chunk, sizeof(s_mjpeg_dma_out_chunk));
     return;
   }
 
-  mjpeg_cache_invalidate_range(pDataOut, OutDataLength);
+  /* Most bytes are written by MDMA, but STM32 HAL can drain the final JPEG
+     FIFO words into this same buffer with CPU stores.  A plain invalidate
+     would discard those dirty tail bytes and occasionally corrupt the last
+     MCUs.  Clean+invalidate is safe for both the MDMA-only and CPU-tail paths. */
+  mjpeg_cache_clean_invalidate_range(pDataOut, OutDataLength);
 
   if ((s_mjpeg_dma_ctx.out_len + OutDataLength) > s_mjpeg_dma_ctx.out_cap)
   {
@@ -443,6 +469,11 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *h, uint8_t *pDataOut, uint32
     return;
   }
 
+  /* memcpy above can refill these cache lines.  Invalidate them once more
+     before MDMA reuses the buffer; this also ensures a HAL CPU-written tail
+     allocates a line containing the current MDMA data instead of stale data
+     from the preceding output chunk. */
+  mjpeg_cache_invalidate_range(s_mjpeg_dma_out_chunk, sizeof(s_mjpeg_dma_out_chunk));
   HAL_JPEG_ConfigOutputBuffer(h, s_mjpeg_dma_out_chunk, sizeof(s_mjpeg_dma_out_chunk));
 }
 
@@ -477,7 +508,12 @@ static int8_t mjpeg_decode_frame_via_dma(uint8_t *jpeg_data, uint32_t decode_len
     return MJPEG_PLAYER_ERR_PARAM;
   }
 
-  mjpeg_log_value("MJPEG: dma start len=", (int32_t)decode_len);
+  s_mjpeg_decode_frame_count++;
+  if ((s_mjpeg_decode_frame_count <= 4U) ||
+      ((s_mjpeg_decode_frame_count & 0x7FU) == 0U))
+  {
+    mjpeg_log_value("MJPEG: dma start len=", (int32_t)decode_len);
+  }
 
   memset(&s_mjpeg_dma_ctx, 0, sizeof(s_mjpeg_dma_ctx));
   s_mjpeg_dma_ctx.in_ptr = jpeg_data;
@@ -558,6 +594,19 @@ static int8_t mjpeg_decode_frame_via_dma(uint8_t *jpeg_data, uint32_t decode_len
     return MJPEG_PLAYER_ERR_DECODE;
   }
   /* Trailing bytes smaller than one MCU block are normal for non-aligned images */
+
+  /* EOC only means that the JPEG core stopped.  A truncated/corrupted input or
+     an MDMA tail problem can still reach EOC before every image MCU has been
+     converted.  Never display a partially updated RGB buffer, because its
+     untouched area still contains pixels from the preceding frame. */
+  if ((s_mjpeg_dma_ctx.convert_ready == 0U) ||
+      (s_mjpeg_dma_ctx.convert_total_mcus == 0U) ||
+      (s_mjpeg_dma_ctx.convert_block_index != s_mjpeg_dma_ctx.convert_total_mcus))
+  {
+    mjpeg_log_value("MJPEG: incomplete MCU got=", (int32_t)s_mjpeg_dma_ctx.convert_block_index);
+    mjpeg_log_value("MJPEG: incomplete MCU expected=", (int32_t)s_mjpeg_dma_ctx.convert_total_mcus);
+    return MJPEG_PLAYER_ERR_DECODE;
+  }
 
   return MJPEG_PLAYER_OK;
 }
@@ -1384,8 +1433,6 @@ static int8_t mjpeg_decode_one_frame(uint8_t *jpeg_data, uint32_t jpeg_len,
   {
     return MJPEG_PLAYER_FRAME_DEFERRED;
   }
-
-  mjpeg_log_value("MJPEG: decode enter len=", (int32_t)jpeg_len);
 
   prepare_status = mjpeg_prepare_decode_stream(
     jpeg_data,
@@ -2756,6 +2803,7 @@ int8_t MJPEG_Player_PlayFile(const char *file_path)
   decoded_frame_count = 0U;
   frame_cursor = 0U;
   s_mjpeg_skip_log_count = 0U;
+  s_mjpeg_decode_frame_count = 0U;
   s_mjpeg_pending_control = MEDIA_CONTROL_NONE;
   mjpeg_seek_history_reset();
 
@@ -3311,6 +3359,28 @@ uint8_t MJPEG_Player_GetLastFsError(void)
   return s_mjpeg_last_fs_error;
 }
 
+int8_t MJPEG_Player_NormalizeJpeg(uint8_t *jpeg_data,
+                                 uint32_t *jpeg_len,
+                                 uint32_t jpeg_capacity)
+{
+  uint32_t decode_len = 0U;
+  int8_t result;
+
+  if ((jpeg_data == NULL) || (jpeg_len == NULL) || (*jpeg_len < 4U) ||
+      (*jpeg_len > jpeg_capacity))
+  {
+    return MJPEG_PLAYER_ERR_PARAM;
+  }
+
+  result = mjpeg_prepare_decode_stream(jpeg_data, *jpeg_len,
+                                       jpeg_capacity, &decode_len);
+  if (result == MJPEG_PLAYER_OK)
+  {
+    *jpeg_len = decode_len;
+  }
+  return result;
+}
+
 int8_t MJPEG_Player_DecodeMemoryToRgb565(uint8_t *jpeg_data,
                                         uint32_t jpeg_len,
                                         uint32_t jpeg_capacity,
@@ -3331,6 +3401,18 @@ int8_t MJPEG_Player_DecodeMemoryToRgb565(uint8_t *jpeg_data,
   if ((s_mjpeg_frame_io_buffer != NULL) || (s_mjpeg_dma_ctx.active != 0U))
   {
     return MJPEG_PLAYER_ERR_BUSY;
+  }
+
+  /* File playback initializes the JPEG utility color tables in PlayFile().
+     Camera preview enters through this memory-only API and may be the first
+     JPEG consumer after boot. Without this initialization, the hardware
+     decoder still yields valid YCbCr data but the software RGB565 converter
+     uses zero-filled chroma lookup tables, producing an apparently grayscale
+     image. Initialize once here as well so both entry paths are equivalent. */
+  if (s_mjpeg_jpeg_tables_ready == 0U)
+  {
+    JPEG_InitColorTables();
+    s_mjpeg_jpeg_tables_ready = 1U;
   }
 
   s_mjpeg_frame_io_buffer = (uint8_t *)rgb565_buffer;

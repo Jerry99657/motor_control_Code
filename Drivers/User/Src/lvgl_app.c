@@ -30,6 +30,7 @@
 #include "command_protocol.h"
 #include "foc_link.h"
 #include "camera_service.h"
+#include "camera_album.h"
 #include "media_memory.h"
 #include "nes_rom_cache.h"
 #include "nes_runtime.h"
@@ -104,6 +105,7 @@ typedef enum
     LVGL_APP_ENTRY_BIN,
     LVGL_APP_ENTRY_GIF,
     LVGL_APP_ENTRY_MJPEG,
+    LVGL_APP_ENTRY_JPEG,
     LVGL_APP_ENTRY_NES,
     LVGL_APP_ENTRY_FILE
 } lvgl_app_entry_type_t;
@@ -157,6 +159,8 @@ static uint16_t s_browser_entry_count = 0U;
 static lvgl_app_browser_entry_t s_browser_entries[LVGL_APP_MAX_BROWSER_ENTRIES];
 static char s_browser_path[LVGL_APP_BROWSER_PATH_LEN] = "/";
 static FRESULT s_browser_scan_result = FR_OK;
+static char s_browser_restore_name[LVGL_APP_ENTRY_NAME_LEN] = {0};
+static uint8_t s_browser_restore_pending = 0U;
 
 static gd_GIF *s_gif = NULL;
 static lv_obj_t *s_gif_obj = NULL;
@@ -228,13 +232,34 @@ static lv_obj_t *s_camera_preview_card = NULL;
 static lv_obj_t *s_camera_preview_image = NULL;
 static lv_obj_t *s_camera_placeholder_label = NULL;
 static lv_obj_t *s_camera_info_label = NULL;
+static lv_obj_t *s_camera_save_popup = NULL;
 static lv_img_dsc_t s_camera_image_dsc;
 static uint16_t *s_camera_rgb_buffer = NULL;
 static uint32_t s_camera_rgb_capacity = 0U;
+static const uint8_t *s_camera_pending_jpeg = NULL;
+static uint32_t s_camera_pending_jpeg_size = 0U;
 static uint32_t s_camera_phase_tick = 0U;
 static uint32_t s_camera_capture_started_tick = 0U;
 static uint32_t s_camera_capture_elapsed_ms = 0U;
 static uint8_t s_camera_capture_after_init = 0U;
+static uint8_t s_camera_preview_paused = 0U;
+static uint8_t s_camera_has_frame = 0U;
+static uint8_t s_camera_consecutive_errors = 0U;
+static uint32_t s_camera_next_capture_tick = 0U;
+static uint32_t s_camera_last_frame_tick = 0U;
+static uint32_t s_camera_frame_count = 0U;
+static uint32_t s_camera_dropped_frames = 0U;
+static uint16_t s_camera_fps_x10 = 0U;
+static uint8_t s_camera_save_requested = 0U;
+static uint8_t s_camera_pending_save = 0U;
+static uint8_t s_camera_photo_key_latched = 0U;
+static lv_obj_t *s_photo_image = NULL;
+static lv_obj_t *s_photo_info_label = NULL;
+static lv_img_dsc_t s_photo_image_dsc;
+static uint16_t *s_photo_rgb_buffer = NULL;
+static uint32_t s_photo_rgb_capacity = 0U;
+static char s_photo_path[LVGL_APP_BROWSER_PATH_LEN] = {0};
+static char s_photo_name[LVGL_APP_ENTRY_UTF8_LEN] = {0};
 static lv_obj_t *s_nes_cache_phase_label = NULL;
 static lv_obj_t *s_nes_cache_progress_bar = NULL;
 static lv_obj_t *s_nes_cache_info_label = NULL;
@@ -312,10 +337,14 @@ static void lvgl_app_update_header_activity(void)
     }
     else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_CAMERA)
     {
-        activity = LVGL_APP_ACTIVITY_RUNNING;
-        symbol = LV_SYMBOL_IMAGE;
+        activity = (s_camera_preview_paused != 0U) ?
+                   LVGL_APP_ACTIVITY_PAUSED : LVGL_APP_ACTIVITY_RUNNING;
+        symbol = (s_camera_preview_paused != 0U) ?
+                 LV_SYMBOL_PAUSE : LV_SYMBOL_IMAGE;
         color = (s_camera_phase == LVGL_APP_CAMERA_PHASE_ERROR) ?
-                lv_color_hex(0xFCA5A5) : lv_color_hex(0x86EFAC);
+                lv_color_hex(0xFCA5A5) :
+                ((s_camera_preview_paused != 0U) ?
+                 lv_color_hex(0xFCD34D) : lv_color_hex(0x86EFAC));
         spin = ((s_camera_phase == LVGL_APP_CAMERA_PHASE_INIT_PENDING) ||
                 (s_camera_phase == LVGL_APP_CAMERA_PHASE_CAPTURING) ||
                 (s_camera_phase == LVGL_APP_CAMERA_PHASE_DECODE_PENDING)) ? 1U : 0U;
@@ -398,6 +427,13 @@ static void lvgl_app_diagnostics_refresh(void);
 static void lvgl_app_show_camera_test(void);
 static void lvgl_app_camera_process(void);
 static void lvgl_app_camera_exit(const char *reason);
+static void lvgl_app_camera_open_album(void);
+static void lvgl_app_camera_show_save_popup(const char *saved_name);
+static void lvgl_app_camera_request_photo(void);
+static void lvgl_app_camera_process_photo_key(void);
+static void lvgl_app_show_photo_viewer(void);
+static void lvgl_app_photo_release(void);
+static void lvgl_app_photo_exit(const char *reason);
 static void lvgl_app_show_display_settings(void);
 static void lvgl_app_show_gif_player(const char *full_path, const char *name);
 static void lvgl_app_exit_gif_player(const char *reason);
@@ -661,6 +697,27 @@ static uint8_t lvgl_app_is_gif_file(const char *name)
     return lvgl_app_is_ext_file(name, "GIF");
 }
 
+static uint8_t lvgl_app_is_jpeg_file(const char *name)
+{
+    size_t len;
+
+    if (lvgl_app_is_ext_file(name, "JPG") != 0U)
+    {
+        return 1U;
+    }
+    if (name == NULL)
+    {
+        return 0U;
+    }
+
+    len = strlen(name);
+    return ((len >= 6U) && (name[len - 5U] == '.') &&
+            ((char)toupper((unsigned char)name[len - 4U]) == 'J') &&
+            ((char)toupper((unsigned char)name[len - 3U]) == 'P') &&
+            ((char)toupper((unsigned char)name[len - 2U]) == 'E') &&
+            ((char)toupper((unsigned char)name[len - 1U]) == 'G')) ? 1U : 0U;
+}
+
 static uint8_t lvgl_app_is_nes_file(const char *name)
 {
     return lvgl_app_is_ext_file(name, "NES");
@@ -711,6 +768,30 @@ static void lvgl_app_browser_reset_path(void)
 {
     s_browser_path[0] = '/';
     s_browser_path[1] = '\0';
+}
+
+static void lvgl_app_browser_remember_name(const char *name)
+{
+    if ((name == NULL) || (name[0] == '\0'))
+    {
+        s_browser_restore_name[0] = '\0';
+        s_browser_restore_pending = 0U;
+        return;
+    }
+
+    (void)snprintf(s_browser_restore_name,
+                   sizeof(s_browser_restore_name), "%s", name);
+    s_browser_restore_pending = 1U;
+}
+
+static void lvgl_app_browser_remember_entry(uint16_t index)
+{
+    if (index >= s_browser_entry_count)
+    {
+        return;
+    }
+
+    lvgl_app_browser_remember_name(s_browser_entries[index].name);
 }
 
 static size_t lvgl_app_cp936_to_utf8(const char *src, char *dst, size_t dst_size)
@@ -877,11 +958,19 @@ static uint8_t lvgl_app_browser_enter_dir(const char *name)
 
 static uint8_t lvgl_app_browser_go_parent(void)
 {
+    const char *child_name;
     size_t len;
 
     if (strcmp(s_browser_path, "/") == 0)
     {
         return 0U;
+    }
+
+    /* The parent page should focus the directory that was just left. */
+    child_name = strrchr(s_browser_path, '/');
+    if ((child_name != NULL) && (child_name[1] != '\0'))
+    {
+        lvgl_app_browser_remember_name(&child_name[1]);
     }
 
     len = strlen(s_browser_path);
@@ -999,6 +1088,10 @@ static uint16_t lvgl_app_scan_browser_entries(void)
             else if ((lvgl_app_is_avi_file(fno.fname) != 0U) || (lvgl_app_is_mjpeg_file(fno.fname) != 0U))
             {
                 file_type = LVGL_APP_ENTRY_MJPEG;
+            }
+            else if (lvgl_app_is_jpeg_file(fno.fname) != 0U)
+            {
+                file_type = LVGL_APP_ENTRY_JPEG;
             }
             else if (lvgl_app_is_nes_file(fno.fname) != 0U)
             {
@@ -1286,6 +1379,11 @@ static void lvgl_app_navigation_leave(lvgl_app_screen_req_t current,
         CommandControl_Leave();
         s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     }
+    if ((current == LVGL_APP_SCREEN_REQ_PHOTO) &&
+        (target != LVGL_APP_SCREEN_REQ_PHOTO))
+    {
+        lvgl_app_photo_release();
+    }
 }
 
 static void lvgl_app_request_screen(lvgl_app_screen_req_t req)
@@ -1353,6 +1451,10 @@ static void lvgl_app_process_pending_screen(void)
     else if (req == LVGL_APP_SCREEN_REQ_CAMERA)
     {
         lvgl_app_show_camera_test();
+    }
+    else if (req == LVGL_APP_SCREEN_REQ_PHOTO)
+    {
+        lvgl_app_show_photo_viewer();
     }
     else if (req == LVGL_APP_SCREEN_REQ_DISPLAY_SETTINGS)
     {
@@ -2828,6 +2930,7 @@ static void lvgl_app_sd_play_bin_by_index(uint16_t index)
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
     char played_name[LVGL_APP_ENTRY_UTF8_LEN];
 
+    lvgl_app_browser_remember_entry(index);
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
           lvgl_app_set_status("Failed to build path");
@@ -3145,6 +3248,7 @@ static void lvgl_app_sd_play_gif_by_index(uint16_t index)
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
     char display_name[LVGL_APP_ENTRY_UTF8_LEN];
 
+    lvgl_app_browser_remember_entry(index);
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
             lvgl_app_set_status("Failed to build path");
@@ -3163,6 +3267,7 @@ static void lvgl_app_sd_play_mjpeg_by_index(uint16_t index)
     char play_path[LVGL_APP_BROWSER_PATH_LEN];
     char played_name[LVGL_APP_ENTRY_UTF8_LEN];
 
+    lvgl_app_browser_remember_entry(index);
     if (lvgl_app_browser_make_file_path(s_browser_entries[index].name, play_path, sizeof(play_path)) == 0U)
     {
           lvgl_app_set_status("Failed to build path");
@@ -3653,10 +3758,28 @@ static void lvgl_app_sd_cache_nes_by_index(uint16_t index)
         return;
     }
 
+    /* Keep the ROM selected across both the cache page and NES runtime. */
+    lvgl_app_browser_remember_entry(index);
     (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name,
                                  s_nes_cache_name,
                                  sizeof(s_nes_cache_name));
     lvgl_app_show_nes_cache();
+}
+
+static void lvgl_app_sd_show_photo_by_index(uint16_t index)
+{
+    lvgl_app_browser_remember_entry(index);
+    if (lvgl_app_browser_make_file_path(s_browser_entries[index].name,
+                                        s_photo_path,
+                                        sizeof(s_photo_path)) == 0U)
+    {
+        lvgl_app_set_status("Failed to build JPEG path");
+        return;
+    }
+
+    (void)lvgl_app_cp936_to_utf8(s_browser_entries[index].name,
+                                 s_photo_name, sizeof(s_photo_name));
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_PHOTO);
 }
 
 static void lvgl_app_sd_select_id(uintptr_t id)
@@ -3701,6 +3824,10 @@ static void lvgl_app_sd_select_id(uintptr_t id)
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_MJPEG)
     {
         lvgl_app_sd_play_mjpeg_by_index(index);
+    }
+    else if (s_browser_entries[index].type == LVGL_APP_ENTRY_JPEG)
+    {
+        lvgl_app_sd_show_photo_by_index(index);
     }
     else if (s_browser_entries[index].type == LVGL_APP_ENTRY_NES)
     {
@@ -3804,6 +3931,9 @@ static void lvgl_app_menu_event_cb(lv_event_t *e)
     }
     else if (id == LVGL_APP_MENU_ID_SD_BROWSER)
     {
+        /* A fresh entry from Main Menu starts at the root without inheriting
+         * an anchor from an earlier browser session. */
+        lvgl_app_browser_remember_name(NULL);
         lvgl_app_browser_reset_path();
         lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
     }
@@ -4339,10 +4469,15 @@ static void lvgl_app_show_diagnostics(void)
     lvgl_app_page_finish();
 }
 
-#define LVGL_APP_CAMERA_PREVIEW_WIDTH   200U
-#define LVGL_APP_CAMERA_PREVIEW_HEIGHT  150U
+#define LVGL_APP_CAMERA_PREVIEW_WIDTH   224U
+#define LVGL_APP_CAMERA_PREVIEW_HEIGHT  168U
 #define LVGL_APP_CAMERA_RGB_BYTES       \
     ((uint32_t)CAMERA_JPEG_WIDTH * (uint32_t)CAMERA_JPEG_HEIGHT * 2U)
+#define LVGL_APP_CAMERA_TARGET_FPS      10U
+#define LVGL_APP_CAMERA_FRAME_PERIOD_MS \
+    (1000U / LVGL_APP_CAMERA_TARGET_FPS)
+#define LVGL_APP_CAMERA_DECODE_DEFER_MS 30U
+#define LVGL_APP_CAMERA_MAX_ERRORS      3U
 
 static void lvgl_app_camera_set_info(const char *fmt, ...)
 {
@@ -4361,10 +4496,23 @@ static void lvgl_app_camera_set_info(const char *fmt, ...)
     (void)UI_LabelSetTextIfChanged(s_camera_info_label, text);
 }
 
+static void lvgl_app_camera_release_pending_jpeg(void)
+{
+    if (s_camera_pending_jpeg != NULL)
+    {
+        Camera_Service_ReleaseSnapshot(s_camera_pending_jpeg);
+        s_camera_pending_jpeg = NULL;
+        s_camera_pending_jpeg_size = 0U;
+    }
+}
+
 static void lvgl_app_camera_release_preview(void)
 {
     if (s_camera_image_dsc.data != NULL)
     {
+        /* The LCD flush is asynchronous.  Do not return the shared media pool
+           while DMA may still be reading the camera's RGB565 frame. */
+        (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
         lv_img_cache_invalidate_src(&s_camera_image_dsc);
     }
     if ((s_camera_preview_image != NULL) &&
@@ -4424,13 +4572,12 @@ static void lvgl_app_camera_show_error(Camera_Result result)
     if ((result == CAMERA_RESULT_I2C) ||
         (diagnostics.i2c_error != HAL_I2C_ERROR_NONE))
     {
-        lvgl_app_camera_set_info("SCCB E%02lX L%u%u N%u P%uR%u\nStep %u  ID 0x%04lX",
+        lvgl_app_camera_set_info("SCCB E%02lX L%u%u N%u P%u RST EXT\nStep %u  ID 0x%04lX",
                                  (unsigned long)diagnostics.i2c_error,
                                  diagnostics.scl_level,
                                  diagnostics.sda_level,
                                  diagnostics.sccb_nack_phase,
                                  diagnostics.pwdn_level,
-                                 diagnostics.reset_level,
                                  (unsigned int)diagnostics.init_stage,
                                  (unsigned long)diagnostics.sensor_id);
     }
@@ -4457,7 +4604,6 @@ static void lvgl_app_camera_start_capture(void)
 {
     Camera_Result result;
 
-    lvgl_app_camera_release_preview();
     result = Camera_Service_StartSnapshot(CAMERA_CAPTURE_TIMEOUT_DEFAULT);
     if (result != CAMERA_RESULT_OK)
     {
@@ -4467,36 +4613,182 @@ static void lvgl_app_camera_start_capture(void)
 
     s_camera_capture_started_tick = HAL_GetTick();
     s_camera_phase = LVGL_APP_CAMERA_PHASE_CAPTURING;
-    lvgl_app_camera_set_info("ID 0x%04X\nCapturing 320x240 JPEG...",
-                             CAMERA_OV5640_SENSOR_ID);
-    lvgl_app_set_status(lvgl_app_tr(
-        "Capturing... KEY3 cancels and returns",
-        "正在采集图像 | KEY3取消并返回"));
+    if (s_camera_has_frame == 0U)
+    {
+        lvgl_app_camera_set_info("ID 0x%04X\nStarting live preview...",
+                                 CAMERA_OV5640_SENSOR_ID);
+    }
 }
 
 static void lvgl_app_camera_request_capture(void)
 {
-    if (s_camera_phase == LVGL_APP_CAMERA_PHASE_READY)
+    if (s_camera_phase == LVGL_APP_CAMERA_PHASE_ERROR)
     {
-        lvgl_app_camera_start_capture();
-        return;
-    }
-    if ((s_camera_phase == LVGL_APP_CAMERA_PHASE_INIT_PENDING) ||
-        (s_camera_phase == LVGL_APP_CAMERA_PHASE_CAPTURING) ||
-        (s_camera_phase == LVGL_APP_CAMERA_PHASE_DECODE_PENDING))
-    {
-        lvgl_app_show_toast(UI_NOTICE_INFO, "Camera is busy");
+        lvgl_app_camera_release_pending_jpeg();
+        Camera_Service_Sleep();
+        s_camera_preview_paused = 0U;
+        s_camera_consecutive_errors = 0U;
+        s_camera_capture_after_init = 1U;
+        s_camera_phase_tick = HAL_GetTick();
+        s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
+        lvgl_app_camera_set_info("Powering OV5640...\nPlease wait");
+        lvgl_app_set_status(lvgl_app_tr("Initializing camera...",
+                                        "正在初始化摄像头..."));
         return;
     }
 
-    lvgl_app_camera_release_preview();
-    Camera_Service_Sleep();
-    s_camera_capture_after_init = 1U;
-    s_camera_phase_tick = HAL_GetTick();
-    s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
-    lvgl_app_camera_set_info("Powering OV5640...\nPlease wait");
-    lvgl_app_set_status(lvgl_app_tr("Initializing camera...",
-                                    "正在初始化摄像头..."));
+    s_camera_preview_paused = (s_camera_preview_paused == 0U) ? 1U : 0U;
+    if (s_camera_preview_paused != 0U)
+    {
+        lvgl_app_set_status(lvgl_app_tr(
+            "Paused | Up photo | Right album | OK resume",
+            "已暂停 | 上键拍照 | 右键相册 | OK继续"));
+        lvgl_app_show_toast(UI_NOTICE_INFO, "Camera paused");
+    }
+    else
+    {
+        s_camera_next_capture_tick = HAL_GetTick();
+        lvgl_app_set_status(lvgl_app_tr(
+            "Up photo | Right album | OK pause",
+            "上键拍照 | 右键相册 | OK暂停"));
+        lvgl_app_show_toast(UI_NOTICE_INFO, "Camera resumed");
+    }
+}
+
+static void lvgl_app_camera_save_popup_delete_cb(lv_event_t *e)
+{
+    if ((lv_event_get_code(e) == LV_EVENT_DELETE) &&
+        (lv_event_get_target(e) == s_camera_save_popup))
+    {
+        s_camera_save_popup = NULL;
+    }
+}
+
+static void lvgl_app_camera_show_save_popup(const char *saved_name)
+{
+    lv_obj_t *title;
+    lv_obj_t *filename;
+
+    if ((s_page_root == NULL) ||
+        (lv_obj_is_valid(s_page_root) == false) ||
+        (saved_name == NULL) || (saved_name[0] == '\0'))
+    {
+        return;
+    }
+
+    if ((s_camera_save_popup != NULL) &&
+        (lv_obj_is_valid(s_camera_save_popup) != false))
+    {
+        lv_obj_del(s_camera_save_popup);
+    }
+
+    s_camera_save_popup = lv_obj_create(s_page_root);
+    lv_obj_set_size(s_camera_save_popup, 194, 82);
+    lv_obj_center(s_camera_save_popup);
+    lv_obj_clear_flag(s_camera_save_popup,
+                      LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(s_camera_save_popup,
+                              lv_color_hex(0xEAF8EF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_camera_save_popup, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_camera_save_popup, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_camera_save_popup,
+                                  lv_color_hex(0x2E9D5B), LV_PART_MAIN);
+    lv_obj_set_style_radius(s_camera_save_popup, 12, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(s_camera_save_popup, 16, LV_PART_MAIN);
+    lv_obj_set_style_shadow_opa(s_camera_save_popup, LV_OPA_30, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(s_camera_save_popup, 8, LV_PART_MAIN);
+    lv_obj_add_event_cb(s_camera_save_popup,
+                        lvgl_app_camera_save_popup_delete_cb,
+                        LV_EVENT_DELETE, NULL);
+
+    title = lv_label_create(s_camera_save_popup);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x176B3A), LV_PART_MAIN);
+    lv_label_set_text(title, LV_SYMBOL_OK "  Photo saved");
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
+
+    filename = lv_label_create(s_camera_save_popup);
+    lv_obj_set_width(filename, 174);
+    lv_label_set_long_mode(filename, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(filename, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_align(filename, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(filename, lv_color_hex(0x24533A), LV_PART_MAIN);
+    lv_label_set_text(filename, saved_name);
+    lv_obj_align(filename, LV_ALIGN_BOTTOM_MID, 0, -2);
+
+    lv_obj_move_foreground(s_camera_save_popup);
+    UI_Anim_StateBounce(s_camera_save_popup);
+    lv_obj_del_delayed(s_camera_save_popup, 1800U);
+}
+
+static void lvgl_app_camera_request_photo(void)
+{
+    if (s_camera_phase == LVGL_APP_CAMERA_PHASE_ERROR)
+    {
+        lvgl_app_set_status("Camera error - OK retries first");
+        return;
+    }
+    if ((s_camera_save_requested != 0U) || (s_camera_pending_save != 0U))
+    {
+        lvgl_app_set_status("Photo save already pending...");
+        return;
+    }
+
+    s_camera_save_requested = 1U;
+    if (s_camera_preview_paused != 0U)
+    {
+        s_camera_preview_paused = 0U;
+        s_camera_next_capture_tick = HAL_GetTick();
+    }
+    lvgl_app_set_status("Capturing photo to SD...");
+    lvgl_app_show_toast(UI_NOTICE_INFO, "Photo requested");
+}
+
+static uint8_t lvgl_app_camera_logical_up_pressed(void)
+{
+    if ((HAL_GPIO_ReadPin(Key_Up_GPIO_Port, Key_Up_Pin) == GPIO_PIN_RESET) &&
+        (UI_Settings_MapDirection(UI_SETTINGS_DIRECTION_UP) ==
+         UI_SETTINGS_DIRECTION_UP))
+    {
+        return 1U;
+    }
+    if ((HAL_GPIO_ReadPin(Key_Right_GPIO_Port, Key_Right_Pin) == GPIO_PIN_RESET) &&
+        (UI_Settings_MapDirection(UI_SETTINGS_DIRECTION_RIGHT) ==
+         UI_SETTINGS_DIRECTION_UP))
+    {
+        return 1U;
+    }
+    if ((HAL_GPIO_ReadPin(Key_Down_GPIO_Port, Key_Down_Pin) == GPIO_PIN_RESET) &&
+        (UI_Settings_MapDirection(UI_SETTINGS_DIRECTION_DOWN) ==
+         UI_SETTINGS_DIRECTION_UP))
+    {
+        return 1U;
+    }
+    if ((HAL_GPIO_ReadPin(Key_Left_GPIO_Port, Key_Left_Pin) == GPIO_PIN_RESET) &&
+        (UI_Settings_MapDirection(UI_SETTINGS_DIRECTION_LEFT) ==
+         UI_SETTINGS_DIRECTION_UP))
+    {
+        return 1U;
+    }
+    return 0U;
+}
+
+static void lvgl_app_camera_process_photo_key(void)
+{
+    uint8_t pressed = lvgl_app_camera_logical_up_pressed();
+
+    if (pressed == 0U)
+    {
+        s_camera_photo_key_latched = 0U;
+        return;
+    }
+    if (s_camera_photo_key_latched != 0U)
+    {
+        return;
+    }
+
+    s_camera_photo_key_latched = 1U;
+    lvgl_app_camera_request_photo();
 }
 
 static void lvgl_app_camera_event_cb(lv_event_t *e)
@@ -4513,12 +4805,53 @@ static void lvgl_app_camera_event_cb(lv_event_t *e)
     {
         lvgl_app_camera_request_capture();
     }
+    /* The keypad port intentionally maps logical Up/Down to PREV/NEXT so
+       lists follow display rotation. Accept both forms on this non-list page. */
+    else if ((key == LV_KEY_UP) || (key == LV_KEY_PREV))
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        s_camera_photo_key_latched = 1U;
+        lvgl_app_camera_request_photo();
+    }
+    else if (key == LV_KEY_RIGHT)
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_camera_open_album();
+    }
     else if ((key == LV_KEY_LEFT) || (key == LV_KEY_ESC))
     {
         lv_port_indev_suppress_all_keys_until_release();
         lvgl_app_camera_exit((key == LV_KEY_LEFT) ?
                              "Returned by Left" : "Returned by KEY2");
     }
+}
+
+static void lvgl_app_camera_recover_frame(Camera_Result result)
+{
+    lvgl_app_camera_release_pending_jpeg();
+    s_camera_pending_save = 0U;
+    ++s_camera_dropped_frames;
+    ++s_camera_consecutive_errors;
+
+    if (s_camera_consecutive_errors >= LVGL_APP_CAMERA_MAX_ERRORS)
+    {
+        lvgl_app_camera_show_error(result);
+        return;
+    }
+
+    /* A transient DCMI/JPEG fault must not destroy the last good image.  A
+       short sensor restart gives the preview two automatic recovery attempts;
+       only repeated failures stop the page and require OK. */
+    Camera_Service_Sleep();
+    s_camera_capture_after_init = 1U;
+    s_camera_phase_tick = HAL_GetTick();
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
+    lvgl_app_camera_set_info("Frame dropped (%lu)  Error %d\nRecovering OV5640...",
+                             (unsigned long)s_camera_dropped_frames,
+                             (int)result);
+    lvgl_app_set_status(lvgl_app_tr(
+        "Camera recovering after a dropped frame...",
+        "检测到丢帧 | 正在自动恢复摄像头..."));
 }
 
 static void lvgl_app_camera_process(void)
@@ -4531,6 +4864,14 @@ static void lvgl_app_camera_process(void)
     uint16_t image_width;
     uint16_t image_height;
     uint32_t decode_started;
+    uint32_t decode_elapsed;
+    uint32_t now;
+    uint32_t frame_delta;
+    uint32_t instant_fps_x10;
+    uint8_t first_frame;
+    uint8_t photo_save_attempted = 0U;
+    int8_t photo_save_result = CAMERA_ALBUM_OK;
+    char saved_photo_path[CAMERA_ALBUM_PATH_MAX] = {0};
     int8_t decode_result;
 
     if (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_CAMERA)
@@ -4538,8 +4879,24 @@ static void lvgl_app_camera_process(void)
         return;
     }
 
+    /* LVGL consumes PREV/NEXT inside group navigation before the focused
+       object's LV_EVENT_KEY callback. Poll the mapped logical Up edge here so
+       the camera shutter remains reliable without changing list navigation. */
+    lvgl_app_camera_process_photo_key();
+
+    now = HAL_GetTick();
+
+    if (((s_camera_phase == LVGL_APP_CAMERA_PHASE_READY) ||
+         (s_camera_phase == LVGL_APP_CAMERA_PHASE_SHOWING)) &&
+        (s_camera_preview_paused == 0U) &&
+        ((int32_t)(now - s_camera_next_capture_tick) >= 0))
+    {
+        lvgl_app_camera_start_capture();
+        return;
+    }
+
     if ((s_camera_phase == LVGL_APP_CAMERA_PHASE_INIT_PENDING) &&
-        ((HAL_GetTick() - s_camera_phase_tick) >= 80U))
+        ((now - s_camera_phase_tick) >= 80U))
     {
         result = Camera_Service_Init();
         Camera_Service_GetDiagnostics(&diagnostics);
@@ -4550,16 +4907,36 @@ static void lvgl_app_camera_process(void)
         }
 
         s_camera_phase = LVGL_APP_CAMERA_PHASE_READY;
-        lvgl_app_camera_set_info("OV5640 ID 0x%04lX\n320x240 JPEG ready",
-                                 (unsigned long)diagnostics.sensor_id);
+        if (diagnostics.autofocus_enabled != 0U)
+        {
+            lvgl_app_camera_set_info("OV5640 ID 0x%04lX  AF:%s/%02X\n320x240 JPEG ready",
+                                     (unsigned long)diagnostics.sensor_id,
+                                     (diagnostics.autofocus_ready != 0U) ?
+                                     "ON" : "--",
+                                     diagnostics.autofocus_status);
+        }
+        else
+        {
+            lvgl_app_camera_set_info("OV5640 ID 0x%04lX  AF:FIXED\n320x240 JPEG ready",
+                                     (unsigned long)diagnostics.sensor_id);
+        }
         lvgl_app_set_status(lvgl_app_tr(
-            "OK captures - Left/KEY3 returns",
-            "OK拍照 | Left/KEY3返回"));
-        lvgl_app_show_toast(UI_NOTICE_SUCCESS, "OV5640 ready");
-        if (s_camera_capture_after_init != 0U)
+            "Up photo | Right album | OK pause",
+            "上键拍照 | 右键相册 | OK暂停"));
+        if (s_camera_frame_count == 0U)
+        {
+            lvgl_app_show_toast(UI_NOTICE_SUCCESS, "OV5640 ready");
+        }
+        if ((s_camera_capture_after_init != 0U) &&
+            (s_camera_preview_paused == 0U))
         {
             s_camera_capture_after_init = 0U;
             lvgl_app_camera_start_capture();
+        }
+        else
+        {
+            s_camera_capture_after_init = 0U;
+            s_camera_next_capture_tick = HAL_GetTick();
         }
         return;
     }
@@ -4572,47 +4949,105 @@ static void lvgl_app_camera_process(void)
             result = Camera_Service_GetSnapshot(&jpeg_data, &jpeg_size);
             if (result != CAMERA_RESULT_OK)
             {
-                lvgl_app_camera_show_error(result);
+                lvgl_app_camera_recover_frame(result);
                 return;
             }
 
+            s_camera_pending_jpeg = jpeg_data;
+            s_camera_pending_jpeg_size = jpeg_size;
+            s_camera_pending_save = s_camera_save_requested;
+            if (s_camera_pending_save != 0U)
+            {
+                s_camera_save_requested = 0U;
+            }
             s_camera_capture_elapsed_ms = HAL_GetTick() - s_camera_capture_started_tick;
+
+            /* The returned slot is now owned by the JPEG decoder. Start DCMI
+               immediately on the other slot so capture N+1 overlaps the
+               settle/decode/display work for frame N. Never queue more than
+               this single frame ahead. */
+            if ((s_camera_preview_paused == 0U) &&
+                (s_camera_pending_save == 0U))
+            {
+                result = Camera_Service_StartSnapshot(
+                    CAMERA_CAPTURE_TIMEOUT_DEFAULT);
+                if (result == CAMERA_RESULT_OK)
+                {
+                    s_camera_capture_started_tick = HAL_GetTick();
+                }
+                else if (result != CAMERA_RESULT_BUSY)
+                {
+                    lvgl_app_camera_recover_frame(result);
+                    return;
+                }
+            }
+
             s_camera_phase_tick = HAL_GetTick();
             s_camera_phase = LVGL_APP_CAMERA_PHASE_DECODE_PENDING;
-            lvgl_app_camera_set_info("JPEG %lu B  Capture %lu ms\nDecoding...",
-                                     (unsigned long)jpeg_size,
-                                     (unsigned long)s_camera_capture_elapsed_ms);
-            lvgl_app_set_status(lvgl_app_tr(
-                "JPEG captured - decoding...", "JPEG采集完成 | 正在解码"));
+            /* Preserve the last completed statistics and normal key hint.
+               A per-frame decoding message visibly flickers at preview rate. */
         }
         else if (camera_state == CAMERA_STATE_ERROR)
         {
-            lvgl_app_camera_show_error(Camera_Service_GetLastResult());
+            lvgl_app_camera_recover_frame(Camera_Service_GetLastResult());
         }
         return;
     }
 
     if ((s_camera_phase != LVGL_APP_CAMERA_PHASE_DECODE_PENDING) ||
-        ((HAL_GetTick() - s_camera_phase_tick) < 30U))
+        ((HAL_GetTick() - s_camera_phase_tick) <
+         LVGL_APP_CAMERA_DECODE_DEFER_MS))
     {
         return;
     }
 
-    result = Camera_Service_GetSnapshot(&jpeg_data, &jpeg_size);
-    if (result != CAMERA_RESULT_OK)
+    if ((s_camera_pending_jpeg == NULL) ||
+        (s_camera_pending_jpeg_size == 0U))
     {
-        lvgl_app_camera_show_error(result);
+        lvgl_app_camera_recover_frame(CAMERA_RESULT_NOT_READY);
         return;
     }
+    jpeg_data = s_camera_pending_jpeg;
+    jpeg_size = s_camera_pending_jpeg_size;
 
-    s_camera_rgb_buffer = (uint16_t *)MediaMemory_Acquire(
-        MEDIA_MEMORY_OWNER_CAMERA,
-        LVGL_APP_CAMERA_RGB_BYTES,
-        &s_camera_rgb_capacity);
+    if (s_camera_pending_save != 0U)
+    {
+        photo_save_attempted = 1U;
+        decode_result = MJPEG_Player_NormalizeJpeg(
+            (uint8_t *)jpeg_data, &jpeg_size, CAMERA_JPEG_BUFFER_CAPACITY);
+        if (decode_result != MJPEG_PLAYER_OK)
+        {
+            s_camera_pending_save = 0U;
+            lvgl_app_camera_recover_frame(CAMERA_RESULT_INVALID_JPEG);
+            return;
+        }
+        s_camera_pending_jpeg_size = jpeg_size;
+        photo_save_result = CameraAlbum_SaveJpeg(
+            jpeg_data, jpeg_size, saved_photo_path, sizeof(saved_photo_path));
+        s_camera_pending_save = 0U;
+    }
+
     if (s_camera_rgb_buffer == NULL)
     {
-        lvgl_app_camera_show_error(CAMERA_RESULT_BUSY);
+        s_camera_rgb_buffer = (uint16_t *)MediaMemory_Acquire(
+            MEDIA_MEMORY_OWNER_CAMERA,
+            LVGL_APP_CAMERA_RGB_BYTES,
+            &s_camera_rgb_capacity);
+    }
+    if (s_camera_rgb_buffer == NULL)
+    {
+        lvgl_app_camera_recover_frame(CAMERA_RESULT_BUSY);
         return;
+    }
+
+    /* The same shared buffer backs the LVGL image and the next JPEG decode.
+       Wait until the asynchronous LCD transfer has stopped reading it before
+       overwriting the pixels, otherwise an occasional torn/striped frame is
+       possible. */
+    if (s_camera_has_frame != 0U)
+    {
+        (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
+        lv_img_cache_invalidate_src(&s_camera_image_dsc);
     }
 
     decode_started = HAL_GetTick();
@@ -4624,32 +5059,39 @@ static void lvgl_app_camera_process(void)
         s_camera_rgb_capacity,
         &image_width,
         &image_height);
+    lvgl_app_camera_release_pending_jpeg();
     if (decode_result != MJPEG_PLAYER_OK)
     {
-        lvgl_app_camera_release_preview();
-        lvgl_app_camera_set_info("JPEG %lu B\nDecode failed (%d)",
-                                 (unsigned long)jpeg_size,
-                                 (int)decode_result);
-        if (lvgl_app_chinese_enabled() != 0U)
+        /* A failed decoder may already have overwritten part of the shared
+           RGB buffer. Hide it until a complete recovery frame is available
+           instead of presenting a torn image as the last good preview. */
+        if ((s_camera_preview_image != NULL) &&
+            (lv_obj_is_valid(s_camera_preview_image) != false))
         {
-            lvgl_app_set_status("JPEG解码失败 (%d) | OK重试",
-                                (int)decode_result);
+            lv_obj_add_flag(s_camera_preview_image, LV_OBJ_FLAG_HIDDEN);
         }
-        else
+        if ((s_camera_placeholder_label != NULL) &&
+            (lv_obj_is_valid(s_camera_placeholder_label) != false))
         {
-            lvgl_app_set_status("JPEG decode failed (%d) - OK retries",
-                                (int)decode_result);
+            lv_label_set_text(s_camera_placeholder_label,
+                              lvgl_app_tr(LV_SYMBOL_REFRESH "\nRecovering...",
+                                          LV_SYMBOL_REFRESH "\n正在恢复..."));
+            lv_obj_clear_flag(s_camera_placeholder_label, LV_OBJ_FLAG_HIDDEN);
         }
-        lvgl_app_show_toast(UI_NOTICE_ERROR, "JPEG decode failed");
-        s_camera_phase = LVGL_APP_CAMERA_PHASE_ERROR;
+        s_camera_has_frame = 0U;
+        s_camera_last_frame_tick = 0U;
+        s_camera_fps_x10 = 0U;
+        lvgl_app_camera_recover_frame(CAMERA_RESULT_INVALID_JPEG);
         return;
     }
+    decode_elapsed = HAL_GetTick() - decode_started;
 
     lvgl_app_camera_scale_rgb565_in_place(s_camera_rgb_buffer,
                                            image_width,
                                            image_height,
                                            LVGL_APP_CAMERA_PREVIEW_WIDTH,
                                            LVGL_APP_CAMERA_PREVIEW_HEIGHT);
+    first_frame = (s_camera_has_frame == 0U) ? 1U : 0U;
     (void)memset(&s_camera_image_dsc, 0, sizeof(s_camera_image_dsc));
     s_camera_image_dsc.header.always_zero = 0U;
     s_camera_image_dsc.header.w = LVGL_APP_CAMERA_PREVIEW_WIDTH;
@@ -4664,17 +5106,142 @@ static void lvgl_app_camera_process(void)
     lv_obj_center(s_camera_preview_image);
     lv_obj_clear_flag(s_camera_preview_image, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_camera_placeholder_label, LV_OBJ_FLAG_HIDDEN);
-    UI_Anim_StateBounce(s_camera_preview_card);
 
-    s_camera_phase = LVGL_APP_CAMERA_PHASE_SHOWING;
-    lvgl_app_camera_set_info("JPEG %lu B  Cap %lu ms  Dec %lu ms",
-                             (unsigned long)jpeg_size,
-                             (unsigned long)s_camera_capture_elapsed_ms,
-                             (unsigned long)(HAL_GetTick() - decode_started));
-    lvgl_app_set_status(lvgl_app_tr(
-        "OK captures again - Left/KEY3 returns",
-        "OK再次拍照 | Left/KEY3返回"));
-    lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Camera frame ready");
+    now = HAL_GetTick();
+    if (s_camera_last_frame_tick != 0U)
+    {
+        frame_delta = now - s_camera_last_frame_tick;
+        if (frame_delta != 0U)
+        {
+            instant_fps_x10 = (10000U + (frame_delta / 2U)) / frame_delta;
+            if (instant_fps_x10 > 999U)
+            {
+                instant_fps_x10 = 999U;
+            }
+            s_camera_fps_x10 = (s_camera_fps_x10 == 0U)
+                                 ? (uint16_t)instant_fps_x10
+                                 : (uint16_t)(((uint32_t)s_camera_fps_x10 * 3U +
+                                               instant_fps_x10 + 2U) / 4U);
+        }
+    }
+    s_camera_last_frame_tick = now;
+    ++s_camera_frame_count;
+    s_camera_has_frame = 1U;
+    s_camera_consecutive_errors = 0U;
+
+    if (first_frame != 0U)
+    {
+        UI_Anim_StateBounce(s_camera_preview_card);
+        lvgl_app_show_toast(UI_NOTICE_SUCCESS, "Camera frame ready");
+    }
+
+    camera_state = Camera_Service_GetState();
+    if (camera_state == CAMERA_STATE_ERROR)
+    {
+        lvgl_app_camera_recover_frame(Camera_Service_GetLastResult());
+        return;
+    }
+    if ((camera_state == CAMERA_STATE_CAPTURING) ||
+        (camera_state == CAMERA_STATE_FRAME_READY))
+    {
+        s_camera_phase = LVGL_APP_CAMERA_PHASE_CAPTURING;
+    }
+    else
+    {
+        s_camera_phase = LVGL_APP_CAMERA_PHASE_SHOWING;
+        s_camera_next_capture_tick = now + LVGL_APP_CAMERA_FRAME_PERIOD_MS;
+    }
+    Camera_Service_GetDiagnostics(&diagnostics);
+    if (diagnostics.autofocus_enabled != 0U)
+    {
+        lvgl_app_camera_set_info("%u.%u FPS DB15 AF:%s/%02X Drop:%lu\n%luB C%lums D%lums #%lu",
+                                 (unsigned int)(s_camera_fps_x10 / 10U),
+                                 (unsigned int)(s_camera_fps_x10 % 10U),
+                                 (diagnostics.autofocus_ready != 0U) ? "ON" : "--",
+                                 diagnostics.autofocus_status,
+                                 (unsigned long)s_camera_dropped_frames,
+                                 (unsigned long)jpeg_size,
+                                 (unsigned long)s_camera_capture_elapsed_ms,
+                                 (unsigned long)decode_elapsed,
+                                 (unsigned long)s_camera_frame_count);
+    }
+    else
+    {
+        lvgl_app_camera_set_info("%u.%u FPS DB15 AF:FIX Drop:%lu\n%luB C%lums D%lums #%lu",
+                                 (unsigned int)(s_camera_fps_x10 / 10U),
+                                 (unsigned int)(s_camera_fps_x10 % 10U),
+                                 (unsigned long)s_camera_dropped_frames,
+                                 (unsigned long)jpeg_size,
+                                 (unsigned long)s_camera_capture_elapsed_ms,
+                                 (unsigned long)decode_elapsed,
+                                 (unsigned long)s_camera_frame_count);
+    }
+    if (photo_save_attempted != 0U)
+    {
+        if (photo_save_result == CAMERA_ALBUM_OK)
+        {
+            const char *saved_name = strrchr(saved_photo_path, '/');
+            saved_name = (saved_name != NULL) ? (saved_name + 1) :
+                                                saved_photo_path;
+            lvgl_app_set_status("Saved %s | Up photo | Right album", saved_name);
+            lvgl_app_camera_show_save_popup(saved_name);
+        }
+        else
+        {
+            lvgl_app_set_status("Photo save failed (%d, fs=%u)",
+                                (int)photo_save_result,
+                                (unsigned int)CameraAlbum_GetLastFsError());
+            lvgl_app_show_toast(
+                UI_NOTICE_ERROR, "Save %d FS%u @%lu %lu/%lu",
+                (int)photo_save_result,
+                (unsigned int)CameraAlbum_GetLastFsError(),
+                (unsigned long)CameraAlbum_GetLastWriteOffset(),
+                (unsigned long)CameraAlbum_GetLastWriteActual(),
+                (unsigned long)CameraAlbum_GetLastWriteRequest());
+        }
+    }
+    else if (s_camera_preview_paused != 0U)
+    {
+        lvgl_app_set_status(lvgl_app_tr(
+            "Paused | Up photo | Right album | OK resume",
+            "已暂停 | 上键拍照 | 右键相册 | OK继续"));
+    }
+    else
+    {
+        lvgl_app_set_status(lvgl_app_tr(
+            "Up photo | Right album | OK pause",
+            "上键拍照 | 右键相册 | OK暂停"));
+    }
+}
+
+static void lvgl_app_camera_stop_session(void)
+{
+    if ((s_camera_save_popup != NULL) &&
+        (lv_obj_is_valid(s_camera_save_popup) != false))
+    {
+        lv_obj_del(s_camera_save_popup);
+    }
+    s_camera_save_popup = NULL;
+    lvgl_app_camera_release_pending_jpeg();
+    lvgl_app_camera_release_preview();
+    Camera_Service_Sleep();
+    s_camera_phase = LVGL_APP_CAMERA_PHASE_OFF;
+    s_camera_capture_after_init = 0U;
+    s_camera_preview_paused = 0U;
+    s_camera_has_frame = 0U;
+    s_camera_consecutive_errors = 0U;
+    s_camera_next_capture_tick = 0U;
+    s_camera_last_frame_tick = 0U;
+    s_camera_frame_count = 0U;
+    s_camera_dropped_frames = 0U;
+    s_camera_fps_x10 = 0U;
+    s_camera_save_requested = 0U;
+    s_camera_pending_save = 0U;
+    s_camera_photo_key_latched = 0U;
+    s_camera_preview_card = NULL;
+    s_camera_preview_image = NULL;
+    s_camera_placeholder_label = NULL;
+    s_camera_info_label = NULL;
 }
 
 static void lvgl_app_camera_exit(const char *reason)
@@ -4684,18 +5251,285 @@ static void lvgl_app_camera_exit(const char *reason)
         return;
     }
 
-    lvgl_app_camera_release_preview();
-    Camera_Service_Sleep();
-    s_camera_phase = LVGL_APP_CAMERA_PHASE_OFF;
-    s_camera_capture_after_init = 0U;
-    s_camera_preview_card = NULL;
-    s_camera_preview_image = NULL;
-    s_camera_placeholder_label = NULL;
-    s_camera_info_label = NULL;
+    lvgl_app_camera_stop_session();
     lvgl_app_set_status("%s", (reason != NULL) ? reason : "Camera closed");
     lvgl_app_show_toast(UI_NOTICE_INFO,
                         (reason != NULL) ? reason : "Camera closed");
     lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+}
+
+static void lvgl_app_camera_open_album(void)
+{
+    int8_t result;
+
+    if (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_CAMERA)
+    {
+        return;
+    }
+
+    lvgl_app_camera_stop_session();
+    result = CameraAlbum_EnsureDirectory();
+    lvgl_app_browser_remember_name(NULL);
+    if (result == CAMERA_ALBUM_OK)
+    {
+        (void)snprintf(s_browser_path, sizeof(s_browser_path), "%s",
+                       CAMERA_ALBUM_DIRECTORY);
+        lvgl_app_set_status("Album: %s", CAMERA_ALBUM_DIRECTORY);
+    }
+    else
+    {
+        lvgl_app_browser_reset_path();
+        lvgl_app_set_status("Album unavailable (%d, fs=%u)", (int)result,
+                            (unsigned int)CameraAlbum_GetLastFsError());
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "Cannot open camera album");
+    }
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+}
+
+static void lvgl_app_photo_release(void)
+{
+    if ((s_photo_image != NULL) &&
+        (lv_obj_is_valid(s_photo_image) != false))
+    {
+        lv_obj_add_flag(s_photo_image, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_photo_image_dsc.data != NULL)
+    {
+        (void)lv_port_disp_wait_idle(LVGL_APP_MEDIA_FLUSH_WAIT_MS);
+        lv_img_cache_invalidate_src(&s_photo_image_dsc);
+    }
+
+    MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+    s_photo_rgb_buffer = NULL;
+    s_photo_rgb_capacity = 0U;
+    (void)memset(&s_photo_image_dsc, 0, sizeof(s_photo_image_dsc));
+    s_photo_image = NULL;
+    s_photo_info_label = NULL;
+}
+
+static void lvgl_app_photo_exit(const char *reason)
+{
+    if (lvgl_app_current_screen() != LVGL_APP_SCREEN_REQ_PHOTO)
+    {
+        return;
+    }
+
+    lvgl_app_set_status("%s", (reason != NULL) ? reason : "Returned to album");
+    lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+}
+
+static void lvgl_app_photo_event_cb(lv_event_t *e)
+{
+    uint32_t key;
+
+    if (lv_event_get_code(e) != LV_EVENT_KEY)
+    {
+        return;
+    }
+
+    key = lvgl_app_event_get_key(e);
+    if (key == LV_KEY_LEFT)
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        lvgl_app_photo_exit("Returned to album");
+    }
+    else if (key == LV_KEY_ESC)
+    {
+        lv_port_indev_suppress_all_keys_until_release();
+        if (HAL_GPIO_ReadPin(Key2_GPIO_Port, Key2_Pin) == GPIO_PIN_RESET)
+        {
+            s_main_menu_selected_id = LVGL_APP_MENU_ID_MANUAL;
+            lvgl_app_set_status("Global exit");
+            lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_MAIN);
+        }
+        else
+        {
+            lvgl_app_photo_exit("Returned to album");
+        }
+    }
+}
+
+static void lvgl_app_show_photo_viewer(void)
+{
+    uint8_t *jpeg_buffer;
+    uint32_t jpeg_capacity;
+    uint32_t jpeg_size;
+    uint16_t image_width;
+    uint16_t image_height;
+    uint16_t display_width;
+    uint16_t display_height;
+    int8_t result;
+    lv_obj_t *preview_card;
+    lv_obj_t *key_receiver;
+
+    Camera_Service_Sleep();
+    result = (int8_t)Camera_Service_GetIdleJpegWorkspace(
+        &jpeg_buffer, &jpeg_capacity);
+    if (result != CAMERA_RESULT_OK)
+    {
+        lvgl_app_set_status("Photo workspace busy (%d)", (int)result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "Photo viewer unavailable");
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    result = CameraAlbum_LoadJpeg(s_photo_path, jpeg_buffer, jpeg_capacity,
+                                  &jpeg_size);
+    if (result != CAMERA_ALBUM_OK)
+    {
+        lvgl_app_set_status("JPEG load failed (%d, fs=%u)", (int)result,
+                            (unsigned int)CameraAlbum_GetLastFsError());
+        lvgl_app_show_toast(
+            UI_NOTICE_ERROR, "Load %d FS%u @%lu %lu/%lu",
+            (int)result,
+            (unsigned int)CameraAlbum_GetLastFsError(),
+            (unsigned long)CameraAlbum_GetLastReadOffset(),
+            (unsigned long)CameraAlbum_GetLastReadActual(),
+            (unsigned long)CameraAlbum_GetLastReadRequest());
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    result = MJPEG_Player_NormalizeJpeg(jpeg_buffer, &jpeg_size,
+                                        jpeg_capacity);
+    if (result != MJPEG_PLAYER_OK)
+    {
+        lvgl_app_set_status("JPEG format failed (%d)", (int)result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "Unsupported JPEG");
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    s_photo_rgb_buffer = (uint16_t *)MediaMemory_Acquire(
+        MEDIA_MEMORY_OWNER_CAMERA, LVGL_APP_CAMERA_RGB_BYTES,
+        &s_photo_rgb_capacity);
+    if (s_photo_rgb_buffer == NULL)
+    {
+        lvgl_app_set_status("Photo RGB memory busy");
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "Media memory is busy");
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    result = MJPEG_Player_DecodeMemoryToRgb565(
+        jpeg_buffer, jpeg_size, jpeg_capacity,
+        s_photo_rgb_buffer, s_photo_rgb_capacity,
+        &image_width, &image_height);
+    if (result != MJPEG_PLAYER_OK)
+    {
+        MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+        s_photo_rgb_buffer = NULL;
+        s_photo_rgb_capacity = 0U;
+        lvgl_app_set_status("JPEG decode failed (%d)", (int)result);
+        lvgl_app_show_toast(UI_NOTICE_ERROR, "JPEG decode failed (%d)",
+                            (int)result);
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    if ((image_width == 0U) || (image_height == 0U))
+    {
+        MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+        s_photo_rgb_buffer = NULL;
+        s_photo_rgb_capacity = 0U;
+        lvgl_app_set_status("JPEG dimensions invalid");
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    display_width = (image_width < LVGL_APP_CAMERA_PREVIEW_WIDTH) ?
+                      image_width : LVGL_APP_CAMERA_PREVIEW_WIDTH;
+    display_height = (uint16_t)(((uint32_t)image_height * display_width) /
+                                image_width);
+    if (display_height > LVGL_APP_CAMERA_PREVIEW_HEIGHT)
+    {
+        display_height = LVGL_APP_CAMERA_PREVIEW_HEIGHT;
+        display_width = (uint16_t)(((uint32_t)image_width * display_height) /
+                                   image_height);
+    }
+    if ((display_width == 0U) || (display_height == 0U) ||
+        (display_width > image_width) || (display_height > image_height))
+    {
+        MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+        s_photo_rgb_buffer = NULL;
+        s_photo_rgb_capacity = 0U;
+        lvgl_app_set_status("JPEG dimensions unsupported: %ux%u",
+                            (unsigned int)image_width,
+                            (unsigned int)image_height);
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    lvgl_app_camera_scale_rgb565_in_place(s_photo_rgb_buffer,
+                                           image_width, image_height,
+                                           display_width, display_height);
+
+    s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
+    s_ctrl_editing = 0U;
+    lvgl_app_control_clear_row_refs();
+    lvgl_app_group_reset();
+    s_status_label = NULL;
+    lvgl_app_page_begin(LVGL_APP_SCREEN_REQ_PHOTO,
+                        lvgl_app_tr("Photo Viewer", "鐓х墖娴忚"));
+    if (s_page_content == NULL)
+    {
+        MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
+        s_photo_rgb_buffer = NULL;
+        s_photo_rgb_capacity = 0U;
+        lvgl_app_request_screen(LVGL_APP_SCREEN_REQ_SD_BROWSER);
+        return;
+    }
+
+    preview_card = lv_obj_create(s_page_content);
+    lv_obj_set_size(preview_card, 232, 172);
+    lv_obj_align(preview_card, LV_ALIGN_TOP_MID, 0, 2);
+    UI_Theme_ApplyPanel(preview_card);
+    lv_obj_set_style_pad_all(preview_card, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(preview_card, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_photo_image = lv_img_create(preview_card);
+    (void)memset(&s_photo_image_dsc, 0, sizeof(s_photo_image_dsc));
+    s_photo_image_dsc.header.always_zero = 0U;
+    s_photo_image_dsc.header.w = display_width;
+    s_photo_image_dsc.header.h = display_height;
+    s_photo_image_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+    s_photo_image_dsc.data_size =
+        (uint32_t)display_width * (uint32_t)display_height * 2U;
+    s_photo_image_dsc.data = (const uint8_t *)s_photo_rgb_buffer;
+    lv_img_cache_invalidate_src(&s_photo_image_dsc);
+    lv_img_set_src(s_photo_image, &s_photo_image_dsc);
+    lv_obj_center(s_photo_image);
+
+    s_photo_info_label = lv_label_create(s_page_content);
+    lv_obj_set_size(s_photo_info_label, 224, 30);
+    lv_label_set_long_mode(s_photo_info_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(s_photo_info_label, UI_FONT_CJK, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_photo_info_label,
+                                LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_photo_info_label,
+                                lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_label_set_text_fmt(s_photo_info_label, "%s  %ux%u  %luB",
+                          s_photo_name,
+                          (unsigned int)image_width,
+                          (unsigned int)image_height,
+                          (unsigned long)jpeg_size);
+    lv_obj_align(s_photo_info_label, LV_ALIGN_BOTTOM_MID, 0, -1);
+
+    key_receiver = lv_obj_create(s_page_content);
+    lv_obj_set_size(key_receiver, 1, 1);
+    lv_obj_set_style_opa(key_receiver, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(key_receiver, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(key_receiver,
+                      LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(key_receiver, lvgl_app_photo_event_cb,
+                        LV_EVENT_KEY, NULL);
+    lv_group_add_obj(s_group, key_receiver);
+    lv_group_focus_obj(key_receiver);
+
+    lvgl_app_set_status("Photo: Left/KEY3 returns to album");
+    UI_Anim_StaggerIn(preview_card, 0U);
+    UI_Anim_StaggerIn(s_photo_info_label, 1U);
+    lvgl_app_page_finish();
 }
 
 static void lvgl_app_show_camera_test(void)
@@ -4716,7 +5550,7 @@ static void lvgl_app_show_camera_test(void)
                         lvgl_app_tr("Camera Test", "摄像头测试"));
 
     s_camera_preview_card = lv_obj_create(s_page_content);
-    lv_obj_set_size(s_camera_preview_card, 208, 154);
+    lv_obj_set_size(s_camera_preview_card, 232, 172);
     lv_obj_align(s_camera_preview_card, LV_ALIGN_TOP_MID, 0, 2);
     UI_Theme_ApplyPanel(s_camera_preview_card);
     lv_obj_set_style_pad_all(s_camera_preview_card, 0, LV_PART_MAIN);
@@ -4741,7 +5575,7 @@ static void lvgl_app_show_camera_test(void)
     lv_obj_center(s_camera_placeholder_label);
 
     s_camera_info_label = lv_label_create(s_page_content);
-    lv_obj_set_width(s_camera_info_label, 224);
+    lv_obj_set_size(s_camera_info_label, 224, 30);
     lv_obj_set_style_text_font(s_camera_info_label,
                                &lv_font_montserrat_12, LV_PART_MAIN);
     lv_obj_set_style_text_align(s_camera_info_label,
@@ -4760,10 +5594,23 @@ static void lvgl_app_show_camera_test(void)
     lv_group_add_obj(s_group, key_receiver);
     lv_group_focus_obj(key_receiver);
 
-    /* Entering the test page should produce a result without an extra key
-       press. Subsequent OK presses re-initialize and capture another frame. */
+    /* Entering starts the 24 MHz, one-frame-ahead double-buffer pipeline.
+       OK pauses/resumes; only page exit powers the camera down. */
     s_camera_capture_after_init = 1U;
     s_camera_capture_elapsed_ms = 0U;
+    s_camera_pending_jpeg = NULL;
+    s_camera_pending_jpeg_size = 0U;
+    s_camera_preview_paused = 0U;
+    s_camera_has_frame = 0U;
+    s_camera_consecutive_errors = 0U;
+    s_camera_next_capture_tick = 0U;
+    s_camera_last_frame_tick = 0U;
+    s_camera_frame_count = 0U;
+    s_camera_dropped_frames = 0U;
+    s_camera_fps_x10 = 0U;
+    s_camera_save_requested = 0U;
+    s_camera_pending_save = 0U;
+    s_camera_photo_key_latched = 0U;
     s_camera_phase_tick = HAL_GetTick();
     s_camera_phase = LVGL_APP_CAMERA_PHASE_INIT_PENDING;
     lvgl_app_set_status(lvgl_app_tr("Initializing OV5640...",
@@ -5458,6 +6305,7 @@ static void lvgl_app_show_sd_browser(void)
     char *display_path;
     size_t path_prefix_len;
     uint16_t i;
+    uint8_t restore_matched = 0U;
 
     s_ctrl_page = LVGL_APP_CTRL_PAGE_NONE;
     s_ctrl_editing = 0U;
@@ -5566,6 +6414,10 @@ static void lvgl_app_show_sd_browser(void)
             {
                 btn = lvgl_app_list_add_btn(list, LV_SYMBOL_VIDEO, display_name);
             }
+            else if (s_browser_entries[i].type == LVGL_APP_ENTRY_JPEG)
+            {
+                btn = lvgl_app_list_add_btn(list, LV_SYMBOL_IMAGE, display_name);
+            }
             else if (s_browser_entries[i].type == LVGL_APP_ENTRY_NES)
             {
                 btn = lvgl_app_list_add_btn(list, LV_SYMBOL_FILE, display_name);
@@ -5580,14 +6432,28 @@ static void lvgl_app_show_sd_browser(void)
             lv_obj_add_event_cb(btn, lvgl_app_sd_file_event_cb, LV_EVENT_KEY, (void *)(uintptr_t)(i + LVGL_APP_SD_ID_BASE));
             lvgl_app_group_add_obj(btn);
             UI_Anim_StaggerIn(btn, (uint8_t)(i + 2U));
-            if (i == 0U)
+            if ((s_browser_restore_pending != 0U) &&
+                (strcmp(s_browser_entries[i].name,
+                        s_browser_restore_name) == 0))
+            {
+                focus_obj = btn;
+                restore_matched = 1U;
+            }
+            else if ((i == 0U) && (restore_matched == 0U))
             {
                 focus_obj = btn;
             }
         }
 
         lv_group_focus_obj(focus_obj);
+        lv_obj_update_layout(list);
+        lv_obj_scroll_to_view(focus_obj, LV_ANIM_OFF);
     }
+
+    /* A restore anchor belongs to exactly one browser rebuild.  Consuming it
+     * prevents an old filename from affecting a later, unrelated directory. */
+    s_browser_restore_name[0] = '\0';
+    s_browser_restore_pending = 0U;
 
     lvgl_app_page_finish();
 }
@@ -5674,6 +6540,11 @@ static void lvgl_app_process_media_return_key(void)
     {
         lv_port_indev_suppress_exit_keys_until_release();
         lvgl_app_camera_exit("Returned by KEY3");
+    }
+    else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_PHOTO)
+    {
+        lv_port_indev_suppress_exit_keys_until_release();
+        lvgl_app_photo_exit("Returned to album by KEY3");
     }
     else if (lvgl_app_current_screen() == LVGL_APP_SCREEN_REQ_NES_CACHE)
     {

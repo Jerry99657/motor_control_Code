@@ -10,7 +10,8 @@ extern "C" {
 #define CAMERA_OV5640_SENSOR_ID          0x5640U
 #define CAMERA_JPEG_WIDTH                320U
 #define CAMERA_JPEG_HEIGHT               240U
-#define CAMERA_JPEG_BUFFER_CAPACITY      (128U * 1024U)
+#define CAMERA_JPEG_BUFFER_COUNT         2U
+#define CAMERA_JPEG_BUFFER_CAPACITY      (64U * 1024U)
 #define CAMERA_CAPTURE_TIMEOUT_DEFAULT   1000U
 
 typedef enum
@@ -62,8 +63,10 @@ typedef struct
   uint8_t scl_level;
   uint8_t sda_level;
   uint8_t pwdn_level;
-  uint8_t reset_level;
   uint8_t sccb_nack_phase;
+  uint8_t autofocus_enabled;
+  uint8_t autofocus_ready;
+  uint8_t autofocus_status;
 } Camera_Diagnostics;
 
 /* Keep OV_PWDN enabled. OV_RESET is owned by the camera carrier because PC4
@@ -77,16 +80,27 @@ Camera_Result Camera_Service_Init(void);
 Camera_Result Camera_Service_StartSnapshot(uint32_t timeout_ms);
 void Camera_Service_Process(void);
 
-/* Convenience bring-up API: initialize, capture one JPEG, then return to reset. */
+/* Convenience bring-up API: initialize and capture one JPEG. The returned
+ * slot must be released with Camera_Service_ReleaseSnapshot(). */
 Camera_Result Camera_Service_CaptureJpeg(const uint8_t **jpeg_data,
                                         uint32_t *jpeg_size,
                                         uint32_t timeout_ms);
 
-/* The returned pointer stays valid until the next capture starts. */
+/* The returned pointer remains valid until Camera_Service_ReleaseSnapshot()
+ * or Camera_Service_Sleep(); capture may continue into the other slot. */
 Camera_Result Camera_Service_GetSnapshot(const uint8_t **jpeg_data,
                                          uint32_t *jpeg_size);
 
-/* Stop DCMI and leave PC4 low / PF13 high. */
+/* Release a snapshot previously returned by Camera_Service_GetSnapshot().
+ * DCMI will not overwrite that JPEG slot until it is released. */
+void Camera_Service_ReleaseSnapshot(const uint8_t *jpeg_data);
+
+/* Borrow one compressed-frame slot while the camera is OFF. This avoids a
+ * second 64 KiB allocation for loading album JPEG files. */
+Camera_Result Camera_Service_GetIdleJpegWorkspace(uint8_t **buffer,
+                                                  uint32_t *capacity);
+
+/* Stop DCMI and put OV5640 in PWDN through PF13. PC4 is buzzer-only. */
 void Camera_Service_Sleep(void);
 
 Camera_State Camera_Service_GetState(void);

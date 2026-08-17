@@ -1,9 +1,9 @@
 # STM32H743 + OV5640 驱动开发与故障排查记录
 
-> 文档日期：2026-08-09  
+> 文档日期：2026-08-17
 > 适用工程：`STM32H743ZIT6_KIT`  
-> 当前目标：通过 Camera Test 页面完成 OV5640 单帧 `320 x 240 JPEG` 采集、硬件 JPEG 解码和 LCD 显示  
-> 当前阻塞点：OV5640 的硬件复位线释放后仍被读为低电平，初始化在 SCCB 通信前停止
+> 当前状态：`320 x 240 JPEG` 双缓冲连续预览约 10.7 FPS，拍照保存与相册浏览代码已经完成
+> 已解决根因：主板 OV_RESET 与摄像头载板 RC 复位网络发生电气冲突；断开两者后恢复正常
 
 ## 1. 文档目的
 
@@ -17,7 +17,7 @@
 
 ## 2. 当前结论摘要
 
-最近一次实际显示为：
+此前长期停留的故障显示为：
 
 ```text
 SCCB E04 L11 N0 P0R0
@@ -33,7 +33,25 @@ Step 2 ID 0x0000
 - `ID 0x0000`：尚未读取 `0x300A/0x300B`，不能据此判断传感器型号。
 - `E04`：这里用于表示当前初始化失败；由于 `N0`，它不是一次真实的地址 NACK。
 
-因此，当前问题不在 DCMI、DMA、JPEG 解码、LVGL 或 OV5640 初始化寄存器表。程序甚至还没有开始读取传感器 ID。当前必须先解决 `OV_RESET` 无法变高的问题。
+最终确认这不是软件 SCCB、DCMI 或 JPEG 问题，而是主板 `OV_RESET` 与摄像头载板自身的 2.8 V RC 复位网络互相冲突。硬件已将两者断开，摄像头复位完全交给载板管理；原 PC4 改为专用 `BUZZER` 输出，摄像头代码不得再读写 PC4。
+
+修复后的阶段 1 验证结果：
+
+- 进入 Camera Test 后能够显示 `Camera frame ready`。
+- 按 OK 可以重复拍照并正常显示。
+- 已连续拍照 100 次，无采集、解码或死机错误。
+- 已反复进入/退出 Camera Test 20 次，无资源泄漏或异常。
+- 已验证摄像头工作不影响 PC4 蜂鸣器。
+
+阶段 2 在此基础上先完成了稳定的 5 FPS 连续预览。10 FPS 串行软件节拍测试实测约 5.5 FPS，采集约 103 ms、解码约 27 ms，并暴露横条花屏；随后将 OV5640 PCLK 提高到 48 MHz，采集仅降至约 81 ms，却出现 `Drop` 增加、频繁恢复和更严重花屏。首版双 JPEG 槽板测仍只有约 5.7 FPS，稳定采集耗时约 180 ms，说明此时解码已经不再是主瓶颈，OV5640 的实际 VSYNC 周期本身只有约 180 ms。当前版本改为工程内 H7参考例程使用的 15 FPS传感器时序：`0x3035=0x11`、`0x3824=0x1F`，并关闭自动夜间降帧；其目的在于提高内部帧生成率，同时通过 DVP分频避免重现48 MHz花屏。保留双 JPEG槽流水线后，实机达到约 10.7 FPS，采集耗时降至约 90 ms。
+
+首次板测连续预览约为 3.7 FPS，同时发现上下颠倒、画面偏模糊且红蓝物体显示为黑白。后续板测结论和修复如下：
+
+- 当前镜头模组是定焦版本，不带 VCM自动对焦机构；`CAMERA_ENABLE_AUTOFOCUS`保持为 0，不上传或启动 AF固件，界面显示 `AF:FIXED`。驱动中保留 AF实现，未来更换 AF模组后再单独启用验证。
+- 方向从 `OV5640_MIRROR_FLIP`改为 `OV5640_MIRROR`，仅保留该载板需要的水平镜像，消除垂直颠倒且不增加逐帧 CPU开销。
+- 明确写入 JPEG彩色输出、完整 ISP、自动白平衡、彩色矩阵和自动锐化参数。
+- 黑白显示的直接原因是 `.avi`入口会调用 `JPEG_InitColorTables()`，而开机直接进入 Camera Test所走的内存 JPEG入口此前没有调用。硬件 JPEG仍能输出亮度/色度数据，但未初始化的 YCbCr到 RGB565查找表使色度转换结果近似黑白。现在两个入口都会在首次解码前完成一次性初始化。
+- 预览区域保持为 `224 x 168`。
 
 ## 3. 硬件版本与原理图基准
 
@@ -52,14 +70,15 @@ Step 2 ID 0x0000
 
 | 信号 | STM32 配置 | 高电平来源 | 原因 |
 |---|---|---|---|
-| `OV_RESET` / PC4 | 开漏输出、无内部上拉 | 摄像头板 R3 上拉到 2.8 V | 避免向 2.8 V 传感器引脚推挽输出 3.3 V |
+| `OV_RESET` | **不连接 STM32** | 摄像头板 R3 上拉到 2.8 V | 载板 RC 网络独立完成上电复位，避免与主板控制冲突 |
+| `BUZZER` / PC4 | 推挽输出、无内部上下拉 | STM32 3.3 V逻辑 | PC4 仅驱动蜂鸣器，与摄像头彻底解耦 |
 | `OV_SCL` / PF14 | 开漏、无内部上拉 | 摄像头板 R11 上拉到 2.8 V | SCCB 总线由板载 5.1 kOhm 上拉 |
 | `OV_SDA` / PF15 | 开漏、无内部上拉 | 摄像头板 R10 上拉到 2.8 V | ACK 和读取阶段必须允许传感器驱动 SDA |
 | `OV_PWDN` / PF13 | 推挽输出 | STM32 3.3 V逻辑 | 高电平掉电，低电平工作 |
 
 严禁再次采用以下配置：
 
-- PC4 推挽输出高电平。
+- 在摄像头代码中读写 PC4或重新连接主板与载板 `OV_RESET`。
 - PF14/PF15 推挽输出高电平。
 - PF14/PF15 启用 STM32 的 3.3 V内部上拉。
 - 将旧版带 Q2 的 `EX_RST` 原理图逻辑套用到当前摄像头板。
@@ -72,7 +91,8 @@ Step 2 ID 0x0000
 |---|---|---|---|
 | SCCB 时钟 | PF14 | 软件 SCCB SCL / I2C4_SCL | `OV_SCL` |
 | SCCB 数据 | PF15 | 软件 SCCB SDA / I2C4_SDA | `OV_SDA` |
-| 硬件复位 | PC4 | 开漏 GPIO | `OV_RESET` |
+| 硬件复位 | 不连接 | 由载板 R3/C13管理 | `OV_RESET` |
+| 蜂鸣器 | PC4 | 推挽 GPIO | 不连接摄像头 |
 | 掉电控制 | PF13 | 推挽 GPIO | `OV_PWDN` |
 | 行同步 | PA4 | DCMI_HSYNC | `OV_HREF`/HSYNC |
 | 场同步 | PG9 | DCMI_VSYNC | `OV_VSYNC` |
@@ -100,17 +120,17 @@ Step 2 ID 0x0000
 
 当前 `.ioc` 中：
 
-- PC4：`GPIO_Output`，`GPIO_MODE_OUTPUT_OD`，`GPIO_NOPULL`，标签 `OV_RESET`。
+- PC4：`GPIO_Output`，推挽输出、无上下拉，标签 `BUZZER`。
 - PF13：`GPIO_Output`，默认输出高电平，标签 `OV_PWDN`。
 
 上电默认状态是：
 
 ```text
 OV_PWDN = 1  摄像头掉电
-OV_RESET = 0 摄像头保持复位
+BUZZER = 0    蜂鸣器关闭
 ```
 
-`Camera_Service_BootHold()` 会在所有 CubeMX 外设初始化后再次设置这两个安全状态。
+`Camera_Service_BootHold()` 只保持 `OV_PWDN=1`，不会访问 PC4。蜂鸣器由独立设置/告警模块管理。
 
 ### 4.2 I2C4 与软件 SCCB
 
@@ -168,7 +188,7 @@ Camera Service 在启动摄像头时将 DMA FIFO阈值调整为 `DMA_FIFO_THRESH
 - STM32H743 硬件 JPEG 外设由 `MX_JPEG_Init()` 初始化。
 - JPEG 输入/输出 FIFO 使用 MDMA。
 - D-Cache 已启用，但 DMA使用的 D2 SRAM被 MPU配置为不可缓存区域。
-- 摄像头 JPEG 压缩缓冲位于 `.ram_d2`，容量 128 KiB，32 字节对齐。
+- 摄像头 JPEG 压缩缓冲位于 `.ram_d2`，总容量仍为 128 KiB，拆成两个 64 KiB、32 字节对齐的槽位。
 - RGB565 输出使用共享媒体内存池 `.media_pool`，位于 AXI SRAM。
 
 这种布局保证 DCMI DMA写入 JPEG、JPEG/MDMA读取压缩数据和生成 RGB565 时不会因为 D-Cache 一致性而破坏数据。
@@ -178,8 +198,11 @@ Camera Service 在启动摄像头时将 DMA FIFO阈值调整为 `DMA_FIFO_THRESH
 | 文件 | 主要职责 |
 |---|---|
 | `Drivers/User/Inc/camera_service.h` | 摄像头状态、错误码、诊断结构和公共 API |
-| `Drivers/User/Src/camera_service.c` | 电源/复位、SCCB、ID检测、OV5640配置、DCMI/DMA快照、JPEG帧边界查找 |
+| `Drivers/User/Src/camera_service.c` | PWDN、SCCB、ID检测、OV5640配置、DCMI/DMA快照、JPEG帧边界查找 |
+| `Drivers/User/Inc/camera_album.h` | 相册目录、保存/读取错误码和公共 API |
+| `Drivers/User/Src/camera_album.c` | SD挂载、目录创建、照片编号、临时文件原子写入和 JPEG读取 |
 | `Drivers/User/Inc/ov5640.h` | ST OV5640组件驱动接口、分辨率和像素格式定义 |
+| `Drivers/User/Inc/ov5640_af_firmware.h` | 参考模组使用的 OV5640内部 MCU自动对焦固件 |
 | `Drivers/User/Src/ov5640.c` | ST OV5640初始化表和传感器控制函数 |
 | `Drivers/User/Inc/ov5640_reg.h` | OV5640寄存器地址定义 |
 | `Drivers/User/Src/ov5640_reg.c` | ST组件驱动寄存器读写包装 |
@@ -191,7 +214,7 @@ Camera Service 在启动摄像头时将 DMA FIFO阈值调整为 `DMA_FIFO_THRESH
 | `STM32H743ZIT6_KIT.ioc` | 可重新生成的 CubeMX配置源 |
 | `STM32H743XX_FLASH.ld` | `.media_pool`、`.ram_d2`、`.ram_d3_bdma` 等内存段布局 |
 
-所有自定义摄像头业务代码位于 `Drivers/User`，不会被 CubeMX 直接覆盖。PC4、PF13、PF14、PF15、DCMI、DMA等生成代码由 `.ioc` 负责保持一致。
+所有自定义摄像头业务代码位于 `Drivers/User`，不会被 CubeMX 直接覆盖。PC4/BUZZER、PF13、PF14、PF15、DCMI、DMA等生成代码由 `.ioc` 负责保持一致。
 
 ## 6. Camera Service 状态机
 
@@ -199,7 +222,7 @@ Camera Service 在启动摄像头时将 DMA FIFO阈值调整为 `DMA_FIFO_THRESH
 
 | 状态 | 数值 | 含义 |
 |---|---:|---|
-| `CAMERA_STATE_OFF` | 0 | RESET有效、PWDN有效，摄像头关闭 |
+| `CAMERA_STATE_OFF` | 0 | PWDN有效，摄像头关闭；RESET由载板管理 |
 | `CAMERA_STATE_INITIALIZING` | 1 | 正在上电、读取 ID或写初始化寄存器 |
 | `CAMERA_STATE_READY` | 2 | OV5640配置完成，可以启动快照 |
 | `CAMERA_STATE_CAPTURING` | 3 | DCMI/DMA正在采集 |
@@ -212,7 +235,7 @@ Camera Service 在启动摄像头时将 DMA FIFO阈值调整为 `DMA_FIFO_THRESH
 |---:|---|---|
 | 0 | `CAMERA_INIT_STAGE_NONE` | 未初始化或已初始化完成 |
 | 1 | `CAMERA_INIT_STAGE_I2C_RECOVERY` | 正在复位 I2C并生成恢复时钟 |
-| 2 | `CAMERA_INIT_STAGE_I2C_PROBE` | 检查 RESET电平、注册 SCCB总线 |
+| 2 | `CAMERA_INIT_STAGE_I2C_PROBE` | 退出 PWDN并注册 SCCB总线 |
 | 3 | `CAMERA_INIT_STAGE_READ_ID` | 读取 `0x300A/0x300B` |
 | 4 | `CAMERA_INIT_STAGE_SENSOR_CONFIG` | 写入 ST OV5640初始化表 |
 | 5 | `CAMERA_INIT_STAGE_CAPTURE` | DCMI/DMA采集阶段 |
@@ -224,7 +247,7 @@ Camera Service 在启动摄像头时将 DMA FIFO阈值调整为 `DMA_FIFO_THRESH
     |
     v
 Camera_Service_Sleep / BootHold
-PWDN=1, RESET=0
+PWDN=1；载板独立管理 RESET
     |
     v
 检查 DCMI 和 DMA句柄
@@ -236,11 +259,10 @@ I2C4 DeInit -> PF14/PF15输出9个恢复时钟 -> STOP -> I2C4 Init
 PWDN=0，等待10 ms
     |
     v
-PC4开漏写高，释放 RESET，等待20 ms
+等待传感器和载板 RC复位稳定20 ms
+（不访问 PC4/BUZZER）
     |
-    +-- R0 --> Step 2立即失败，不发送 SCCB
-    |
-    v R1
+    v
 注册 OV5640 Bus IO，PF14/PF15切到开漏软件 SCCB
     |
     v
@@ -258,6 +280,8 @@ OV5640_SetPCLK(24M)
     v
 CAMERA_STATE_READY
 ```
+
+连续预览时，初始化表和 `OV5640_Start()`只执行一次，传感器保持输出，让 AE/AWB连续工作。每帧结束后只停止当前 DCMI传输，下一帧直接从 `FRAME_READY`启动新的 DCMI快照；只有退出页面或自动恢复时才停止传感器并执行完整 `Sleep()`。
 
 ## 7. SCCB 实现细节
 
@@ -357,16 +381,23 @@ DMA使用 word宽度，快照结束后通过 DMA NDTR反推实际接收字节数
 
 Camera Test页面取得 JPEG后：
 
-1. 从共享媒体内存池申请 `320 x 240 x 2` 字节 RGB565缓冲。
-2. 调用 `MJPEG_Player_DecodeMemoryToRgb565()` 复用硬件 JPEG/MDMA解码流水线。
-3. 将 320 x 240 RGB565原地缩小为 200 x 150。
-4. 构造 `lv_img_dsc_t`，在 LVGL预览卡片中显示。
-5. 显示 JPEG大小、采集耗时和解码耗时。
+1. DCMI 将完整 JPEG 写入当前 64 KiB 槽，帧尾校验通过后将该槽标记为 `READY`。
+2. UI 取得快照后，槽状态变为 `IN_USE`；Camera Service 随即在另一空闲槽启动下一帧 DCMI 快照。
+3. 在下一帧采集并行进行时，上一帧继续等待 30 ms 帧尾保护，然后调用 `MJPEG_Player_DecodeMemoryToRgb565()`；该入口在首次使用时独立执行 `JPEG_InitColorTables()`，并复用硬件 JPEG/MDMA 解码流水线。
+4. 解码完成或失败后都显式释放 JPEG 槽，之后 DCMI 才能重新使用该槽。
+5. 首帧从共享媒体内存池申请 `320 x 240 x 2` 字节 RGB565 缓冲，后续帧持续复用，并原地缩小为 `224 x 168`。
+6. 构造 `lv_img_dsc_t`，在 LVGL 预览卡片中显示，同时更新实际 FPS、JPEG 大小、采集/解码耗时、帧号和累计丢帧。
+
+双槽采用明确的 `FREE -> READY -> IN_USE -> FREE` 所有权流程。系统只允许一帧采集、一帧解码，不建立更深队列；这样既能重叠 DCMI 与 JPEG/MDMA/LCD 工作，也不会因 UI 暂时变慢而持续占用更多内存。两个 64 KiB 槽合计仍为原来的 128 KiB，因此本次优化没有新增整帧 SRAM 开销。
+
+首次双槽实测出现 `FPS DB AF:FIX` 约 5.7 FPS、`C` 约 180 ms。这里 `C` 包含等待 OV5640 下一次 VSYNC和接收完整 JPEG的时间；稳定在180 ms意味着传感器源帧率约为 `1000 / 180 = 5.6 FPS`。双缓冲只能隐藏约27 ms解码耗时，不能提高传感器没有产生的帧率。因此后续增加了15 FPS内部时序，统计标记也改为 `DB15`。若 `DB15` 下 `C`仍接近180 ms，应优先检查寄存器读回、AEC低照度行为和传感器时序，而不是继续增加软件目标 FPS。
+
+由于 LCD刷新使用异步 DMA，下一次 JPEG解码覆盖共享 RGB565缓冲前必须先调用 `lv_port_disp_wait_idle()`。否则 LCD DMA可能一边读取旧帧，一边被解码器写入新帧，产生撕裂或花屏。
 
 离开页面会：
 
 - 停止 DCMI。
-- 令 PWDN=1、RESET=0。
+- 令 PWDN=1；不操作载板 RESET和 PC4蜂鸣器。
 - 释放共享媒体内存。
 - 使 LVGL图片描述符失效。
 
@@ -374,20 +405,20 @@ Camera Test页面取得 JPEG后：
 
 | 操作 | 行为 |
 |---|---|
-| 进入页面 | 先关闭摄像头并显示初始化占位信息 |
-| OK | 初始化摄像头并自动拍摄；显示图像后再次按 OK可重新拍摄 |
+| 进入页面 | 初始化 OV5640并自动启动24 MHz双缓冲连续预览 |
+| OK | 暂停/继续连续预览；暂停发生在当前采集/解码完成之后 |
 | Left | 停止摄像头、释放内存并返回主页面 |
 | KEY2 / ESC | 停止摄像头并返回 |
 | KEY3 | 由全局媒体退出逻辑停止当前功能并返回 |
 
-页面内部阶段包括 OFF、INIT_PENDING、READY、CAPTURING、DECODE_PENDING、SHOWING和 ERROR。初始化和 JPEG解码故意分散到不同主循环周期，避免一次 LVGL处理占用过长时间。
+页面内部阶段包括 OFF、INIT_PENDING、READY、CAPTURING、DECODE_PENDING、SHOWING和 ERROR。初始化、采集、解码和下一帧调度分散到不同主循环周期。单个采集坏帧会保留上一张有效画面并自动重启摄像头；如果解码器已可能覆盖 RGB缓冲，则暂时隐藏图像，避免显示半帧。连续 3 次失败才进入 ERROR，按 OK可再次初始化。
 
 ## 10. LCD 诊断字段
 
 错误显示格式：
 
 ```text
-SCCB Exx Lxy Nz PpRr
+SCCB Exx Lxy Nz Pp RST EXT
 Step s ID 0xiiii
 ```
 
@@ -396,7 +427,7 @@ Step s ID 0xiiii
 | 值 | 含义 |
 |---|---|
 | `E00` | 没有记录到总线错误 |
-| `E04` | `HAL_I2C_ERROR_AF`；硬件 I2C中表示 NACK，软件 SCCB中也用于表示 ACK失败或复位检查失败 |
+| `E04` | `HAL_I2C_ERROR_AF`；硬件 I2C中表示 NACK，软件 SCCB中用于表示 ACK失败 |
 | `E20` | `HAL_I2C_ERROR_TIMEOUT`；早期硬件 I2C探测曾出现该错误 |
 
 ### 10.2 `Lxy`：总线空闲电平
@@ -424,14 +455,14 @@ Step s ID 0xiiii
 | 4 | 写寄存器数据时没有 ACK |
 | 5 | 读设备地址 `0x79` 时没有 ACK |
 
-### 10.4 `P` 与 `R`
+### 10.4 `P` 与 `RST EXT`
 
 | 字段 | 正常工作值 | 含义 |
 |---|---:|---|
 | `P` | 0 | PF13/PWDN为低，摄像头工作 |
-| `R` | 1 | PC4/RESET已被板载 R3拉到逻辑高 |
+| `RST EXT` | - | OV_RESET由摄像头载板管理，MCU不采样、不驱动 |
 
-注意：`R` 只是 STM32数字输入阈值判断，不是电压测量。它不能区分 1.9 V、2.8 V或其他高于 VIH的电压。
+不要为了恢复 `R0/R1`显示而把 PC4临时切成输入；PC4现在属于蜂鸣器，这会重新引入功能冲突。
 
 ## 11. Camera Result错误码
 
@@ -441,7 +472,7 @@ Step s ID 0xiiii
 | -1 | `CAMERA_RESULT_INVALID_ARGUMENT` | 空指针或参数错误 |
 | -2 | `CAMERA_RESULT_BUSY` | 摄像头或共享内存正在使用 |
 | -3 | `CAMERA_RESULT_NOT_READY` | 摄像头未完成初始化 |
-| -4 | `CAMERA_RESULT_I2C` | RESET、I2C或 SCCB失败 |
+| -4 | `CAMERA_RESULT_I2C` | I2C恢复或 SCCB通信失败 |
 | -5 | `CAMERA_RESULT_BAD_SENSOR_ID` | 读到的 ID不是 0x5640 |
 | -6 | `CAMERA_RESULT_SENSOR_INIT` | OV5640初始化表或 Start/Stop失败 |
 | -7 | `CAMERA_RESULT_DCMI` | DCMI/DMA初始化或采集错误 |
@@ -506,7 +537,7 @@ SCCB E04 L11 N0 P0R0
 Step 2 ID 0x0000
 ```
 
-程序在发送 SCCB前发现 RESET仍为低，因此停止初始化。当前故障就停留在这里。
+当时程序在发送 SCCB前发现 RESET仍为低，因此停止初始化，故障排查暂时停留在这里。
 
 ### 12.5 原理图版本纠正
 
@@ -519,9 +550,23 @@ Step 2 ID 0x0000
 - 软件 SCCB的高电平改为释放引脚，由板载 2.8 V电阻产生。
 - `.ioc`、`main.c`、`stm32h7xx_hal_msp.c` 和 `camera_service.c` 已同步。
 
-最后一次 `P0R0/L11` 是在上述最终安全配置烧录前得到的，必须用最新固件重新测试一次。最新固件关闭了 PF14/PF15内部上拉，因此新的 `Lxy` 更有诊断价值。
+该阶段仍假定 MCU应控制 RESET，后来通过实际硬件断线验证推翻了这一假定。
 
-## 13. 当前 Bug 的可能原因排序
+### 12.6 最终根因与修复
+
+最终发现开发板的 `OV_RESET` 驱动与摄像头载板上的 R3/C13复位网络存在电气冲突。采取的修复是：
+
+1. 硬件断开主板与摄像头载板 `OV_RESET` 的连接。
+2. 由摄像头载板的 2.8 V RC网络独立完成上电复位。
+3. CubeMX将 PC4配置为 `BUZZER` 推挽输出。
+4. `Camera_Service_BootHold()`、初始化、休眠和诊断路径全部移除 PC4访问。
+5. LCD诊断将虚假的 `R0/R1`改为 `RST EXT`。
+
+修复后 ID读取、寄存器初始化、DCMI快照、JPEG硬件解码和 LCD显示全部通过。用户已完成 100次连续拍照、20次页面进出以及蜂鸣器并行验证，阶段 1正式关闭。
+
+## 13. 历史 Bug 的可能原因排序（仅供旧硬件排查）
+
+本节保留当时尚未发现 RESET连接冲突时的推断过程，不代表当前硬件状态。当前版本不再通过 MCU检查 RESET。
 
 ### 高概率
 
@@ -536,7 +581,7 @@ Step 2 ID 0x0000
 2. RESET线路短路到地。
 3. 摄像头模组或驱动板损坏。
 
-### 当前不是首要原因
+### 当时不是首要原因
 
 - SCCB地址写错：程序尚未发送地址，`N0`已经证明这一点。
 - 24 MHz XCLK缺失：缺少 XCLK可能导致后续 `R1/N1`，但通常不能解释 STM32直接读到 RESET低电平。
@@ -544,6 +589,8 @@ Step 2 ID 0x0000
 - JPEG缓冲、Cache或 LVGL错误：尚未取得任何图像数据。
 
 ## 14. 无测量设备时的排查方法
+
+以下 `R0/R1`组合表只用于分析尚未断开 RESET冲突的旧硬件。当前硬件应先确认主板 `OV_RESET`确实保持断开，正常固件只显示 `RST EXT`。
 
 ### 14.1 第一步：确保测试的是最新安全固件
 
@@ -642,19 +689,21 @@ LCD第2行：
 当前基线记录：
 
 ```text
-日期：2026-08-09
-固件：最终开漏安全配置烧录前的诊断版本
-LCD第1行：SCCB E04 L11 N0 P0R0
-LCD第2行：Step 2 ID 0x0000
-结论：PWDN退出成功；RESET未释放；SCCB未发送
-下一步：烧录最终开漏、无内部上拉版本，完整断电后重新记录Lxy/P/R
+日期：2026-08-17
+硬件：主板OV_RESET与摄像头载板OV_RESET已断开，PC4专用于BUZZER
+固件：Camera Test阶段1收尾版本
+结果：Camera frame ready；重复OK拍照正常
+压力测试：连续拍照100次；页面进出20次；蜂鸣器不受影响
+结论：SCCB、OV5640初始化、DCMI、JPEG/MDMA和LVGL单帧显示链路通过
+后续结果：5 FPS串行连续预览已稳定通过；10 FPS串行节拍和48 MHz PCLK实验均未通过稳定性验证，随后在24 MHz基线上改用双JPEG槽流水线
 ```
 
 ## 17. CubeMX重新生成后的检查清单
 
 重新生成代码后必须确认：
 
-- [ ] PC4仍为 `GPIO_MODE_OUTPUT_OD + GPIO_NOPULL`。
+- [ ] PC4仍为 `BUZZER`推挽输出，摄像头代码没有读写 PC4。
+- [ ] 主板与摄像头载板的 `OV_RESET`保持物理断开。
 - [ ] PF13上电默认高，标签仍为 `OV_PWDN`。
 - [ ] PF14/PF15仍为 I2C4开漏且 `GPIO_NOPULL`。
 - [ ] DCMI仍为 8 bit、JPEG Enable、PCLK Rising、VSYNC High、HSYNC Low。
@@ -667,29 +716,62 @@ LCD第2行：Step 2 ID 0x0000
 
 ## 18. 后续开发顺序
 
-建议严格按以下顺序继续，前一步没有通过时不要跳到下一步：
+当前完成情况如下：
 
-1. `P0R1`：确认掉电和复位控制正确。
-2. `N0/E00` 且 ID=`0x5640`：确认 SCCB通信正确。
-3. Step 4完成：确认 OV5640寄存器配置正确。
-4. 捕获到 PCLK/VSYNC/HREF活动：确认并行输出存在。
-5. DCMI FRAME中断出现：确认采集同步正确。
-6. JPEG缓冲包含 `FF D8 ... FF D9`：确认完整图像帧。
-7. 硬件 JPEG解码成功：确认 MDMA和共享内存正确。
-8. LVGL显示单帧正确：完成 Camera Test第一阶段。
-9. 再考虑连续预览、双缓冲、帧率控制和通过 ESP32/Wi-Fi传输。
+1. 载板 RESET独立工作、PWDN控制正确：已完成。
+2. ID=`0x5640`、SCCB通信和寄存器配置：已完成。
+3. DCMI FRAME、完整 `FF D8 ... FF D9` JPEG：已完成。
+4. JPEG/MDMA硬件解码和 LVGL单帧显示：已完成。
+5. 100次拍照、20次页面进出、蜂鸣器隔离测试：已完成。
+6. 5 FPS串行连续预览、OK暂停/继续、性能统计：已通过；48 MHz PCLK实验因花屏和丢帧失败，已回到24 MHz稳定基线。
+7. 双 64 KiB JPEG 槽、单帧超前的采集/解码流水线：代码与编译验证已完成；首次板测发现传感器源帧率约5.6 FPS，已增加参考例程的15 FPS内部时序，待再次记录 FPS、C、Drop、JPEG大小和花屏情况。
+8. 15 FPS传感器时序实机约 10.7 FPS、采集约 90 ms：已通过初测。
+9. 拍照保存、相册目录和静态 JPEG查看器：代码与编译验证已完成，待实机回归。
 
-## 19. 已知技术限制与后续优化点
+## 19. 拍照保存与相册实现
 
-- 当前 Camera Test以单帧快照为目标，每次完整采集后都会停止并让摄像头回到安全状态，不适合直接作为连续预览架构。
+### 19.1 页面操作
+
+- Camera Test 中按 Up：保存下一张完整帧。
+- Camera Test 中按 Right：停止摄像头并进入 `/DCIM/CAMERA`。
+- SD 文件页选择 `.JPG/.JPEG`：进入 Photo Viewer。
+- Photo Viewer 中按 Left 或 KEY3：返回相册，并恢复到刚才选中的照片。
+- Photo Viewer 中按 KEY2：执行全局退出并回到主菜单第 1 项。
+
+### 19.2 文件组织和掉电保护
+
+照片使用 `/DCIM/CAMERA/IMG00001.JPG` 到 `IMG99999.JPG` 的命名方式。保存时先写 `/DCIM/CAMERA/CAPTURE.TMP`，分 4 KiB 写入并执行 `f_sync()`；关闭成功后才通过 `f_rename()`变为最终文件名。写卡失败时会删除临时文件，既有照片不会被覆盖。
+
+首次实机保存曾返回 `CAMERA_ALBUM_ERR_WRITE(-6)`。原因范围位于 FatFs数据写入到 SDMMC底层之间，而不是目录创建或文件打开。当前版本不再把 D2 SRAM中的 DCMI JPEG槽直接交给 FatFs：每个4 KiB块先复制到32字节对齐的 AXI SRAM暂存区，再执行写入；同时 `SD_write()`增加与读取路径一致的“DMA失败后复位SDMMC并以轮询模式重试”。错误提示会保留 FatFs码、失败文件偏移以及“实际/请求”字节数，便于继续区分卡片、DMA和空间不足问题。
+
+随后实机打开 JPG又偶发 `CAMERA_ALBUM_ERR_READ(-9), fs=1`。这同样属于底层磁盘I/O错误，而不是 JPEG格式错误。读取路径现在也以4 KiB为单位先读入同一个 AXI SRAM对齐暂存区，成功后再由CPU复制到 D2 JPEG槽，避免 SDMMC直接访问摄像头压缩缓冲。读取错误提示同样包含失败偏移和“实际/请求”字节数。
+
+OV5640输出的 JPEG可能省略标准 DHT。保存前调用 `MJPEG_Player_NormalizeJpeg()`补齐 Huffman表并完成硬件 JPEG要求的字节对齐，因此生成的 JPG既能由本机硬件 JPEG解码，也便于电脑或手机软件读取。
+
+### 19.3 内存复用
+
+相册没有新增整帧静态缓冲。进入 Photo Viewer前先让 Camera Service进入 OFF状态，再借用一个空闲的 64 KiB JPEG槽读取文件；解码输出继续使用共享媒体 RGB565池。离开查看器时先等待 LCD异步刷新停止，再使 LVGL图片缓存失效并释放媒体池，避免显示 DMA仍在读取时覆盖缓冲。
+
+### 19.4 建议实机回归
+
+1. 连续保存20张，确认编号递增、预览能恢复且 `Drop`没有异常增长。
+2. 按 Right进入相册，逐张打开并检查方向、颜色和完整性。
+3. 从 Photo Viewer按 Left和 KEY3返回，确认焦点仍在原照片。
+4. 将 SD卡放入电脑，确认 JPG可由通用图片软件打开。
+5. 在写保护、拔卡或空间不足时拍照，确认显示保存错误但系统不死机，原照片不损坏。
+
+## 20. 已知技术限制与后续优化点
+
+- 当前连续预览使用已通过板测的 24 MHz PCLK。双 JPEG 槽使“下一帧采集”与“上一帧 30 ms帧尾保护、解码及显示”重叠；48 MHz 测试虽将采集从约 103 ms缩短到 81 ms，但 `Drop`、自动恢复和花屏明显增加，证明当前载板/FPC/DCMI链路的信号完整性不足以稳定使用该档位。
+- 当前使用单个 RGB565显示缓冲，通过等待 LCD异步刷新完成来安全复用；若提高到更高帧率，应再评估双 RGB缓冲和内存占用。
 - 软件 SCCB在初始化期间阻塞 CPU，但不影响 DCMI采集；后续若需要频繁动态调参，可考虑验证后切回硬件 I2C。
-- 128 KiB JPEG缓冲适用于当前 QVGA测试，提升分辨率或降低压缩率前必须重新评估容量。
+- 每个 JPEG槽只有 64 KiB；当前 QVGA帧必须持续低于该容量。提升分辨率、降低压缩率或遇到 `CAMERA_RESULT_BUFFER_FULL(-9)` 前必须重新规划槽容量和 SRAM布局。
 - 当前只记录 NACK阶段，没有记录“最后失败寄存器”。Step 4失败时应补充该字段。
 - 当前没有软件检测板载 24 MHz XCLK、PCLK、VSYNC或 HREF活动。
-- `R/L/P` 都是数字电平，不是模拟电压，不能替代万用表。
+- `L/P` 都是数字电平，不是模拟电压，不能替代万用表；RESET当前不再由 MCU测量。
 - 当前软件 SCCB将失败映射为 `HAL_I2C_ERROR_AF`，因此 `E04` 可能来自软件诊断，不一定来自 HAL硬件 I2C外设。
 
-## 20. 相关资料路径
+## 21. 相关资料路径
 
 - 最终硬件依据：用户最后提供的 2024-05版 OV 系列摄像头驱动板原理图截图。
 - Arduino参考工程：`D:/Data/Downloads/zhao_xiang_ji8.21/zhao_xiang_ji8.2`。

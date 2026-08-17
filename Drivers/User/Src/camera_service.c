@@ -2,6 +2,7 @@
 
 #include "main.h"
 #include "ov5640.h"
+#include "ov5640_af_firmware.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -18,16 +19,29 @@
 #define CAMERA_ID_READ_RETRIES            3U
 #define CAMERA_OV5640_ID_HIGH_REG          0x300AU
 #define CAMERA_OV5640_ID_LOW_REG           0x300BU
+#define CAMERA_ENABLE_AUTOFOCUS                 0U
+#define CAMERA_AF_FIRMWARE_BASE             0x8000U
+#define CAMERA_AF_UPLOAD_CHUNK               128U
+#define CAMERA_AF_READY_TIMEOUT_MS          1500U
+#define CAMERA_AF_COMMAND_TIMEOUT_MS         800U
+#define CAMERA_INVALID_SLOT                  0xFFU
 
 extern I2C_HandleTypeDef hi2c4;
 extern DCMI_HandleTypeDef hdcmi;
 
 static OV5640_Object_t s_sensor;
 
-/* The compressed input must coexist with the RGB565 media pool during JPEG
-   decode. DMA1 can access D2 SRAM and the project MPU keeps it non-cacheable. */
-static uint8_t s_jpeg_buffer[CAMERA_JPEG_BUFFER_CAPACITY]
+/* Two compressed slots use the same total 128 KiB as the former single slot.
+   DCMI can fill one while JPEG/MDMA decodes the other. DMA1 can access D2 SRAM
+   and the project MPU keeps this region non-cacheable. */
+static uint8_t s_jpeg_buffer[CAMERA_JPEG_BUFFER_COUNT]
+                            [CAMERA_JPEG_BUFFER_CAPACITY]
   __attribute__((section(".ram_d2"), aligned(32)));
+static uint32_t s_slot_frame_size[CAMERA_JPEG_BUFFER_COUNT] = {0U};
+static uint8_t s_slot_ready[CAMERA_JPEG_BUFFER_COUNT] = {0U};
+static uint8_t s_slot_in_use[CAMERA_JPEG_BUFFER_COUNT] = {0U};
+static uint8_t s_capture_slot = CAMERA_INVALID_SLOT;
+static uint8_t s_next_capture_slot = 0U;
 
 static Camera_State s_state = CAMERA_STATE_OFF;
 static Camera_Result s_last_result = CAMERA_RESULT_OK;
@@ -37,16 +51,17 @@ static uint32_t s_dma_bytes_received = 0U;
 static uint32_t s_dcmi_error = 0U;
 static uint32_t s_capture_started_at = 0U;
 static uint32_t s_capture_timeout_ms = CAMERA_CAPTURE_TIMEOUT_DEFAULT;
-static uint8_t *s_frame_data = NULL;
 static uint8_t s_sensor_active = 0U;
+static uint8_t s_sensor_streaming = 0U;
 static Camera_InitStage s_init_stage = CAMERA_INIT_STAGE_NONE;
 static uint32_t s_i2c_error = HAL_I2C_ERROR_NONE;
 static uint32_t s_i2c_state = HAL_I2C_STATE_RESET;
 static uint8_t s_scl_level = 0U;
 static uint8_t s_sda_level = 0U;
 static uint8_t s_pwdn_active_level = 1U;
-static uint8_t s_reset_release_level = 0U;
 static uint8_t s_sccb_nack_phase = 0U;
+static uint8_t s_autofocus_ready = 0U;
+static uint8_t s_autofocus_status = 0U;
 
 static volatile uint8_t s_capture_active = 0U;
 static volatile uint8_t s_frame_event = 0U;
@@ -60,6 +75,11 @@ static int32_t Camera_Bus_Read(uint16_t address, uint16_t reg,
                                uint8_t *data, uint16_t length);
 static int32_t Camera_Bus_GetTick(void);
 static int32_t Camera_ReadSensorId(uint32_t *sensor_id);
+static int32_t Camera_AutofocusInit(void);
+static int32_t Camera_AutofocusWait(uint16_t reg, uint8_t expected,
+                                    uint32_t timeout_ms);
+static int32_t Camera_ConfigureImageQuality(void);
+static int32_t Camera_ConfigurePreviewTiming(void);
 static void Camera_SCCB_ConfigurePins(void);
 static void Camera_SCCB_DelayUs(uint32_t delay_us);
 static void Camera_SCCB_Start(void);
@@ -69,9 +89,14 @@ static uint8_t Camera_SCCB_ReadByte(void);
 static void Camera_SCCB_SendAck(uint8_t nack);
 static void Camera_RecordSCCBStatus(uint8_t success);
 static void Camera_HoldPins(void);
+static void Camera_StopCapture(void);
 static void Camera_StopHardware(void);
+static void Camera_ResetSlots(void);
+static uint8_t Camera_FindFreeSlot(void);
 static Camera_Result Camera_FinishCapture(void);
-static Camera_Result Camera_FindJpeg(uint32_t received_bytes);
+static Camera_Result Camera_FindJpeg(uint8_t *buffer,
+                                    uint32_t received_bytes,
+                                    uint32_t *frame_size);
 static HAL_StatusTypeDef Camera_I2C_Recover(void);
 static void Camera_I2C_ConfigurePins(void);
 static void Camera_RecordI2CStatus(void);
@@ -461,6 +486,207 @@ static int32_t Camera_ReadSensorId(uint32_t *sensor_id)
   return OV5640_ERROR;
 }
 
+static int32_t Camera_AutofocusWait(uint16_t reg, uint8_t expected,
+                                    uint32_t timeout_ms)
+{
+  uint32_t started_at = HAL_GetTick();
+  uint8_t value = 0U;
+
+  do
+  {
+    if (Camera_Bus_Read(CAMERA_OV5640_I2C_ADDRESS, reg, &value, 1U) !=
+        OV5640_OK)
+    {
+      return OV5640_ERROR;
+    }
+    s_autofocus_status = value;
+    if (value == expected)
+    {
+      return OV5640_OK;
+    }
+    HAL_Delay(5U);
+  } while ((HAL_GetTick() - started_at) < timeout_ms);
+
+  return OV5640_ERROR;
+}
+
+static int32_t Camera_AutofocusInit(void)
+{
+  static const uint16_t control_regs[] =
+  {
+    0x3022U, 0x3023U, 0x3024U, 0x3025U,
+    0x3026U, 0x3027U, 0x3028U, 0x3029U
+  };
+  static const uint8_t control_values[] =
+  {
+    0x00U, 0x00U, 0x00U, 0x00U,
+    0x00U, 0x00U, 0x00U, 0x7FU
+  };
+  uint32_t offset;
+  uint16_t chunk;
+  uint8_t value;
+  uint8_t index;
+
+  s_autofocus_ready = 0U;
+  s_autofocus_status = 0U;
+
+  value = 0x20U; /* Hold the sensor's internal AF MCU in reset. */
+  if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3000U,
+                       &value, 1U) != OV5640_OK)
+  {
+    return OV5640_ERROR;
+  }
+
+  for (offset = 0U; offset < sizeof(g_ov5640_af_firmware); offset += chunk)
+  {
+    chunk = (uint16_t)(sizeof(g_ov5640_af_firmware) - offset);
+    if (chunk > CAMERA_AF_UPLOAD_CHUNK)
+    {
+      chunk = CAMERA_AF_UPLOAD_CHUNK;
+    }
+    if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS,
+                         (uint16_t)(CAMERA_AF_FIRMWARE_BASE + offset),
+                         (uint8_t *)&g_ov5640_af_firmware[offset],
+                         chunk) != OV5640_OK)
+    {
+      value = 0x00U;
+      (void)Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3000U,
+                             &value, 1U);
+      return OV5640_ERROR;
+    }
+  }
+
+  for (index = 0U; index < (uint8_t)(sizeof(control_regs) /
+                                      sizeof(control_regs[0])); ++index)
+  {
+    value = control_values[index];
+    if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, control_regs[index],
+                         &value, 1U) != OV5640_OK)
+    {
+      return OV5640_ERROR;
+    }
+  }
+
+  value = 0x00U; /* Start the downloaded AF firmware. */
+  if ((Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3000U,
+                        &value, 1U) != OV5640_OK) ||
+      (Camera_AutofocusWait(0x3029U, 0x70U,
+                            CAMERA_AF_READY_TIMEOUT_MS) != OV5640_OK))
+  {
+    return OV5640_ERROR;
+  }
+
+  /* Enter idle first, then enable continuous autofocus as in the supplied
+     F407 reference for the autofocus OV5640 module. */
+  value = 0x01U;
+  if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3023U,
+                       &value, 1U) != OV5640_OK)
+  {
+    return OV5640_ERROR;
+  }
+  value = 0x08U;
+  if ((Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3022U,
+                        &value, 1U) != OV5640_OK) ||
+      (Camera_AutofocusWait(0x3023U, 0x00U,
+                            CAMERA_AF_COMMAND_TIMEOUT_MS) != OV5640_OK))
+  {
+    return OV5640_ERROR;
+  }
+
+  value = 0x01U;
+  if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3023U,
+                       &value, 1U) != OV5640_OK)
+  {
+    return OV5640_ERROR;
+  }
+  value = 0x04U;
+  if ((Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3022U,
+                        &value, 1U) != OV5640_OK) ||
+      (Camera_AutofocusWait(0x3023U, 0x00U,
+                            CAMERA_AF_COMMAND_TIMEOUT_MS) != OV5640_OK))
+  {
+    return OV5640_ERROR;
+  }
+
+  s_autofocus_ready = 1U;
+  return OV5640_OK;
+}
+
+static int32_t Camera_ConfigureImageQuality(void)
+{
+  /* Keep the complete color ISP path enabled, then apply auto white balance,
+     the reference module's +1 saturation matrix and automatic sharpening.
+     The explicit JPEG/ISP writes also recover from any stale monochrome or
+     RGB test configuration retained before a software re-initialization. */
+  static const uint16_t regs[] =
+  {
+    0x4300U, 0x501FU, 0x5000U, 0x5001U,
+    0x4713U, 0x4407U,
+    0x3212U,
+    0x3400U, 0x3401U, 0x3402U, 0x3403U, 0x3404U, 0x3405U, 0x3406U,
+    0x5381U, 0x5382U, 0x5383U, 0x5384U, 0x5385U, 0x5386U,
+    0x5387U, 0x5388U, 0x5389U, 0x538BU, 0x538AU,
+    0x5580U, 0x5003U,
+    0x5308U, 0x5300U, 0x5301U, 0x5302U, 0x5303U,
+    0x5309U, 0x530AU, 0x530BU, 0x530CU,
+    0x3212U, 0x3212U
+  };
+  static const uint8_t values[] =
+  {
+    0x30U, 0x00U, 0xA7U, 0xA3U,
+    0x03U, 0x01U,
+    0x03U,
+    0x04U, 0x00U, 0x04U, 0x00U, 0x04U, 0x00U, 0x00U,
+    0x1CU, 0x5AU, 0x06U, 0x1FU, 0x7AU, 0x9AU,
+    0x9CU, 0x9AU, 0x02U, 0x98U, 0x01U,
+    0x06U, 0x08U,
+    0x25U, 0x08U, 0x30U, 0x10U, 0x00U,
+    0x08U, 0x30U, 0x04U, 0x06U,
+    0x13U, 0xA3U
+  };
+  uint8_t value;
+  uint8_t index;
+
+  for (index = 0U; index < (uint8_t)(sizeof(regs) / sizeof(regs[0])); ++index)
+  {
+    value = values[index];
+    if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, regs[index],
+                         &value, 1U) != OV5640_OK)
+    {
+      return OV5640_ERROR;
+    }
+  }
+  return OV5640_OK;
+}
+
+static int32_t Camera_ConfigurePreviewTiming(void)
+{
+  uint8_t value;
+
+  /* The sensor's default ST DVP setup leaves 0x3035 at 0x41. On this module
+     that produces a measured frame period near 180 ms, so a software 10 FPS
+     request cannot exceed about 5.6 FPS. The supplied H7 OV5640 webcam
+     example uses the following pair for 15 FPS JPEG operation: increase the
+     internal sensor timing rate, then divide the DVP pixel clock strongly.
+     This raises VSYNC/frame cadence without returning to the electrically
+     unstable 48 MHz DVP setting that caused horizontal corruption. */
+  value = 0x11U;
+  if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3035U,
+                       &value, 1U) != OV5640_OK)
+  {
+    return OV5640_ERROR;
+  }
+
+  value = 0x1FU;
+  if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, 0x3824U,
+                       &value, 1U) != OV5640_OK)
+  {
+    return OV5640_ERROR;
+  }
+
+  return OV5640_OK;
+}
+
 static int32_t Camera_Bus_GetTick(void)
 {
   return (int32_t)HAL_GetTick();
@@ -474,13 +700,49 @@ static void Camera_HoldPins(void)
   HAL_GPIO_WritePin(OV_PWDN_GPIO_Port, OV_PWDN_Pin, GPIO_PIN_SET);
 }
 
+static void Camera_ResetSlots(void)
+{
+  uint8_t slot;
+
+  for (slot = 0U; slot < CAMERA_JPEG_BUFFER_COUNT; ++slot)
+  {
+    s_slot_frame_size[slot] = 0U;
+    s_slot_ready[slot] = 0U;
+    s_slot_in_use[slot] = 0U;
+  }
+  s_capture_slot = CAMERA_INVALID_SLOT;
+  s_next_capture_slot = 0U;
+  s_frame_size = 0U;
+}
+
+static uint8_t Camera_FindFreeSlot(void)
+{
+  uint8_t offset;
+
+  for (offset = 0U; offset < CAMERA_JPEG_BUFFER_COUNT; ++offset)
+  {
+    uint8_t slot = (uint8_t)((s_next_capture_slot + offset) %
+                             CAMERA_JPEG_BUFFER_COUNT);
+    if ((s_slot_ready[slot] == 0U) && (s_slot_in_use[slot] == 0U))
+    {
+      return slot;
+    }
+  }
+
+  return CAMERA_INVALID_SLOT;
+}
+
 void Camera_Service_BootHold(void)
 {
   Camera_HoldPins();
   s_sensor_active = 0U;
+  s_sensor_streaming = 0U;
   s_capture_active = 0U;
   s_frame_event = 0U;
   s_error_event = 0U;
+  s_autofocus_ready = 0U;
+  s_autofocus_status = 0U;
+  Camera_ResetSlots();
   s_state = CAMERA_STATE_OFF;
   s_last_result = CAMERA_RESULT_OK;
   s_init_stage = CAMERA_INIT_STAGE_NONE;
@@ -496,13 +758,19 @@ Camera_Result Camera_Service_Init(void)
   {
     return CAMERA_RESULT_BUSY;
   }
-  if ((s_state == CAMERA_STATE_READY) && (s_sensor_active != 0U))
+  if (((s_state == CAMERA_STATE_READY) ||
+       (s_state == CAMERA_STATE_FRAME_READY)) &&
+      (s_sensor_active != 0U))
   {
     return CAMERA_RESULT_OK;
   }
 
   s_state = CAMERA_STATE_INITIALIZING;
   s_last_result = CAMERA_RESULT_OK;
+  s_sensor_streaming = 0U;
+  s_autofocus_ready = 0U;
+  s_autofocus_status = 0U;
+  Camera_ResetSlots();
   s_sensor_id = 0U;
   s_dcmi_error = 0U;
   s_i2c_error = HAL_I2C_ERROR_NONE;
@@ -544,8 +812,6 @@ Camera_Result Camera_Service_Init(void)
   HAL_Delay(CAMERA_SENSOR_WAKE_MS);
   s_pwdn_active_level =
     (HAL_GPIO_ReadPin(OV_PWDN_GPIO_Port, OV_PWDN_Pin) == GPIO_PIN_SET) ? 1U : 0U;
-  /* Diagnostic R1 now means the carrier-managed RESET is assumed released. */
-  s_reset_release_level = 1U;
   s_sensor_active = 1U;
   s_init_stage = CAMERA_INIT_STAGE_I2C_PROBE;
 
@@ -586,8 +852,35 @@ Camera_Result Camera_Service_Init(void)
   }
 
   s_init_stage = CAMERA_INIT_STAGE_SENSOR_CONFIG;
-  if ((OV5640_Init(&s_sensor, OV5640_R320x240, OV5640_JPEG) != OV5640_OK) ||
-      (OV5640_SetPCLK(&s_sensor, OV5640_PCLK_24M) != OV5640_OK))
+  if (OV5640_Init(&s_sensor, OV5640_R320x240, OV5640_JPEG) != OV5640_OK)
+  {
+    s_last_result = CAMERA_RESULT_SENSOR_INIT;
+    Camera_StopHardware();
+    s_state = CAMERA_STATE_ERROR;
+    return s_last_result;
+  }
+
+  /* This board carries the fixed-focus OV5640 variant, so do not upload or
+     start the VCM autofocus firmware. Keep the implementation available for
+     a future AF module without disturbing the JPEG pipeline on this module. */
+  if ((CAMERA_ENABLE_AUTOFOCUS != 0U) &&
+      (OV5640_SetPixelFormat(&s_sensor, OV5640_RGB565) == OV5640_OK))
+  {
+    (void)Camera_AutofocusInit();
+  }
+
+  /* The carrier needs horizontal mirroring only. MIRROR_FLIP corrected the
+     horizontal direction but left the reported preview vertically inverted. */
+  if ((OV5640_SetPixelFormat(&s_sensor, OV5640_JPEG) != OV5640_OK) ||
+      (OV5640_MirrorFlipConfig(&s_sensor, OV5640_MIRROR) != OV5640_OK) ||
+      (Camera_ConfigureImageQuality() != OV5640_OK) ||
+      /* 48 MHz reduced capture time only from about 103 ms to 81 ms on this
+         carrier, but caused frequent corrupt frames and DCMI recovery. Keep
+         the board-validated 24 MHz PLL baseline, then use the reference
+         15 FPS timing with an additional DVP divider. */
+      (OV5640_SetPCLK(&s_sensor, OV5640_PCLK_24M) != OV5640_OK) ||
+      (OV5640_NightModeConfig(&s_sensor, NIGHT_MODE_DISABLE) != OV5640_OK) ||
+      (Camera_ConfigurePreviewTiming() != OV5640_OK))
   {
     s_last_result = CAMERA_RESULT_SENSOR_INIT;
     Camera_StopHardware();
@@ -604,16 +897,29 @@ Camera_Result Camera_Service_Init(void)
 
 Camera_Result Camera_Service_StartSnapshot(uint32_t timeout_ms)
 {
+  uint8_t free_slot;
+
   if (s_state == CAMERA_STATE_CAPTURING)
   {
     return CAMERA_RESULT_BUSY;
   }
-  if ((s_state != CAMERA_STATE_READY) || (s_sensor_active == 0U))
+  if (((s_state != CAMERA_STATE_READY) &&
+       (s_state != CAMERA_STATE_FRAME_READY)) ||
+      (s_sensor_active == 0U))
   {
     return CAMERA_RESULT_NOT_READY;
   }
-  s_frame_data = NULL;
-  s_frame_size = 0U;
+
+  free_slot = Camera_FindFreeSlot();
+  if (free_slot == CAMERA_INVALID_SLOT)
+  {
+    return CAMERA_RESULT_BUSY;
+  }
+
+  s_capture_slot = free_slot;
+  s_next_capture_slot = (uint8_t)((free_slot + 1U) %
+                                  CAMERA_JPEG_BUFFER_COUNT);
+  s_slot_frame_size[free_slot] = 0U;
   s_dma_bytes_received = 0U;
   s_dcmi_error = 0U;
   s_frame_event = 0U;
@@ -622,13 +928,15 @@ Camera_Result Camera_Service_StartSnapshot(uint32_t timeout_ms)
   s_capture_timeout_ms = (timeout_ms == 0U)
                            ? CAMERA_CAPTURE_TIMEOUT_DEFAULT : timeout_ms;
 
-  if (OV5640_Start(&s_sensor) != OV5640_OK)
+  if ((s_sensor_streaming == 0U) &&
+      (OV5640_Start(&s_sensor) != OV5640_OK))
   {
     s_last_result = CAMERA_RESULT_SENSOR_INIT;
     Camera_StopHardware();
     s_state = CAMERA_STATE_ERROR;
     return s_last_result;
   }
+  s_sensor_streaming = 1U;
 
   hdcmi.ErrorCode = HAL_DCMI_ERROR_NONE;
   __HAL_DCMI_CLEAR_FLAG(&hdcmi, DCMI_FLAG_FRAMERI | DCMI_FLAG_OVRRI |
@@ -642,7 +950,7 @@ Camera_Result Camera_Service_StartSnapshot(uint32_t timeout_ms)
   s_state = CAMERA_STATE_CAPTURING;
 
   if (HAL_DCMI_Start_DMA(&hdcmi, DCMI_MODE_SNAPSHOT,
-                         (uint32_t)s_jpeg_buffer,
+                         (uint32_t)s_jpeg_buffer[s_capture_slot],
                          CAMERA_DMA_WORD_COUNT) != HAL_OK)
   {
     s_capture_active = 0U;
@@ -674,9 +982,19 @@ void Camera_Service_Process(void)
   if (s_frame_event != 0U)
   {
     s_last_result = Camera_FinishCapture();
-    Camera_StopHardware();
-    s_state = (s_last_result == CAMERA_RESULT_OK)
-                ? CAMERA_STATE_FRAME_READY : CAMERA_STATE_ERROR;
+    if (s_last_result == CAMERA_RESULT_OK)
+    {
+      /* Keep the configured sensor powered between snapshots.  Re-running the
+       * full SCCB register table for every preview frame is both slow and much
+       * less reliable than stopping only the active DCMI transfer. */
+      Camera_StopCapture();
+      s_state = CAMERA_STATE_FRAME_READY;
+    }
+    else
+    {
+      Camera_StopHardware();
+      s_state = CAMERA_STATE_ERROR;
+    }
     return;
   }
 
@@ -690,7 +1008,14 @@ void Camera_Service_Process(void)
 
 static Camera_Result Camera_FinishCapture(void)
 {
+  Camera_Result result;
   uint32_t remaining_words;
+  uint32_t frame_size;
+
+  if (s_capture_slot >= CAMERA_JPEG_BUFFER_COUNT)
+  {
+    return CAMERA_RESULT_DCMI;
+  }
 
   /* Frame IRQ precedes this main-loop service by several ms, allowing the DMA
      FIFO to commit its final word before the counter is sampled. */
@@ -702,13 +1027,30 @@ static Camera_Result Camera_FinishCapture(void)
   }
 
   s_dma_bytes_received = (CAMERA_DMA_WORD_COUNT - remaining_words) * sizeof(uint32_t);
-  return Camera_FindJpeg(s_dma_bytes_received);
+  frame_size = 0U;
+  result = Camera_FindJpeg(s_jpeg_buffer[s_capture_slot],
+                           s_dma_bytes_received, &frame_size);
+  if (result == CAMERA_RESULT_OK)
+  {
+    s_slot_frame_size[s_capture_slot] = frame_size;
+    s_slot_ready[s_capture_slot] = 1U;
+    s_frame_size = frame_size;
+  }
+  return result;
 }
 
-static Camera_Result Camera_FindJpeg(uint32_t received_bytes)
+static Camera_Result Camera_FindJpeg(uint8_t *buffer,
+                                    uint32_t received_bytes,
+                                    uint32_t *frame_size)
 {
   uint32_t start;
   uint32_t end;
+
+  if ((buffer == NULL) || (frame_size == NULL))
+  {
+    return CAMERA_RESULT_INVALID_ARGUMENT;
+  }
+  *frame_size = 0U;
 
   if (received_bytes > CAMERA_JPEG_BUFFER_CAPACITY)
   {
@@ -717,8 +1059,8 @@ static Camera_Result Camera_FindJpeg(uint32_t received_bytes)
 
   for (start = 0U; (start + 1U) < received_bytes; ++start)
   {
-    if ((s_jpeg_buffer[start] == 0xFFU) &&
-        (s_jpeg_buffer[start + 1U] == 0xD8U))
+    if ((buffer[start] == 0xFFU) &&
+        (buffer[start + 1U] == 0xD8U))
     {
       break;
     }
@@ -731,15 +1073,14 @@ static Camera_Result Camera_FindJpeg(uint32_t received_bytes)
 
   for (end = start + 2U; (end + 1U) < received_bytes; ++end)
   {
-    if ((s_jpeg_buffer[end] == 0xFFU) &&
-        (s_jpeg_buffer[end + 1U] == 0xD9U))
+    if ((buffer[end] == 0xFFU) &&
+        (buffer[end + 1U] == 0xD9U))
     {
-      s_frame_size = (end + 2U) - start;
+      *frame_size = (end + 2U) - start;
       if (start != 0U)
       {
-        memmove(s_jpeg_buffer, &s_jpeg_buffer[start], s_frame_size);
+        memmove(buffer, &buffer[start], *frame_size);
       }
-      s_frame_data = s_jpeg_buffer;
       return CAMERA_RESULT_OK;
     }
   }
@@ -782,40 +1123,103 @@ Camera_Result Camera_Service_CaptureJpeg(const uint8_t **jpeg_data,
 Camera_Result Camera_Service_GetSnapshot(const uint8_t **jpeg_data,
                                          uint32_t *jpeg_size)
 {
+  uint8_t slot;
+
   if ((jpeg_data == NULL) || (jpeg_size == NULL))
   {
     return CAMERA_RESULT_INVALID_ARGUMENT;
   }
-  if ((s_state != CAMERA_STATE_FRAME_READY) ||
-      (s_frame_data == NULL) || (s_frame_size == 0U))
+
+  for (slot = 0U; slot < CAMERA_JPEG_BUFFER_COUNT; ++slot)
   {
-    return (s_last_result == CAMERA_RESULT_OK)
-             ? CAMERA_RESULT_NOT_READY : s_last_result;
+    if ((s_slot_ready[slot] != 0U) && (s_slot_frame_size[slot] != 0U))
+    {
+      s_slot_ready[slot] = 0U;
+      s_slot_in_use[slot] = 1U;
+      *jpeg_data = s_jpeg_buffer[slot];
+      *jpeg_size = s_slot_frame_size[slot];
+      if (s_state == CAMERA_STATE_FRAME_READY)
+      {
+        s_state = CAMERA_STATE_READY;
+      }
+      return CAMERA_RESULT_OK;
+    }
   }
 
-  *jpeg_data = s_frame_data;
-  *jpeg_size = s_frame_size;
+  return (s_last_result == CAMERA_RESULT_OK)
+           ? CAMERA_RESULT_NOT_READY : s_last_result;
+}
+
+void Camera_Service_ReleaseSnapshot(const uint8_t *jpeg_data)
+{
+  uint8_t slot;
+
+  if (jpeg_data == NULL)
+  {
+    return;
+  }
+
+  for (slot = 0U; slot < CAMERA_JPEG_BUFFER_COUNT; ++slot)
+  {
+    if (jpeg_data == s_jpeg_buffer[slot])
+    {
+      s_slot_frame_size[slot] = 0U;
+      __DMB();
+      s_slot_in_use[slot] = 0U;
+      return;
+    }
+  }
+}
+
+Camera_Result Camera_Service_GetIdleJpegWorkspace(uint8_t **buffer,
+                                                  uint32_t *capacity)
+{
+  if ((buffer == NULL) || (capacity == NULL))
+  {
+    return CAMERA_RESULT_INVALID_ARGUMENT;
+  }
+  if ((s_state != CAMERA_STATE_OFF) || (s_sensor_active != 0U) ||
+      (s_capture_active != 0U))
+  {
+    return CAMERA_RESULT_BUSY;
+  }
+
+  *buffer = s_jpeg_buffer[0];
+  *capacity = CAMERA_JPEG_BUFFER_CAPACITY;
   return CAMERA_RESULT_OK;
 }
 
-static void Camera_StopHardware(void)
+static void Camera_StopCapture(void)
 {
   if (s_capture_active != 0U)
   {
     (void)HAL_DCMI_Stop(&hdcmi);
   }
   s_capture_active = 0U;
+  s_capture_slot = CAMERA_INVALID_SLOT;
+}
+
+static void Camera_StopHardware(void)
+{
+  Camera_StopCapture();
 
   if (s_sensor_active != 0U)
   {
     if (s_sensor.IsInitialized != 0U)
     {
-      (void)OV5640_Stop(&s_sensor);
+      if (s_sensor_streaming != 0U)
+      {
+        (void)OV5640_Stop(&s_sensor);
+      }
       (void)OV5640_DeInit(&s_sensor);
     }
     Camera_HoldPins();
     s_sensor_active = 0U;
+    s_sensor_streaming = 0U;
+    s_autofocus_ready = 0U;
+    s_autofocus_status = 0U;
   }
+  Camera_ResetSlots();
 }
 
 void Camera_Service_Sleep(void)
@@ -823,8 +1227,6 @@ void Camera_Service_Sleep(void)
   Camera_StopHardware();
   s_frame_event = 0U;
   s_error_event = 0U;
-  s_frame_data = NULL;
-  s_frame_size = 0U;
   s_state = CAMERA_STATE_OFF;
   s_last_result = CAMERA_RESULT_OK;
 }
@@ -858,8 +1260,10 @@ void Camera_Service_GetDiagnostics(Camera_Diagnostics *diagnostics)
   diagnostics->scl_level = s_scl_level;
   diagnostics->sda_level = s_sda_level;
   diagnostics->pwdn_level = s_pwdn_active_level;
-  diagnostics->reset_level = s_reset_release_level;
   diagnostics->sccb_nack_phase = s_sccb_nack_phase;
+  diagnostics->autofocus_enabled = CAMERA_ENABLE_AUTOFOCUS;
+  diagnostics->autofocus_ready = s_autofocus_ready;
+  diagnostics->autofocus_status = s_autofocus_status;
 }
 
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *camera_dcmi)

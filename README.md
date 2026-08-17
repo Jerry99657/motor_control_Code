@@ -9,7 +9,7 @@
 - MPU6500 六轴数据采集与姿态融合，提供平面航向角和航向角速度。
 - 小陀螺模式：车体连续自转，同时通过航向补偿保持世界坐标方向运动。
 - LVGL 菜单、固定页面骨架、页面过渡、焦点反馈、数值惯性和 UI 性能诊断。
-- SD 卡目录浏览，播放 `.bin` 动画、`.avi` MJPEG 视频和 `.gif` 动画。
+- SD 卡目录浏览，播放 `.bin` 动画、`.avi` MJPEG 视频和 `.gif` 动画，并浏览 `.jpg/.jpeg` 照片。
 - NES 模拟器：支持 iNES Mapper 0/1/2/3、QSPI ROM 缓存、MMC1 和电池 `.sav` 存档，无音频输出。
 - 媒体播放暂停/继续、前后跳帧、停止和返回目录。
 - WS2812 RGB 控制及上电状态提示。
@@ -30,6 +30,7 @@ Drivers/User/Src/imu_service.c 平面航向快照、航向角速度和安装方�
 Drivers/User/Src/foc_link.c    UART4 FOC 指令队列、停止优先级和遥测解析
 Drivers/User/Src/media_control.c 媒体按键、暂停、跳帧和返回状态机
 Drivers/User/Src/mjpeg_player.c AVI/MJPEG 解码与播放调度
+Drivers/User/Src/camera_album.c OV5640 照片编号、原子保存和相册 JPEG 读取
 Drivers/User/Src/nes_rom_cache.c NES ROM 的 SD→QSPI 缓存、快速命中和 CRC 校验
 Drivers/User/Src/nes_cpu.c     Ricoh 2A03/6502 指令、NMI/IRQ 和故障现场
 Drivers/User/Src/nes_runtime.c Mapper、PPU、APU 兼容时序、LCD 输出和 `.sav`
@@ -165,17 +166,25 @@ UI Diagnostics 分为 9 个分页：Overview、Display、Memory、Reliability、
 
 ### 4.9 Camera Test
 
-进入页面后按需唤醒 OV5640、校验传感器 ID，并自动采集一帧 `320×240 JPEG`。JPEG 使用 STM32H7 硬件 JPEG 外设解码为 RGB565，再缩放为 `200×150` 显示在 LVGL 预览区；页面底部同时显示 JPEG 大小、采集耗时和解码耗时。
+进入页面后唤醒 OV5640、校验传感器 ID，并自动启动 `320×240 JPEG` 连续预览。48 MHz DVP 配置曾使采集耗时从约 103 ms 降至 81 ms，但出现频繁坏帧、恢复和严重花屏，因此不用于当前硬件。首版双缓冲板测仍只有约 5.7 FPS，且稳定采集耗时变为约 180 ms；这证明当时的主要瓶颈是 OV5640 本身只产生约 5.6 帧/秒，而不是约 27 ms 的 JPEG 解码。当前版本参考工程内 H7 OV5640 网络摄像头的 15 FPS 配置，使用 `0x3035=0x11` 提高传感器内部帧时序、`0x3824=0x1F` 对 DVP PCLK 分频，并关闭自动夜间降帧。这样提高 VSYNC 帧率的同时避免恢复到不稳定的 48 MHz 并行引脚速率。
 
-- OK：重新初始化摄像头并采集下一帧。
-- Left/KEY2/KEY3：停止当前采集、拉低 `OV_RESET`、进入掉电状态并返回主菜单。
+连续预览将原有 128 KiB 压缩缓冲拆成两个 64 KiB JPEG 槽：DCMI 在一槽采集下一帧时，硬件 JPEG/MDMA 从另一槽解码上一帧，消除了原先“采集完成后才开始延时和解码”的串行等待。每个已交给解码器的槽都必须显式释放，DCMI 不会覆盖仍在使用的压缩帧。页面统计中的 `DB15` 表示双 JPEG 槽和 15 FPS 传感器时序均已启用。
+
+当前镜头确认为定焦版本，因此不会上传或启动 VCM 自动对焦固件，页面显示 `AF:FIXED`。初始化在传感器端完成方向修正、自动白平衡、彩色矩阵和自动锐化；摄像头内存解码入口会独立初始化 YCbCr 到 RGB565 彩色查找表，不再依赖此前是否播放过 `.avi`。JPEG 使用 STM32H7 硬件 JPEG 外设解码为 RGB565，再缩放为 `224×168` 显示在 LVGL 预览区；页面底部显示实际 FPS、AF 类型、JPEG 大小、采集/解码耗时、帧号和累计丢帧。当前板测约为 10.7 FPS、单帧采集约 90 ms。瞬态坏帧会自动恢复，连续 3 次失败后才停止等待重试；连续预览不会再逐帧显示“JPEG采集完成/正在解码”的临时状态。
+
+- OK：暂停/继续预览。
+- Up：保存下一张完整 JPEG 到 `/DCIM/CAMERA/IMGxxxxx.JPG`；暂停状态下会自动恢复一帧，保存完成后继续预览。
+- Right：停止预览并进入 `/DCIM/CAMERA` 相册目录。
+- Left/KEY2/KEY3：停止当前采集、置 `OV_PWDN`、释放共享显示缓冲并返回主菜单。
+
+照片先写入 `CAPTURE.TMP`，完成 `f_sync()` 和关闭后再改名，避免写入中断时留下看似正常但内容不完整的最终照片。OV5640 JPEG 若缺少标准 Huffman 表，保存前会补齐 DHT，使照片也能在电脑和手机上打开。SD 文件页选择 `.jpg/.jpeg` 会进入 Photo Viewer；Left 或 KEY3 返回相册并保持原照片选中，KEY2 执行全局退出。
 
 ### 4.10 Display Settings
 
 提供屏幕旋转、按键声音、中英文切换和低电压蜂鸣器报警开关。屏幕旋转后五维按键方向同步映射；设置写入 W25Q64，掉电后保持。
-- 初始化或采集失败时，页面显示传感器 ID、Camera 错误码和 DCMI 错误码；按 OK 可重试。
+- 初始化或连续采集失败时，页面显示传感器 ID、Camera 错误码和 DCMI 错误码；按 OK 可重试。
 
-该页面只做单帧拍照测试，不持续占用 DCMI。离开页面会释放共享 RGB565 媒体内存池，摄像头压缩帧缓冲与显示帧缓冲分别位于 D2 SRAM 和 AXI SRAM，保证硬件 JPEG 解码时输入、输出能够同时存在。
+摄像头载板独立管理 `OV_RESET`；主板与该信号的连接已断开，PC4仅用于蜂鸣器。连续预览期间复用共享 RGB565媒体内存，并在覆盖下一帧前等待 LCD异步刷新完成；离开页面才让摄像头进入 PWDN并释放内存。详细结构与历史故障见 [`docs/ov5640_driver_development_and_debugging_zh.md`](docs/ov5640_driver_development_and_debugging_zh.md)。
 
 ## 5. 媒体播放操作
 
