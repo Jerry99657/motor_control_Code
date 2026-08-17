@@ -25,6 +25,10 @@
 #define CAMERA_AF_READY_TIMEOUT_MS          1500U
 #define CAMERA_AF_COMMAND_TIMEOUT_MS         800U
 #define CAMERA_INVALID_SLOT                  0xFFU
+/* Keep local LCD detail one step above the web stream. The stream follows the
+   ST OV5640 QS=0x04 baseline to keep 2.5 Mb/s UART frames near 10 KiB. */
+#define CAMERA_JPEG_QS_LOCAL_PREVIEW          0x03U
+#define CAMERA_JPEG_QS_WEB_STREAM             0x04U
 
 extern I2C_HandleTypeDef hi2c4;
 extern DCMI_HandleTypeDef hdcmi;
@@ -62,6 +66,7 @@ static uint8_t s_pwdn_active_level = 1U;
 static uint8_t s_sccb_nack_phase = 0U;
 static uint8_t s_autofocus_ready = 0U;
 static uint8_t s_autofocus_status = 0U;
+static uint8_t s_jpeg_quantization_scale = CAMERA_JPEG_QS_LOCAL_PREVIEW;
 
 static volatile uint8_t s_capture_active = 0U;
 static volatile uint8_t s_frame_event = 0U;
@@ -109,6 +114,14 @@ static void Camera_RecordI2CStatus(void)
                                  CAMERA_SCCB_SCL_PIN) == GPIO_PIN_SET) ? 1U : 0U;
   s_sda_level = (HAL_GPIO_ReadPin(CAMERA_SCCB_GPIO_PORT,
                                  CAMERA_SCCB_SDA_PIN) == GPIO_PIN_SET) ? 1U : 0U;
+}
+
+void Camera_Service_SetJpegProfile(Camera_JpegProfile profile)
+{
+  s_jpeg_quantization_scale =
+      (profile == CAMERA_JPEG_PROFILE_WEB_STREAM)
+          ? CAMERA_JPEG_QS_WEB_STREAM
+          : CAMERA_JPEG_QS_LOCAL_PREVIEW;
 }
 
 static void Camera_RecordSCCBStatus(uint8_t success)
@@ -634,7 +647,7 @@ static int32_t Camera_ConfigureImageQuality(void)
   static const uint8_t values[] =
   {
     0x30U, 0x00U, 0xA7U, 0xA3U,
-    0x03U, 0x01U,
+    0x03U, 0x00U,
     0x03U,
     0x04U, 0x00U, 0x04U, 0x00U, 0x04U, 0x00U, 0x00U,
     0x1CU, 0x5AU, 0x06U, 0x1FU, 0x7AU, 0x9AU,
@@ -650,6 +663,10 @@ static int32_t Camera_ConfigureImageQuality(void)
   for (index = 0U; index < (uint8_t)(sizeof(regs) / sizeof(regs[0])); ++index)
   {
     value = values[index];
+    if (regs[index] == 0x4407U)
+    {
+      value = s_jpeg_quantization_scale;
+    }
     if (Camera_Bus_Write(CAMERA_OV5640_I2C_ADDRESS, regs[index],
                          &value, 1U) != OV5640_OK)
     {
@@ -1264,6 +1281,7 @@ void Camera_Service_GetDiagnostics(Camera_Diagnostics *diagnostics)
   diagnostics->autofocus_enabled = CAMERA_ENABLE_AUTOFOCUS;
   diagnostics->autofocus_ready = s_autofocus_ready;
   diagnostics->autofocus_status = s_autofocus_status;
+  diagnostics->jpeg_quantization_scale = s_jpeg_quantization_scale;
 }
 
 void HAL_DCMI_FrameEventCallback(DCMI_HandleTypeDef *camera_dcmi)

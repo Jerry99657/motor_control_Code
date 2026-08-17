@@ -41,6 +41,12 @@ typedef enum
 
 typedef enum
 {
+  CAMERA_JPEG_PROFILE_LOCAL_PREVIEW = 0,
+  CAMERA_JPEG_PROFILE_WEB_STREAM
+} Camera_JpegProfile;
+
+typedef enum
+{
   CAMERA_INIT_STAGE_NONE = 0,
   CAMERA_INIT_STAGE_I2C_RECOVERY,
   CAMERA_INIT_STAGE_I2C_PROBE,
@@ -67,11 +73,17 @@ typedef struct
   uint8_t autofocus_enabled;
   uint8_t autofocus_ready;
   uint8_t autofocus_status;
+  uint8_t jpeg_quantization_scale;
 } Camera_Diagnostics;
 
 /* Keep OV_PWDN enabled. OV_RESET is owned by the camera carrier because PC4
  * is assigned to the buzzer. Safe to call once GPIO is ready. */
 void Camera_Service_BootHold(void);
+
+/* Select the JPEG quantization scale used by the next sensor initialization.
+ * Local preview favors detail; the web stream favors smaller UART frames.
+ * Call while the camera is OFF (both current owners do this before Init). */
+void Camera_Service_SetJpegProfile(Camera_JpegProfile profile);
 
 /* Power up and configure OV5640 for 320x240 JPEG parallel output. */
 Camera_Result Camera_Service_Init(void);

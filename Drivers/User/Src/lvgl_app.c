@@ -30,6 +30,7 @@
 #include "command_protocol.h"
 #include "foc_link.h"
 #include "camera_service.h"
+#include "camera_stream.h"
 #include "camera_album.h"
 #include "media_memory.h"
 #include "nes_rom_cache.h"
@@ -1463,6 +1464,7 @@ static void lvgl_app_process_pending_screen(void)
 }
 
 static lv_obj_t *s_cmd_ctrl_label = NULL;
+static lv_obj_t *s_cmd_camera_status_label = NULL;
 
 static void lvgl_app_control_refresh_rows(void)
 {
@@ -1480,10 +1482,13 @@ static void lvgl_app_control_refresh_rows(void)
         if (s_cmd_ctrl_label != NULL)
         {
             char big_buf[256];
+            char camera_status[48];
             CommandControlSnapshot command;
+            CameraStreamStats camera_stream;
             FOC_LinkTelemetry foc_telemetry;
             uint8_t foc_alive;
             CommandControl_GetSnapshot(&command);
+            CameraStream_GetStats(&camera_stream);
             command.gyro_enabled = Mecanum_IsGyroModeEnabled();
             FOC_Link_GetTelemetry(&foc_telemetry);
             foc_alive = FOC_Link_IsTelemetryAlive(250U);
@@ -1508,6 +1513,15 @@ static void lvgl_app_control_refresh_rows(void)
                      command.joystick_lx, command.joystick_ly,
                      command.joystick_rx, command.joystick_ry);
             (void)UI_LabelSetTextIfChanged(s_cmd_ctrl_label, big_buf);
+            snprintf(camera_status, sizeof(camera_status),
+                     "CAM R%u C%u F%lu P%lu E%lu",
+                     (unsigned int)camera_stream.requested,
+                     (unsigned int)camera_stream.camera_owned,
+                     (unsigned long)camera_stream.frames_completed,
+                     (unsigned long)camera_stream.packets_sent,
+                     (unsigned long)camera_stream.camera_error_count);
+            (void)UI_LabelSetTextIfChanged(s_cmd_camera_status_label,
+                                           camera_status);
         }
         return;
     }
@@ -4473,10 +4487,10 @@ static void lvgl_app_show_diagnostics(void)
 #define LVGL_APP_CAMERA_PREVIEW_HEIGHT  168U
 #define LVGL_APP_CAMERA_RGB_BYTES       \
     ((uint32_t)CAMERA_JPEG_WIDTH * (uint32_t)CAMERA_JPEG_HEIGHT * 2U)
-#define LVGL_APP_CAMERA_TARGET_FPS      10U
+#define LVGL_APP_CAMERA_TARGET_FPS      15U
 #define LVGL_APP_CAMERA_FRAME_PERIOD_MS \
     (1000U / LVGL_APP_CAMERA_TARGET_FPS)
-#define LVGL_APP_CAMERA_DECODE_DEFER_MS 30U
+#define LVGL_APP_CAMERA_DECODE_DEFER_MS  5U
 #define LVGL_APP_CAMERA_MAX_ERRORS      3U
 
 static void lvgl_app_camera_set_info(const char *fmt, ...)
@@ -4543,6 +4557,8 @@ static void lvgl_app_camera_scale_rgb565_in_place(uint16_t *pixels,
 {
     uint32_t dst_y;
     uint32_t dst_x;
+    uint32_t x_step;
+    uint32_t y_step;
 
     if ((pixels == NULL) || (src_width == 0U) || (src_height == 0U) ||
         (dst_width == 0U) || (dst_height == 0U) ||
@@ -4551,14 +4567,69 @@ static void lvgl_app_camera_scale_rgb565_in_place(uint16_t *pixels,
         return;
     }
 
+    if ((src_width == dst_width) && (src_height == dst_height))
+    {
+        return;
+    }
+
+    if ((dst_width == 1U) || (dst_height == 1U))
+    {
+        return;
+    }
+
+    x_step = (((uint32_t)src_width - 1U) << 16U) /
+             ((uint32_t)dst_width - 1U);
+    y_step = (((uint32_t)src_height - 1U) << 16U) /
+             ((uint32_t)dst_height - 1U);
+
+    /* Forward traversal is safe in place while downscaling: each source
+       coordinate is at or ahead of its destination coordinate. Load all four
+       RGB565 samples before writing the destination pixel. Eight-bit
+       fractional weights provide visibly smoother LCD edges without a second
+       full-frame buffer. */
     for (dst_y = 0U; dst_y < dst_height; ++dst_y)
     {
-        uint32_t src_y = (dst_y * src_height) / dst_height;
+        uint32_t y_fp = (dst_y == ((uint32_t)dst_height - 1U))
+                          ? (((uint32_t)src_height - 1U) << 16U)
+                          : (dst_y * y_step);
+        uint32_t src_y = y_fp >> 16U;
+        uint32_t next_y = (src_y + 1U < src_height) ? src_y + 1U : src_y;
+        uint32_t y_weight = (y_fp >> 8U) & 0xFFU;
+        uint32_t y_inverse = 256U - y_weight;
+        uint32_t row0 = src_y * src_width;
+        uint32_t row1 = next_y * src_width;
+
         for (dst_x = 0U; dst_x < dst_width; ++dst_x)
         {
-            uint32_t src_x = (dst_x * src_width) / dst_width;
+            uint32_t x_fp = (dst_x == ((uint32_t)dst_width - 1U))
+                              ? (((uint32_t)src_width - 1U) << 16U)
+                              : (dst_x * x_step);
+            uint32_t src_x = x_fp >> 16U;
+            uint32_t next_x = (src_x + 1U < src_width) ? src_x + 1U : src_x;
+            uint32_t x_weight = (x_fp >> 8U) & 0xFFU;
+            uint32_t x_inverse = 256U - x_weight;
+            uint16_t p00 = pixels[row0 + src_x];
+            uint16_t p01 = pixels[row0 + next_x];
+            uint16_t p10 = pixels[row1 + src_x];
+            uint16_t p11 = pixels[row1 + next_x];
+            uint32_t r0 = ((uint32_t)(p00 >> 11U) * x_inverse) +
+                          ((uint32_t)(p01 >> 11U) * x_weight);
+            uint32_t r1 = ((uint32_t)(p10 >> 11U) * x_inverse) +
+                          ((uint32_t)(p11 >> 11U) * x_weight);
+            uint32_t g0 = ((uint32_t)((p00 >> 5U) & 0x3FU) * x_inverse) +
+                          ((uint32_t)((p01 >> 5U) & 0x3FU) * x_weight);
+            uint32_t g1 = ((uint32_t)((p10 >> 5U) & 0x3FU) * x_inverse) +
+                          ((uint32_t)((p11 >> 5U) & 0x3FU) * x_weight);
+            uint32_t b0 = ((uint32_t)(p00 & 0x1FU) * x_inverse) +
+                          ((uint32_t)(p01 & 0x1FU) * x_weight);
+            uint32_t b1 = ((uint32_t)(p10 & 0x1FU) * x_inverse) +
+                          ((uint32_t)(p11 & 0x1FU) * x_weight);
+            uint32_t red = ((r0 * y_inverse) + (r1 * y_weight) + 0x8000U) >> 16U;
+            uint32_t green = ((g0 * y_inverse) + (g1 * y_weight) + 0x8000U) >> 16U;
+            uint32_t blue = ((b0 * y_inverse) + (b1 * y_weight) + 0x8000U) >> 16U;
+
             pixels[(dst_y * dst_width) + dst_x] =
-                pixels[(src_y * src_width) + src_x];
+                (uint16_t)((red << 11U) | (green << 5U) | blue);
         }
     }
 }
@@ -5537,6 +5608,7 @@ static void lvgl_app_show_camera_test(void)
     lv_obj_t *key_receiver;
 
     Camera_Service_Sleep();
+    Camera_Service_SetJpegProfile(CAMERA_JPEG_PROFILE_LOCAL_PREVIEW);
     MediaMemory_Release(MEDIA_MEMORY_OWNER_CAMERA);
     (void)memset(&s_camera_image_dsc, 0, sizeof(s_camera_image_dsc));
     s_camera_rgb_buffer = NULL;
@@ -6247,11 +6319,13 @@ static void lvgl_app_show_command_control(void)
     lv_obj_set_style_bg_color(status_card, lv_color_hex(0xE8F1FF), LV_PART_MAIN);
     lv_obj_clear_flag(status_card, LV_OBJ_FLAG_SCROLLABLE);
 
-    lbl = lv_label_create(status_card);
-    lv_label_set_text(lbl, "USB/UART5 + UART4 FOC");
-    lv_obj_set_style_text_color(lbl, lv_color_hex(0x173B67), LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_12, LV_PART_MAIN);
-    lv_obj_center(lbl);
+    s_cmd_camera_status_label = lv_label_create(status_card);
+    lv_label_set_text(s_cmd_camera_status_label, "CAM R0 C0 F0 P0 E0");
+    lv_obj_set_style_text_color(s_cmd_camera_status_label,
+                                lv_color_hex(0x173B67), LV_PART_MAIN);
+    lv_obj_set_style_text_font(s_cmd_camera_status_label,
+                               &lv_font_montserrat_12, LV_PART_MAIN);
+    lv_obj_center(s_cmd_camera_status_label);
     UI_Anim_StaggerIn(status_card, 0U);
 
     data_panel = lv_obj_create(s_page_content);

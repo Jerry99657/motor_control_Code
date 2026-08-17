@@ -19,6 +19,8 @@ NimBLEClient* gClient = nullptr;
 volatile bool gConnectRequested = false;
 volatile bool gDisconnectPending = false;
 bool gScanRunning = false;
+bool gScanSuspended = false;
+bool gRadioSuspended = false;
 bool gReady = false;
 uint32_t gNextScanAt = 0;
 uint16_t gSubscribedReports = 0;
@@ -143,7 +145,7 @@ void deleteDisconnectedClient() {
 }
 
 void startScan() {
-  if (gScanRunning || gConnectRequested ||
+  if (gScanSuspended || gScanRunning || gConnectRequested ||
       ((gClient != nullptr) && gClient->isConnected())) {
     return;
   }
@@ -246,6 +248,9 @@ bool connectTarget() {
 }  // namespace
 
 void begin() {
+  if (NimBLEDevice::getInitialized()) {
+    return;
+  }
   NimBLEDevice::init("STM32-KIT Controller");
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
@@ -257,6 +262,9 @@ void begin() {
 }
 
 void service() {
+  if (gRadioSuspended) {
+    return;
+  }
   if (gDisconnectPending) {
     gDisconnectPending = false;
     deleteDisconnectedClient();
@@ -271,10 +279,83 @@ void service() {
   }
 
   const uint32_t now = millis();
-  if (!gReady && !gScanRunning && !gConnectRequested &&
+  if (!gScanSuspended && !gReady && !gScanRunning && !gConnectRequested &&
       (static_cast<int32_t>(now - gNextScanAt) >= 0)) {
     startScan();
   }
+}
+
+void setScanSuspended(bool suspended) {
+  if (gScanSuspended == suspended) {
+    return;
+  }
+
+  gScanSuspended = suspended;
+  if (suspended) {
+    if (gScanRunning) {
+      /* stop() may also invoke scanCompleteCallback(); gScanSuspended keeps
+       * service() from starting another scan while camera turbo is active. */
+      NimBLEDevice::getScan()->stop();
+      gScanRunning = false;
+    }
+    Serial.println("[PAD BLE] discovery paused for Wi-Fi camera turbo");
+  } else {
+    gNextScanAt = millis();
+    Serial.println("[PAD BLE] discovery resumed");
+  }
+}
+
+bool isScanSuspended() {
+  return gScanSuspended;
+}
+
+bool setRadioSuspended(bool suspended) {
+  if (gRadioSuspended == suspended) {
+    return true;
+  }
+
+  if (suspended) {
+    if (gReady || ((gClient != nullptr) && gClient->isConnected())) {
+      Serial.println("[PAD BLE] radio turbo refused: physical pad connected");
+      return false;
+    }
+
+    gScanSuspended = true;
+    if (gScanRunning) {
+      NimBLEDevice::getScan()->stop();
+      gScanRunning = false;
+    }
+    gConnectRequested = false;
+    gDisconnectPending = false;
+    gAdvertisedDevice = nullptr;
+    deleteDisconnectedClient();
+    if (NimBLEDevice::getInitialized()) {
+      /* clearAll invalidates the scan/client objects owned by NimBLE. Clear
+       * our non-owning pointers immediately after shutdown. */
+      NimBLEDevice::deinit(true);
+    }
+    gClient = nullptr;
+    gSubscribedReports = 0U;
+    gRadioSuspended = true;
+    Serial.println("[PAD BLE] radio stopped for Wi-Fi camera turbo");
+    return true;
+  }
+
+  /* The caller must restore WIFI_PS_MIN_MODEM before reaching this path; old
+   * ESP32-C3 IDF coexistence aborts if BLE starts while Wi-Fi uses PS_NONE. */
+  gRadioSuspended = false;
+  gScanSuspended = false;
+  gAdvertisedDevice = nullptr;
+  gClient = nullptr;
+  gConnectRequested = false;
+  gDisconnectPending = false;
+  begin();
+  Serial.println("[PAD BLE] radio restored after camera turbo");
+  return true;
+}
+
+bool isRadioSuspended() {
+  return gRadioSuspended;
 }
 
 bool takeState(flydigi_direwolf3::State* state) {

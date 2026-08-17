@@ -6,6 +6,7 @@
 #include "app_scheduler.h"
 #include "battery_monitor.h"
 #include "camera_service.h"
+#include "camera_stream.h"
 #include "command_protocol.h"
 #include "command_control.h"
 #include "comm_service.h"
@@ -63,6 +64,7 @@ static void app_runtime_camera_task(uint32_t now, void *context)
     (void)now;
     (void)context;
     Camera_Service_Process();
+    CameraStream_Process();
 }
 
 static void app_runtime_adc_task(uint32_t now, void *context)
@@ -134,6 +136,7 @@ void AppRuntime_Init(const AppContext *context)
     AppEvent_Init();
     CommandControl_Init();
     CommandProtocol_Init();
+    CameraStream_Init();
     TelemetryService_Init();
     AppBoot_Run();
 
@@ -174,6 +177,11 @@ void AppRuntime_Process(void)
     {
         AppScheduler_Run(&s_scheduler, HAL_GetTick());
     }
+}
+
+uint32_t AppRuntime_GetIdleDelayMs(void)
+{
+    return (CameraStream_NeedsFastService() != 0U) ? 1U : 5U;
 }
 
 void AppRuntime_GetSchedulerStats(AppSchedulerStats *stats)

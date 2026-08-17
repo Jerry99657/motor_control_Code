@@ -1,6 +1,7 @@
 #include "command_protocol.h"
 
 #include "comm_service.h"
+#include "camera_stream.h"
 #include "command_control.h"
 #include "dc_motor_ol.h"
 #include "foc_link.h"
@@ -402,6 +403,24 @@ static uint8_t command_protocol_dispatch_frame(uint8_t channel,
             NES_Runtime_RequestRemoteReset();
             accepted = 1U;
         }
+    }
+    else if ((channel == COMMAND_PROTOCOL_CHANNEL_UART5) &&
+             (device_id == CAMERA_STREAM_DEVICE_ID) &&
+             (command == CAMERA_STREAM_COMMAND_ENABLE) &&
+             (length == 0x07U))
+    {
+        CameraStream_SetRemoteEnabled((frame[5] != 0U) ? 1U : 0U);
+        accepted = 1U;
+    }
+    else if ((channel == COMMAND_PROTOCOL_CHANNEL_UART5) &&
+             (device_id == CAMERA_STREAM_DEVICE_ID) &&
+             (command == CAMERA_STREAM_COMMAND_FRAME_ACK) &&
+             (length == 0x08U))
+    {
+        uint16_t sequence = (uint16_t)frame[5] |
+                            ((uint16_t)frame[6] << 8U);
+        CameraStream_AcknowledgeFrame(sequence);
+        accepted = 1U;
     }
     else if (CommandControl_IsActive() == 0U)
     {
