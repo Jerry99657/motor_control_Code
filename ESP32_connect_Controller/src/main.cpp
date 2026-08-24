@@ -261,6 +261,11 @@ const char index_html[] PROGMEM = R"rawliteral(
     .mode-switch { position:fixed; top:8px; right:10px; z-index:30; min-width:92px; height:32px; padding:0 13px; border:1px solid rgba(255,255,255,.2); border-radius:16px; color:#08111d; background:linear-gradient(135deg,#67e8f9,#22d3ee); box-shadow:0 5px 18px rgba(0,0,0,.35); font-size:11px; font-weight:900; letter-spacing:.5px; touch-action:manipulation; transition:transform .14s cubic-bezier(.2,1.7,.4,1),background .2s,color .2s; }
     .mode-switch:active { transform:scale(.9); }
     .mode-switch.nes { color:#f8ead0; background:linear-gradient(145deg,#9a2632,#5b1019); }
+    .input-switch { position:fixed; top:8px; left:10px; z-index:30; min-width:112px; max-width:190px; height:32px; padding:0 13px; overflow:hidden; border:1px solid rgba(255,255,255,.2); border-radius:16px; color:#dbeafe; background:linear-gradient(145deg,#334155,#1e293b); box-shadow:0 5px 18px rgba(0,0,0,.35); font-size:10px; font-weight:900; letter-spacing:.45px; text-overflow:ellipsis; white-space:nowrap; touch-action:manipulation; transition:transform .14s cubic-bezier(.2,1.7,.4,1),background .2s,color .2s,box-shadow .2s; }
+    .input-switch:active { transform:scale(.92); }
+    .input-switch.pc { color:#082f49; background:linear-gradient(135deg,#bae6fd,#38bdf8); }
+    .input-switch.ready { color:#052e16; background:linear-gradient(135deg,#86efac,#22c55e); box-shadow:0 5px 18px rgba(0,0,0,.35),0 0 18px rgba(34,197,94,.25); }
+    .input-switch.blocked { color:#450a0a; background:linear-gradient(135deg,#fecaca,#f87171); }
     .mode-page[hidden] { display:none !important; }
     #debug { position: absolute; top: 35px; width: 100%; text-align: center; font-size: 14px; color: #fff; pointer-events: none; text-shadow: 0px 0px 5px #000; z-index: 10;}
     .gyro-panel { box-sizing:border-box; width:min(620px,calc(100% - 28px)); height:76px; margin:42px auto 0; padding:10px 14px; display:grid; grid-template-columns:104px 1fr; gap:16px; align-items:center; border:1px solid rgba(255,255,255,.12); border-radius:18px; background:linear-gradient(145deg,rgba(36,45,61,.94),rgba(18,23,32,.94)); box-shadow:0 12px 30px rgba(0,0,0,.34),inset 0 1px 0 rgba(255,255,255,.08); }
@@ -293,6 +298,15 @@ const char index_html[] PROGMEM = R"rawliteral(
       touch-action: none; 
     }
     .label { margin-top: 10px; color: #aaa; font-size: 14px; pointer-events: none; font-weight: bold;}
+    /* PC gamepad layout: the enlarged camera is the top of the triangle and
+       the two read-only stick mirrors form its lower corners. */
+    #robotPage.pc-gamepad .container { box-sizing:border-box; width:min(940px,100%); margin:0 auto; padding:6px 28px 12px; display:grid; grid-template-columns:1fr 1fr; grid-template-rows:minmax(190px,1fr) 126px; column-gap:80px; row-gap:2px; align-items:center; justify-items:center; transform:none; }
+    #robotPage.pc-gamepad .camera-panel { grid-column:1 / 3; grid-row:1; width:min(520px,62vw); border-color:rgba(103,232,249,.72); box-shadow:0 16px 42px rgba(0,0,0,.48),inset 0 0 0 1px rgba(255,255,255,.07),0 0 28px rgba(34,211,238,.2); }
+    #robotPage.pc-gamepad .joy-wrap:first-child { grid-column:1; grid-row:2; }
+    #robotPage.pc-gamepad .joy-wrap:last-child { grid-column:2; grid-row:2; }
+    #robotPage.pc-gamepad .joy-wrap { pointer-events:none; opacity:.9; }
+    #robotPage.pc-gamepad canvas { width:108px; height:108px; border-width:2px; box-shadow:0 0 14px rgba(0,0,0,.8) inset,0 0 12px rgba(103,232,249,.1); }
+    #robotPage.pc-gamepad .label { margin-top:3px; font-size:11px; letter-spacing:.4px; }
     .nes-page { box-sizing:border-box; width:100%; height:calc(100vh - 34px); padding:7px 12px 10px; display:flex; align-items:center; justify-content:center; }
     .nes-shell { position:relative; box-sizing:border-box; width:min(920px,96vw); height:min(390px,82vh); min-height:230px; padding:24px 30px; border:5px solid #4a0c13; border-radius:44px; background:linear-gradient(155deg,#9c2e39 0%,#711622 55%,#4b0d15 100%); box-shadow:0 20px 45px rgba(0,0,0,.58),inset 0 2px 0 rgba(255,255,255,.17),inset 0 -8px 18px rgba(0,0,0,.25); }
     .nes-face { box-sizing:border-box; width:100%; height:100%; display:grid; grid-template-columns:1.05fr .8fr 1.05fr; align-items:center; gap:20px; padding:18px 22px; border-radius:30px; color:#1d1b18; background:linear-gradient(160deg,#f2ead4,#d7cdb4); box-shadow:inset 0 0 0 3px rgba(61,30,25,.17),inset 0 -7px 15px rgba(65,42,32,.12); }
@@ -343,6 +357,10 @@ const char index_html[] PROGMEM = R"rawliteral(
       .nes-center { padding-bottom:10px; gap:10px; }
       .reset-btn { width:96px; height:28px; }
       .nes-status { bottom:3px; }
+      #robotPage.pc-gamepad .container { height:calc(100vh - 104px); grid-template-rows:minmax(130px,1fr) 88px; padding:2px 18px 5px; column-gap:52px; }
+      #robotPage.pc-gamepad .camera-panel { width:min(300px,46vw); }
+      #robotPage.pc-gamepad canvas { width:76px; height:76px; }
+      #robotPage.pc-gamepad .label { margin-top:1px; font-size:9px; }
     }
     @media (max-width:560px) and (orientation:portrait) {
       .gyro-panel { margin-top:40px; }
@@ -356,10 +374,14 @@ const char index_html[] PROGMEM = R"rawliteral(
       .action-area { gap:10px; }
       .action-btn { width:58px; height:58px; }
       .system-buttons { padding:8px 15px; }
+      #robotPage.pc-gamepad .container { width:100%; grid-template-rows:minmax(180px,1fr) 116px; padding:4px 12px 9px; column-gap:18px; }
+      #robotPage.pc-gamepad .camera-panel { width:min(360px,88vw); }
+      #robotPage.pc-gamepad canvas { width:98px; height:98px; }
     }
   </style>
 </head>
 <body>
+  <button id="inputSwitch" class="input-switch" type="button" title="Switch between touch joysticks and a controller connected to this computer">INPUT: TOUCH</button>
   <button id="modeSwitch" class="mode-switch" type="button">OPEN NES</button>
   <main id="robotPage" class="mode-page">
     <div class="title">ESP32 Web Joystick Controller</div>
@@ -421,14 +443,18 @@ const char index_html[] PROGMEM = R"rawliteral(
     let gyroEnabled=false, gyroSignedSpeed=0, gyroDirty=true;
     let axesDirty=true, lastAxesSendMs=0, debugUpdatePending=false;
     let axesInFlight=false, axesSequence=0, axesSentAtMs=0;
-    let axesTimeoutReported=false;
+    let axesTimeoutReported=false, axesSentWasZero=true;
     let lastRttMs=0, mergedAxesCount=0, ackTimeoutCount=0;
     let socketClaimed=false, superseded=false;
     let controlMode=0, nesButtons=0, nesSequence=0, lastNesSendMs=0;
+    let inputMode=0, gamepadIndex=-1, gamepadState='TOUCH', gamepadName='';
+    let inputHandoverPending=false;
+    let leftJoy=null, rightJoy=null, gamepadLoopStarted=false;
     const nesPointers=new Map();
     const AXES_MIN_SEND_MS=20, AXES_KEEPALIVE_MS=100, AXES_ACK_TIMEOUT_MS=300;
     const WS_MAX_BUFFERED_BYTES=128;
     const NES_KEEPALIVE_MS=50, MODE_MECANUM=0, MODE_NES=1;
+    const INPUT_TOUCH=0, INPUT_PC_GAMEPAD=1, GAMEPAD_DEADZONE=.12;
     const WS_MSG_ACK=0x41, WS_MSG_HELLO=0x48, WS_MSG_AXES=0x4A;
     const sessionId = (() => {
       if(window.crypto && window.crypto.getRandomValues) {
@@ -442,6 +468,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     const robotPage = document.getElementById('robotPage');
     const nesPage = document.getElementById('nesPage');
     const modeSwitch = document.getElementById('modeSwitch');
+    const inputSwitch = document.getElementById('inputSwitch');
     const nesStatus = document.getElementById('nesStatus');
     const nesReset = document.getElementById('nesReset');
     let nesResetTimer=null, nesResetPointer=null, nesResetSequence=0;
@@ -696,12 +723,139 @@ const char index_html[] PROGMEM = R"rawliteral(
       nesReset.addEventListener('lostpointercapture',release);
     }
 
+    function updateInputUI() {
+      const pc=inputMode===INPUT_PC_GAMEPAD;
+      robotPage.classList.toggle('pc-gamepad',pc);
+      inputSwitch.classList.toggle('pc',pc);
+      inputSwitch.classList.toggle('ready',pc && gamepadState==='READY');
+      inputSwitch.classList.toggle('blocked',pc &&
+        (gamepadState==='UNSUPPORTED' || gamepadState==='BLOCKED'));
+
+      if(!pc) inputSwitch.textContent='INPUT: TOUCH';
+      else if(gamepadState==='READY') inputSwitch.textContent='PC PAD: READY';
+      else if(gamepadState==='BLOCKED') inputSwitch.textContent='PC PAD: BLOCKED';
+      else if(gamepadState==='UNSUPPORTED') inputSwitch.textContent='PC PAD: UNSUPPORTED';
+      else inputSwitch.textContent='PC PAD: PRESS BUTTON';
+
+      inputSwitch.title=pc ?
+        (gamepadName || 'Focus this page, then move a stick or press a controller button') :
+        'Switch to a controller connected to this computer';
+      if(leftJoy) leftJoy.sync();
+      if(rightJoy) rightJoy.sync();
+      updateDebug();
+    }
+
+    function setGamepadState(state,name='') {
+      if(gamepadState===state && gamepadName===name) return;
+      gamepadState=state;
+      gamepadName=name;
+      updateInputUI();
+    }
+
+    function releaseRobotAxes(send=true) {
+      setAxesZero();
+      if(leftJoy) leftJoy.sync();
+      if(rightJoy) rightJoy.sync();
+      if(send) sendLatest(true);
+    }
+
+    function setInputMode(nextMode) {
+      if(nextMode!==INPUT_TOUCH && nextMode!==INPUT_PC_GAMEPAD) return;
+      if(inputMode===nextMode) {
+        updateInputUI();
+        return;
+      }
+
+      /* Never carry a non-zero command across an input-source handover. */
+      inputHandoverPending=true;
+      releaseRobotAxes(true);
+      if(leftJoy) leftJoy.cancel();
+      if(rightJoy) rightJoy.cancel();
+      inputMode=nextMode;
+      gamepadIndex=-1;
+      gamepadName='';
+      gamepadState=nextMode===INPUT_PC_GAMEPAD ?
+        (typeof navigator.getGamepads==='function' ? 'WAIT' : 'UNSUPPORTED') :
+        'TOUCH';
+      updateInputUI();
+    }
+
+    function readVisibleGamepads() {
+      if(typeof navigator.getGamepads!=='function') {
+        setGamepadState('UNSUPPORTED');
+        return [];
+      }
+      try {
+        return Array.from(navigator.getGamepads() || []);
+      } catch(error) {
+        setGamepadState('BLOCKED',error && error.name ? error.name : 'Gamepad API blocked');
+        return [];
+      }
+    }
+
+    function selectGamepad(pads) {
+      if(gamepadIndex>=0) {
+        const selected=pads[gamepadIndex];
+        if(selected && selected.connected && selected.axes.length>=4) return selected;
+      }
+      const selected=pads.find(pad => pad && pad.connected &&
+        pad.axes.length>=4 && pad.mapping==='standard') ||
+        pads.find(pad => pad && pad.connected && pad.axes.length>=4);
+      if(selected) gamepadIndex=selected.index;
+      return selected || null;
+    }
+
+    function mapGamepadStick(rawX,rawY) {
+      let x=Number.isFinite(rawX) ? Math.max(-1,Math.min(1,rawX)) : 0;
+      let y=Number.isFinite(rawY) ? Math.max(-1,Math.min(1,rawY)) : 0;
+      const magnitude=Math.min(1,Math.hypot(x,y));
+      if(magnitude<=GAMEPAD_DEADZONE) return [0,0];
+      const scaled=(magnitude-GAMEPAD_DEADZONE)/(1-GAMEPAD_DEADZONE);
+      x=x/magnitude*scaled;
+      y=y/magnitude*scaled;
+      return [Math.round(x*100),Math.round(-y*100)];
+    }
+
+    function applyGamepadAxes(pad) {
+      const left=mapGamepadStick(pad.axes[0],pad.axes[1]);
+      const right=mapGamepadStick(pad.axes[2],pad.axes[3]);
+      if(clx===left[0] && cly===left[1] && crx===right[0] && cry===right[1]) return;
+      clx=left[0]; cly=left[1]; crx=right[0]; cry=right[1];
+      if(axesInFlight) mergedAxesCount++;
+      axesDirty=true;
+      if(leftJoy) leftJoy.sync();
+      if(rightJoy) rightJoy.sync();
+      updateDebug();
+      sendLatest();
+    }
+
+    function pollPcGamepad() {
+      requestAnimationFrame(pollPcGamepad);
+      if(inputMode!==INPUT_PC_GAMEPAD || controlMode!==MODE_MECANUM ||
+         document.hidden || inputHandoverPending) return;
+
+      const pad=selectGamepad(readVisibleGamepads());
+      if(!pad) {
+        const wasReady=gamepadState==='READY';
+        gamepadIndex=-1;
+        setGamepadState(gamepadState==='BLOCKED' || gamepadState==='UNSUPPORTED' ?
+          gamepadState : 'WAIT');
+        if(wasReady) releaseRobotAxes(true);
+        return;
+      }
+
+      setGamepadState('READY',`${pad.id} | mapping:${pad.mapping || 'raw'} | axes:${pad.axes.length}`);
+      applyGamepadAxes(pad);
+    }
+
     function updateModeUI() {
       const nes = controlMode === MODE_NES;
       robotPage.hidden = nes;
       nesPage.hidden = !nes;
+      inputSwitch.hidden = nes;
       modeSwitch.classList.toggle('nes', nes);
       modeSwitch.textContent = nes ? 'OPEN ROBOT' : 'OPEN NES';
+      updateInputUI();
       updateDebug();
       updateNesStatus();
     }
@@ -763,11 +917,27 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     modeSwitch.addEventListener('click', switchMode);
+    inputSwitch.addEventListener('click', () => {
+      setInputMode(inputMode===INPUT_TOUCH ? INPUT_PC_GAMEPAD : INPUT_TOUCH);
+    });
+    window.addEventListener('gamepadconnected', event => {
+      if(inputMode!==INPUT_PC_GAMEPAD) return;
+      gamepadIndex=event.gamepad.index;
+      setGamepadState('READY',`${event.gamepad.id} | mapping:${event.gamepad.mapping || 'raw'} | axes:${event.gamepad.axes.length}`);
+    });
+    window.addEventListener('gamepaddisconnected', event => {
+      if(inputMode!==INPUT_PC_GAMEPAD || event.gamepad.index!==gamepadIndex) return;
+      gamepadIndex=-1;
+      setGamepadState('WAIT');
+      releaseRobotAxes(true);
+    });
     window.addEventListener('blur', () => {
       if(controlMode === MODE_NES) releaseAllNes(true);
+      else if(inputMode===INPUT_PC_GAMEPAD) releaseRobotAxes(true);
     });
     document.addEventListener('visibilitychange', () => {
       if(document.hidden && controlMode === MODE_NES) releaseAllNes(true);
+      else if(document.hidden && inputMode===INPUT_PC_GAMEPAD) releaseRobotAxes(true);
     });
 
     gyroToggle.addEventListener('click', () => {
@@ -792,6 +962,19 @@ const char index_html[] PROGMEM = R"rawliteral(
       let kx = cx, ky = cy;
       let active = false;
       let touchId = null;
+
+      function sync() {
+        const x=isLeft ? clx : crx;
+        const y=isLeft ? cly : cry;
+        kx=cx+(Math.max(-100,Math.min(100,x))/100)*maxDist;
+        ky=cy-(Math.max(-100,Math.min(100,y))/100)*maxDist;
+        draw();
+      }
+
+      function cancel() {
+        active=false;
+        touchId=null;
+      }
 
       function draw() {
         ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -823,18 +1006,23 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
 
       function updatePos(e) {
+        if(inputMode!==INPUT_TOUCH || inputHandoverPending) return;
         let touch = null;
-        for(let i=0; i<e.changedTouches.length; i++){
-          if(e.changedTouches[i].identifier === touchId){
-            touch = e.changedTouches[i];
-            break;
+        if(e.changedTouches) {
+          for(let i=0; i<e.changedTouches.length; i++){
+            if(e.changedTouches[i].identifier === touchId){
+              touch = e.changedTouches[i];
+              break;
+            }
           }
         }
         if(!touch && e.clientX === undefined) return;
 
         const rect = canvas.getBoundingClientRect();
-        let tx = (touch ? touch.clientX : e.clientX) - rect.left;
-        let ty = (touch ? touch.clientY : e.clientY) - rect.top;
+        let tx = ((touch ? touch.clientX : e.clientX) - rect.left) *
+                 canvas.width / Math.max(1,rect.width);
+        let ty = ((touch ? touch.clientY : e.clientY) - rect.top) *
+                 canvas.height / Math.max(1,rect.height);
 
         let dx = tx - cx;
         let dy = ty - cy;
@@ -861,6 +1049,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       }
 
       canvas.addEventListener('touchstart', e => {
+        if(inputMode!==INPUT_TOUCH || inputHandoverPending) return;
         e.preventDefault();
         active = true;
         touchId = e.changedTouches[0].identifier;
@@ -873,6 +1062,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       }, {passive:false});
 
       const end = (e) => {
+        if(!active || inputMode!==INPUT_TOUCH || inputHandoverPending) return;
         e.preventDefault();
         active = false;
         touchId = null;
@@ -889,21 +1079,30 @@ const char index_html[] PROGMEM = R"rawliteral(
       canvas.addEventListener('touchend', end);
       canvas.addEventListener('touchcancel', end);
       
-      canvas.addEventListener('mousedown', e => { active = true; updatePos(e); });
+      canvas.addEventListener('mousedown', e => {
+        if(inputMode!==INPUT_TOUCH || inputHandoverPending) return;
+        active = true;
+        updatePos(e);
+      });
       canvas.addEventListener('mousemove', e => { if(active) updatePos(e); });
       canvas.addEventListener('mouseup', end);
       canvas.addEventListener('mouseleave', end);
       
       draw();
+      return {sync,cancel};
     }
 
     // Force initialization after page fully paints
     setTimeout(() => {
-        initJoy('joyL', true);
-        initJoy('joyR', false);
+        leftJoy=initJoy('joyL', true);
+        rightJoy=initJoy('joyR', false);
         setupNesButtons();
         setupNesReset();
         updateModeUI();
+        if(!gamepadLoopStarted) {
+          gamepadLoopStarted=true;
+          requestAnimationFrame(pollPcGamepad);
+        }
     }, 100);
 
     let socket = null;
@@ -923,10 +1122,12 @@ const char index_html[] PROGMEM = R"rawliteral(
         debugUpdatePending = false;
         const state = superseded ? 'TAKEN' : (socketReady() ? 'LINK' : 'WAIT');
         const gyroState = gyroEnabled ? `G:${gyroSignedSpeed}` : 'G:OFF';
+        const inputState = inputHandoverPending ? 'INPUT:ARM' :
+          (inputMode===INPUT_PC_GAMEPAD ? `PAD:${gamepadState}` : 'TOUCH');
         const link = socketReady() ?
           `RTT:${Math.round(lastRttMs)}ms M:${mergedAxesCount} T:${ackTimeoutCount}` :
           'RTT:--';
-        debug.innerText = `${state} ${link} | ${gyroState} | L: (${clx}, ${cly}) | R: (${crx}, ${cry})`;
+        debug.innerText = `${state} ${link} | ${inputState} | ${gyroState} | L: (${clx}, ${cly}) | R: (${crx}, ${cry})`;
       });
     }
 
@@ -948,6 +1149,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       ]);
       socket.send(axes.buffer);
       axesInFlight = true;
+      axesSentWasZero = clx===0 && cly===0 && crx===0 && cry===0;
       axesTimeoutReported = false;
       axesSentAtMs = now;
       axesDirty = false;
@@ -978,6 +1180,8 @@ const char index_html[] PROGMEM = R"rawliteral(
       clx=0; cly=0; crx=0; cry=0;
       if(axesInFlight) mergedAxesCount++;
       axesDirty=true;
+      if(leftJoy) leftJoy.sync();
+      if(rightJoy) rightJoy.sync();
       updateDebug();
     }
 
@@ -1013,13 +1217,21 @@ const char index_html[] PROGMEM = R"rawliteral(
       if(message.length === 3 && message[0] === WS_MSG_ACK) {
         const ackSequence = message[1] | (message[2] << 8);
         if(axesInFlight && ackSequence === axesSequence) {
+          const acknowledgedZero=axesSentWasZero;
           lastRttMs = performance.now() - axesSentAtMs;
           axesInFlight=false;
           axesTimeoutReported=false;
+          if(inputHandoverPending && acknowledgedZero) inputHandoverPending=false;
           updateDebug();
-          /* Do not starve a low-rate gyro change while the stick is moving. */
-          sendGyroState();
-          if(axesDirty) sendLatest(true);
+          if(inputHandoverPending) {
+            /* Complete the mandatory zero-frame handover before allowing a
+             * low-rate latched command to occupy the WebSocket. */
+            if(axesDirty) sendLatest(true);
+          } else {
+            /* Do not starve a low-rate gyro change while the stick is moving. */
+            sendGyroState();
+            if(axesDirty) sendLatest(true);
+          }
         }
       }
     }
@@ -1179,6 +1391,7 @@ void handleRoot() {
   server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Expires", "0");
+  server.sendHeader("Permissions-Policy", "gamepad=(self)");
   /* index_html lives in Flash. server.send() first materializes a large
    * String in the heap; after adding the 64 KiB JPEG assembler that temporary
    * allocation can fail and the browser receives an empty white page.
